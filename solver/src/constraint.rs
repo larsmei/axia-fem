@@ -504,7 +504,7 @@ fn surface_nodes(model: &Model, name: &str) -> Result<Vec<i32>> {
     model.expand_nset(&key)
 }
 
-fn face_nodes(el: &crate::model::Element, face: i32) -> Vec<i32> {
+pub(crate) fn face_nodes(el: &crate::model::Element, face: i32) -> Vec<i32> {
     let n = &el.nodes;
     match (el.kind.ccx_name(), face) {
         ("C3D8" | "C3D8I" | "C3D8R", 1) if n.len() >= 4 => n[0..4].to_vec(),
@@ -513,6 +513,20 @@ fn face_nodes(el: &crate::model::Element, face: i32) -> Vec<i32> {
         ("C3D8" | "C3D8I" | "C3D8R", 4) if n.len() >= 8 => vec![n[1], n[5], n[6], n[2]],
         ("C3D8" | "C3D8I" | "C3D8R", 5) if n.len() >= 8 => vec![n[2], n[6], n[7], n[3]],
         ("C3D8" | "C3D8I" | "C3D8R", 6) if n.len() >= 8 => vec![n[3], n[7], n[4], n[0]],
+        ("C3D20" | "C3D20R", 1) if n.len() >= 4 => n[0..4].to_vec(),
+        ("C3D20" | "C3D20R", 2) if n.len() >= 8 => vec![n[4], n[7], n[6], n[5]],
+        ("C3D20" | "C3D20R", 3) if n.len() >= 8 => vec![n[0], n[4], n[5], n[1]],
+        ("C3D20" | "C3D20R", 4) if n.len() >= 8 => vec![n[1], n[5], n[6], n[2]],
+        ("C3D20" | "C3D20R", 5) if n.len() >= 8 => vec![n[2], n[6], n[7], n[3]],
+        ("C3D20" | "C3D20R", 6) if n.len() >= 8 => vec![n[3], n[7], n[4], n[0]],
+        ("C3D4", 1) if n.len() >= 3 => n[0..3].to_vec(),
+        ("C3D4", 2) if n.len() >= 4 => vec![n[0], n[3], n[1]],
+        ("C3D4", 3) if n.len() >= 4 => vec![n[1], n[3], n[2]],
+        ("C3D4", 4) if n.len() >= 4 => vec![n[2], n[3], n[0]],
+        ("C3D10", 1) if n.len() >= 3 => n[0..3].to_vec(),
+        ("C3D10", 2) if n.len() >= 4 => vec![n[0], n[3], n[1]],
+        ("C3D10", 3) if n.len() >= 4 => vec![n[1], n[3], n[2]],
+        ("C3D10", 4) if n.len() >= 4 => vec![n[2], n[3], n[0]],
         ("C3D6", 1) if n.len() >= 3 => n[0..3].to_vec(),
         ("C3D6", 2) if n.len() >= 6 => n[3..6].to_vec(),
         _ => n.clone(),

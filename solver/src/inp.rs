@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{err, Result};
 use crate::model::{
-    Amplitude, AnalysisStep, BeamSection, Boundary, Cflux, Cload, Coupling, Dflux, Dload, ElemKind,
-    Element, Equation, Film, FluxKind, InitCond, InitKind, Material, Model, RigidBody, Surface,
-    ThermalBc, Tie, Transform,
+    Amplitude, AnalysisStep, BeamSection, Boundary, Cflux, Cload, ContactPair, Coupling, Dflux,
+    Dload, ElemKind, Element, Equation, Film, FluxKind, InitCond, InitKind, Material, Model,
+    RigidBody, Surface, SurfaceInteraction, ThermalBc, Tie, Transform,
 };
 
 fn strip_comment(line: &str) -> &str {
@@ -184,6 +184,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
     let mut i = 0;
     let mut current_material: Option<String> = None;
     let mut current_coupling: Option<usize> = None;
+    let mut current_interaction: Option<String> = None;
     let mut saw_step = false;
     let mut step_open = false;
 
@@ -1056,6 +1057,72 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                 }
                 model.surfaces.insert(name.to_ascii_uppercase(), surf);
             }
+            "*SURFACE INTERACTION" => {
+                let name = params
+                    .get("NAME")
+                    .cloned()
+                    .ok_or_else(|| crate::error::FemError("*SURFACE INTERACTION ohne NAME=".into()))?;
+                let key = name.to_ascii_uppercase();
+                model.interactions.insert(
+                    key.clone(),
+                    SurfaceInteraction {
+                        kn: 1.0e7,
+                        mu: 0.0,
+                    },
+                );
+                current_interaction = Some(key);
+                let (_toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+            }
+            "*SURFACE BEHAVIOR" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let kn = toks.first().and_then(|t| parse_f64(t).ok()).unwrap_or(1.0e7);
+                if let Some(name) = &current_interaction {
+                    if let Some(it) = model.interactions.get_mut(name) {
+                        it.kn = kn.abs().max(0.0);
+                    }
+                } else {
+                    model.warn("*SURFACE BEHAVIOR ohne *SURFACE INTERACTION — ignoriert.");
+                }
+            }
+            "*FRICTION" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mu = toks.first().and_then(|t| parse_f64(t).ok()).unwrap_or(0.0);
+                if let Some(name) = &current_interaction {
+                    if let Some(it) = model.interactions.get_mut(name) {
+                        it.mu = mu.abs();
+                    }
+                }
+                if mu.abs() > 0.0 {
+                    model.warn("*FRICTION wird in 1.6 ignoriert (reibungsfreier Kontakt).");
+                }
+            }
+            "*CONTACT PAIR" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if toks.len() < 2 {
+                    model.warn("*CONTACT PAIR braucht SLAVE, MASTER.");
+                    continue;
+                }
+                let iname = params
+                    .get("INTERACTION")
+                    .cloned()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                let (kn, mu) = model
+                    .interactions
+                    .get(&iname)
+                    .map(|it| (it.kn, it.mu))
+                    .unwrap_or((1.0e7, 0.0));
+                model.contact_pairs.push(ContactPair {
+                    slave: toks[0].to_ascii_uppercase(),
+                    master: toks[1].to_ascii_uppercase(),
+                    kn,
+                    mu,
+                });
+            }
             "*TIE" => {
                 let (toks, ni) = collect_tokens(&lines, i + 1);
                 i = ni;
@@ -1273,6 +1340,10 @@ fn parse_expanded(inp: &str) -> Result<Model> {
             "*PREPRINT" => {
                 i += 1;
             }
+            "*CONTACT" => {
+                let (_toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+            }
             "*END STEP" | "*END STEP " => {
                 if step_open {
                     push_step(&mut model);
@@ -1311,7 +1382,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                                 "{other} nicht unterstützt in dieser Version."
                             ));
                         }
-                        "*CONTACT" | "*ORIENTATION" => {
+                        "*ORIENTATION" => {
                             model.warn(format!("{other} wird ignoriert."));
                             let (_toks, ni) = collect_tokens(&lines, i + 1);
                             i = ni;

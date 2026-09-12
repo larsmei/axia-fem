@@ -588,6 +588,20 @@ pub struct Transform {
     pub axes: [[f64; 3]; 3],
 }
 
+#[derive(Clone, Debug)]
+pub struct SurfaceInteraction {
+    pub kn: f64,
+    pub mu: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContactPair {
+    pub slave: String,
+    pub master: String,
+    pub kn: f64,
+    pub mu: f64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ThermalBc {
     pub node: i32,
@@ -732,6 +746,8 @@ pub struct Model {
     pub elset_spring: HashMap<String, f64>,
     pub temperatures: HashMap<i32, f64>,
     pub plastic: HashMap<String, Vec<(f64, f64)>>, // material -> [(peeq, sy)]
+    pub interactions: HashMap<String, SurfaceInteraction>,
+    pub contact_pairs: Vec<ContactPair>,
     pub thermal_bcs: Vec<ThermalBc>,
     pub cfluxes: Vec<Cflux>,
     pub dfluxes: Vec<Dflux>,
@@ -780,6 +796,8 @@ impl Model {
             elset_spring: HashMap::new(),
             temperatures: HashMap::new(),
             plastic: HashMap::new(),
+            interactions: HashMap::new(),
+            contact_pairs: Vec::new(),
             thermal_bcs: Vec::new(),
             cfluxes: Vec::new(),
             dfluxes: Vec::new(),
@@ -983,6 +1001,10 @@ impl Model {
 
     pub fn has_plastic(&self) -> bool {
         !self.plastic.is_empty()
+    }
+
+    pub fn has_contact(&self) -> bool {
+        !self.contact_pairs.is_empty()
     }
 
     pub fn amp_value(&self, name: &str, t: f64) -> f64 {

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::beam;
 use crate::constraint::{self, DofMap};
+use crate::contact;
 use crate::dat;
 use crate::elem::{
     element_ke, element_nodal_stress, hex8_body_force, hex8_face_pressure, quad4_body_force,
@@ -97,6 +98,15 @@ fn solve_one(model: Model, t0: f64) -> Result<SolveOutput> {
         && model.elements.iter().all(|e| e.kind == ElemKind::Truss2);
     let continuum_only = !model.elements.is_empty()
         && model.elements.iter().all(|e| nlgeom::is_nl_continuum(e.kind));
+    if model.has_contact() {
+        if nlgeom || model.has_plastic() {
+            return err("*CONTACT PAIR ist nicht mit NLGEOM oder *PLASTIC kombiniert.");
+        }
+        if !matches!(model.procedure, Procedure::Static { .. }) {
+            return err("*CONTACT PAIR nur für *STATIC.");
+        }
+        return solve_contact(model, t0);
+    }
     if nlgeom || model.has_plastic() {
         if truss2_only {
             return solve_truss_newton(model, t0, nlgeom);
@@ -1254,6 +1264,258 @@ fn assemble_fext(model: &Model, ndn: usize, ndof: usize) -> Result<Vec<f64>> {
         }
     }
     Ok(f)
+}
+
+fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
+    let ndn = model.ndof_node();
+    let nnode = model.node_ids.len();
+    let ndof = ndn * nnode;
+    if ndof == 0 {
+        return err("Modell ohne Freiheitsgrade.");
+    }
+    let mut prescribed: HashMap<usize, f64> = HashMap::new();
+    for bc in &model.bcs {
+        if bc.dof >= ndn {
+            continue;
+        }
+        let ni = model.node_index(bc.node)?;
+        prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
+    }
+    if ndn == 6 {
+        let mut struct_node = vec![false; nnode];
+        for el in &model.elements {
+            if el.kind.is_beam() || el.kind.is_shell() {
+                for &id in &el.nodes {
+                    struct_node[model.node_index(id)?] = true;
+                }
+            }
+        }
+        for ni in 0..nnode {
+            if !struct_node[ni] {
+                for r in 3..6 {
+                    prescribed.entry(dof_of(ndn, ni, r)).or_insert(0.0);
+                }
+            }
+        }
+    }
+    let f_ext = assemble_fext(&model, ndn, ndof)?;
+    let mut trips: Vec<(usize, usize, f64)> = Vec::new();
+    for el in &model.elements {
+        let xyz = elem_xyz(&model, &el.nodes)?;
+        let mat = model.material_for(el)?;
+        let th = if el.kind.is_spring() {
+            model.spring_k_for(el)?
+        } else {
+            model.thickness_for(el)
+        };
+        let sec = if el.kind.is_beam() {
+            Some(model.beam_section_for(el)?)
+        } else {
+            None
+        };
+        let mut kef = element_ke(el.kind, &xyz, mat.e, mat.nu, th, sec.as_ref())?;
+        if !model.node_transform.is_empty() {
+            constraint::transform_ke(
+                &mut kef.ke,
+                el.kind.nnodes(),
+                el.kind.ndof_per_node(),
+                &el.nodes,
+                &model.node_transform,
+            );
+        }
+        let nn = el.kind.nnodes();
+        let local_dim = el.kind.ndof_per_node();
+        let mut gdofs = Vec::with_capacity(nn * local_dim);
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for d in 0..local_dim {
+                gdofs.push(dof_of(ndn, ni, d));
+            }
+        }
+        let m = gdofs.len();
+        for i in 0..m {
+            for j in 0..m {
+                let v = kef.ke[i * kef.ndof + j];
+                if v.abs() > 0.0 {
+                    trips.push((gdofs[i], gdofs[j], v));
+                }
+            }
+        }
+    }
+    let mpcs = constraint::build_all_mpcs(&model, ndn)?;
+    let map = DofMap::build(ndof, &prescribed, &mpcs)?;
+    let nfree = map.n_ind;
+    if nfree == 0 {
+        return err("Kontakt: keine freien DOF.");
+    }
+    let mut u_full = map.u0.clone();
+    let mut solver = String::new();
+    let mut residual = 0.0;
+    let mut iters = 0usize;
+    let mut last_fint = vec![0.0; ndof];
+    let mut n_active = 0usize;
+    for it in 0..model.max_newton.max(1) {
+        iters = it + 1;
+        let cf = contact::assemble(&model, ndn, ndof, &u_full)?;
+        n_active = cf.n_active;
+        let mut ku = vec![0.0; ndof];
+        for &(i, j, v) in &trips {
+            ku[i] += v * u_full[j];
+        }
+        let mut f_int = ku;
+        for i in 0..ndof {
+            f_int[i] += cf.f[i];
+        }
+        last_fint.clone_from(&f_int);
+        let mut r = vec![0.0; ndof];
+        for i in 0..ndof {
+            r[i] = f_ext[i] - f_int[i];
+        }
+        let mut all = trips.clone();
+        all.extend(cf.trips);
+        let (ff, rhs) = map.reduce_inc(&all, &r);
+        residual = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let fref = f_ext.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if residual < model.newton_tol * (1.0 + fref) {
+            break;
+        }
+        if it + 1 == model.max_newton.max(1) {
+            return err(format!(
+                "Newton (Kontakt) konvergierte nicht (r={residual:.3e}, {n_active} aktiv, {iters} Iterationen)."
+            ));
+        }
+        let solved = solve_kff(nfree, ff, &rhs)?;
+        solver = solved.name;
+        let mut du_full = vec![0.0; ndof];
+        for i in 0..ndof {
+            for &(j, c) in &map.t_row[i] {
+                du_full[i] += c * solved.x[j];
+            }
+        }
+        for i in 0..ndof {
+            u_full[i] += du_full[i];
+        }
+        if solved.x.iter().map(|v| v * v).sum::<f64>().sqrt() < 1e-14 {
+            break;
+        }
+    }
+    if solver.is_empty() {
+        solver = "Newton (contact)".into();
+    } else {
+        solver = format!("Newton-contact ({solver}, {iters} iters, {n_active} active)");
+    }
+
+    constraint::dofs_to_global(&mut u_full, ndn, &model.node_ids, &model.node_transform);
+    let mut rf_full = vec![0.0; ndof];
+    for d in 0..ndof {
+        rf_full[d] = last_fint[d] - f_ext[d];
+    }
+    constraint::dofs_to_global(&mut rf_full, ndn, &model.node_ids, &model.node_transform);
+
+    let mut u = vec![[0.0; 3]; nnode];
+    let mut ur = vec![[0.0; 3]; nnode];
+    let mut rf = vec![[0.0; 3]; nnode];
+    let rm = vec![[0.0; 3]; nnode];
+    for ni in 0..nnode {
+        for d in 0..3.min(ndn) {
+            u[ni][d] = u_full[dof_of(ndn, ni, d)];
+            rf[ni][d] = rf_full[dof_of(ndn, ni, d)];
+        }
+        if ndn >= 6 {
+            for d in 0..3 {
+                ur[ni][d] = u_full[dof_of(ndn, ni, 3 + d)];
+            }
+        }
+    }
+    let mut acc = vec![[0.0; 6]; nnode];
+    let mut cnt = vec![0.0; nnode];
+    let mut stress_gp = Vec::new();
+    for el in &model.elements {
+        let xyz = elem_xyz(&model, &el.nodes)?;
+        let mat = model.material_for(el)?;
+        let nn = el.kind.nnodes();
+        let local_dim = el.kind.ndof_per_node();
+        let th = model.thickness_for(el);
+        let sec = if el.kind.is_beam() {
+            Some(model.beam_section_for(el)?)
+        } else {
+            None
+        };
+        let mut ue = vec![0.0; nn * local_dim];
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for d in 0..local_dim {
+                ue[a * local_dim + d] = u_full[dof_of(ndn, ni, d)];
+            }
+        }
+        let sn = element_nodal_stress(el.kind, &xyz, &ue, mat.e, mat.nu, sec.as_ref(), th)?;
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for c in 0..6 {
+                acc[ni][c] += sn[a][c];
+            }
+            cnt[ni] += 1.0;
+        }
+        let mut mean = [0.0; 6];
+        for a in 0..nn {
+            for c in 0..6 {
+                mean[c] += sn[a][c] / nn as f64;
+            }
+        }
+        stress_gp.push((el.id, 1usize, mean));
+    }
+    let mut stress = vec![[0.0; 6]; nnode];
+    let mut strain = vec![[0.0; 6]; nnode];
+    let mut vm = vec![0.0; nnode];
+    for i in 0..nnode {
+        if cnt[i] > 0.0 {
+            for c in 0..6 {
+                stress[i][c] = acc[i][c] / cnt[i];
+            }
+        }
+        vm[i] = von_mises(&stress[i]);
+        let mat = model.materials.values().next().copied().unwrap_or_default();
+        let e = mat.e;
+        let nu = mat.nu;
+        let tr = stress[i][0] + stress[i][1] + stress[i][2];
+        if e.abs() > 0.0 {
+            strain[i][0] = ((1.0 + nu) * stress[i][0] - nu * tr) / e;
+            strain[i][1] = ((1.0 + nu) * stress[i][1] - nu * tr) / e;
+            strain[i][2] = ((1.0 + nu) * stress[i][2] - nu * tr) / e;
+            let g2 = e / (1.0 + nu);
+            strain[i][3] = stress[i][3] / g2;
+            strain[i][4] = stress[i][4] / g2;
+            strain[i][5] = stress[i][5] / g2;
+        }
+    }
+    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &[]);
+    let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
+    let procedure = model.procedure.name().to_string();
+    let nsteps = model.steps.len().max(1);
+    Ok(SolveOutput {
+        model,
+        u,
+        ur,
+        rf,
+        rm,
+        stress,
+        strain,
+        von_mises: vm,
+        stress_gp,
+        frd: frd_s,
+        dat: dat_s,
+        nfree,
+        ndof,
+        solver,
+        iters,
+        residual,
+        time_ms: now_ms() - t0,
+        procedure,
+        frequencies: vec![],
+        buckles: vec![],
+        nsteps,
+        peeq: Vec::new(),
+    })
 }
 
 fn solve_continuum_plastic(model: Model, t0: f64) -> Result<SolveOutput> {

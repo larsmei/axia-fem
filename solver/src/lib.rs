@@ -2,6 +2,7 @@ mod analysis;
 mod axisym;
 mod beam;
 mod constraint;
+mod contact;
 mod dat;
 mod elem;
 mod error;
@@ -2140,5 +2141,153 @@ FIXED, 1, 1
         assert!((ux - 0.0095238).abs() < 2e-5, "elastic C3D8 ux={ux}");
         let pe = out.peeq.iter().copied().fold(0.0_f64, f64::max);
         assert!(pe < 1e-10, "peeq should be 0, got {pe}");
+    }
+
+    #[test]
+    fn contact_two_blocks_series() {
+        let inp = r#"
+*HEADING
+two C3D8 in series through *CONTACT PAIR
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+9, 0, 0, 10
+10, 10, 0, 10
+11, 10, 10, 10
+12, 0, 10, 10
+13, 0, 0, 20
+14, 10, 0, 20
+15, 10, 10, 20
+16, 0, 10, 20
+*ELEMENT, TYPE=C3D8, ELSET=E1
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*ELEMENT, TYPE=C3D8, ELSET=E2
+2, 9, 10, 11, 12, 13, 14, 15, 16
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.0
+*SOLID SECTION, ELSET=E1, MATERIAL=STEEL
+*SOLID SECTION, ELSET=E2, MATERIAL=STEEL
+*NSET, NSET=BOT
+1, 2, 3, 4
+*NSET, NSET=TOP
+13, 14, 15, 16
+*NSET, NSET=ALL
+1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
+*SURFACE, NAME=MASTER, TYPE=ELEMENT
+1, S2
+*SURFACE, NAME=SLAVE, TYPE=ELEMENT
+2, S1
+*SURFACE INTERACTION, NAME=INT
+*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR
+1e8
+*CONTACT PAIR, INTERACTION=INT, TYPE=NODE TO SURFACE
+SLAVE, MASTER
+*BOUNDARY
+ALL, 1, 2
+BOT, 3, 3
+TOP, 3, 3, -0.01
+*STEP
+*STATIC
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        assert!(out.model.contact_pairs.len() == 1);
+        let uz = |id: i32| out.u[out.model.node_index(id).unwrap()][2];
+        assert!((uz(13) + 0.01).abs() < 1e-12, "prescribed uz={}", uz(13));
+        let mid = 0.25 * (uz(5) + uz(6) + uz(7) + uz(8));
+        assert!(
+            (mid + 0.005).abs() < 5e-4,
+            "interface master uz={mid}, expected -0.005"
+        );
+        let slave = 0.25 * (uz(9) + uz(10) + uz(11) + uz(12));
+        assert!(
+            (slave - mid).abs() < 2e-4,
+            "penetration slave={slave} master={mid}"
+        );
+        assert!(out.solver.contains("contact"), "solver={}", out.solver);
+    }
+
+    #[test]
+    fn contact_closes_gap() {
+        let inp = r#"
+*HEADING
+cube drops onto a rigid foundation
+*NODE
+1, 0, 0, -10
+2, 10, 0, -10
+3, 10, 10, -10
+4, 0, 10, -10
+5, 0, 0, 0
+6, 10, 0, 0
+7, 10, 10, 0
+8, 0, 10, 0
+9, 0, 0, 0.2
+10, 10, 0, 0.2
+11, 10, 10, 0.2
+12, 0, 10, 0.2
+13, 0, 0, 10.2
+14, 10, 0, 10.2
+15, 10, 10, 10.2
+16, 0, 10, 10.2
+*ELEMENT, TYPE=C3D8, ELSET=FND
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*ELEMENT, TYPE=C3D8, ELSET=BLK
+2, 9, 10, 11, 12, 13, 14, 15, 16
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.0
+*SOLID SECTION, ELSET=FND, MATERIAL=STEEL
+*SOLID SECTION, ELSET=BLK, MATERIAL=STEEL
+*NSET, NSET=FOUND
+1, 2, 3, 4, 5, 6, 7, 8
+*NSET, NSET=SLV
+9, 10, 11, 12, 13, 14, 15, 16
+*SURFACE, NAME=MASTER, TYPE=ELEMENT
+1, S2
+*SURFACE, NAME=SLAVE, TYPE=ELEMENT
+2, S1
+*SURFACE INTERACTION, NAME=INT
+*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR
+1e8
+*CONTACT PAIR, INTERACTION=INT
+SLAVE, MASTER
+*BOUNDARY
+FOUND, 1, 3
+SLV, 1, 2
+*STEP
+*STATIC
+*CLOAD
+13, 3, -2500
+14, 3, -2500
+15, 3, -2500
+16, 3, -2500
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let uz = |id: i32| out.u[out.model.node_index(id).unwrap()][2];
+        let z = |id: i32| {
+            let i = out.model.node_index(id).unwrap();
+            out.model.coords[i][2] + out.u[i][2]
+        };
+        // close 0.2 gap, then compress FL/EA = 10000*10/210000/100 wait A=100, F=10000, δ=FL/EA=0.004762
+        assert!(
+            (uz(9) + 0.2).abs() < 0.01,
+            "slave uz={} expected ~-0.2",
+            uz(9)
+        );
+        assert!(z(9).abs() < 0.01, "slave z={} should sit on z=0", z(9));
+        let utop = uz(13);
+        assert!(
+            (utop + 0.20476).abs() < 0.01,
+            "top uz={utop}, expected ~-0.20476"
+        );
+        assert!(utop < uz(9), "block must compress");
     }
 }

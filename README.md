@@ -9,7 +9,7 @@ Zwei Frontends, ein Solver:
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
 
-**1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
+**1.6** — `*CONTACT PAIR` Node-to-Surface, Penalty, reibungsfrei. **1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
 
 ## CLI
 
@@ -49,6 +49,7 @@ Mitgelieferte Decks in [`examples/`](examples/):
 | `nlgeom_stretch.inp` | C3D8 SVK, \(\lambda=1{,}2\), Cauchy \(\sigma_{xx}=26{,}4\) |
 | `plastic_bar.inp` | T3D2 `*PLASTIC` (isotrope Verfestigung), \(u\approx 3{,}095\) |
 | `plastic_c3d8.inp` | C3D8 J2, \(\sigma=250\), \(u_x\approx 0{,}03095\) |
+| `contact_blocks.inp` | zwei C3D8, `*CONTACT PAIR`, \(u_{z,\mathrm{mid}}=-0{,}005\) |
 | `heat_bar.inp` | stationäre Wärmeleitung T3D2, \(T(L/2)=50\) |
 | `dynamic_sdof.inp` | Newmark, SDOF \(u(T/2)=-u_0\) |
 
@@ -220,6 +221,22 @@ Kontinuum (C3D*): Total-Lagrange, St. Venant–Kirchhoff \(S=\lambda\,\mathrm{tr
 
 CalculiX-Reihenfolge \(\sigma_y, \bar\varepsilon^p\). T3D2: 1D-J2. Kontinuum: Radial-Return, \(q=\sqrt{3J_2}\), isotrope Verfestigung, konsistente Tangente. Uniaxial C3D8 mit \(\sigma=250\), \(H=21000\) liefert \(u_x\approx 0{,}03095\). FRD-Block `PEEQ`. `NLGEOM`+`*PLASTIC` auf C3D* noch nicht kombiniert.
 
+### Kontakt (1.6)
+
+```
+*SURFACE, NAME=MASTER, TYPE=ELEMENT
+1, S2
+*SURFACE, NAME=SLAVE, TYPE=ELEMENT
+2, S1
+*SURFACE INTERACTION, NAME=INT
+*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR
+1e8
+*CONTACT PAIR, INTERACTION=INT, TYPE=NODE TO SURFACE
+SLAVE, MASTER
+```
+
+Penalty, Node-to-Surface, reibungsfrei. Slave-Knoten gegen Master-Flächen (C3D8/C3D20/C3D4/C3D10/C3D6). Aktiv bei Durchdringung \(g=n\cdot(x_s-x_c)<0\). Zwei Würfel in Serie: \(u_{z,\mathrm{oben}}=-0{,}01\) → Interface \(-0{,}005\). `*FRICTION` wird ignoriert. Nicht mit `NLGEOM` oder `*PLASTIC` kombiniert.
+
 ### Wärmeleitung und Dynamik (1.1)
 
 ```
@@ -265,6 +282,7 @@ Newmark (mittlere Beschleunigung). Lumped mass wie `*FREQUENCY`. Lasten mit `*AM
 | C3D8 SVK \(\lambda=1{,}2\) | Cauchy \(\sigma_{xx}=26{,}4\) |
 | T3D2 `*PLASTIC` | \(\sigma=250\), \(u\approx 3{,}095\) (über elastisch \(1{,}19\)) |
 | C3D8 `*PLASTIC` | \(\sigma=250\), \(u_x\approx 0{,}03095\) |
+| zwei C3D8 Kontakt | \(u_{z,\mathrm{Interface}}=-0{,}005\) |
 | Wärmeleitung T3D2 | \(T(0)=0\), \(T(L)=100\) → \(T(L/2)=50\) |
 | SDOF `*DYNAMIC` | \(k=100\), \(m=1\), \(u(T/2)=-u_0\) |
 | Kragträger B32 | Timoshenko \(\delta = PL^3/3EI + PL/kAG \approx 0{,}1906\) |
