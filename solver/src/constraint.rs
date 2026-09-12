@@ -174,6 +174,39 @@ impl DofMap {
         (ff, rhs)
     }
 
+    /// Like [`reduce`], but for a Newton increment: `du = T dx` (no `u0` particular solution).
+    pub fn reduce_inc(
+        &self,
+        trips: &[(usize, usize, f64)],
+        r_full: &[f64],
+    ) -> (Vec<(usize, usize, f64)>, Vec<f64>) {
+        let mut rhs = vec![0.0; self.n_ind];
+        for i in 0..self.n_full {
+            if i >= r_full.len() {
+                break;
+            }
+            let fi = r_full[i];
+            if fi.abs() == 0.0 {
+                continue;
+            }
+            for &(a, ta) in &self.t_row[i] {
+                rhs[a] += ta * fi;
+            }
+        }
+        let mut ff = Vec::new();
+        for &(i, j, v) in trips {
+            if i >= self.n_full || j >= self.n_full || v.abs() == 0.0 {
+                continue;
+            }
+            for &(a, ta) in &self.t_row[i] {
+                for &(b, tb) in &self.t_row[j] {
+                    ff.push((a, b, v * ta * tb));
+                }
+            }
+        }
+        (ff, rhs)
+    }
+
     pub fn reconstruct(&self, x: &[f64]) -> Vec<f64> {
         let mut u = self.u0.clone();
         for i in 0..self.n_full {

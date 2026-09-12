@@ -728,6 +728,69 @@ export const EXAMPLES: Example[] = [
     blurb: "Viertelmodell, Kerbspannung",
     inp: plateWithHole(),
   },
+  {
+    id: "nlgeom",
+    name: "Fachwerk NLGEOM",
+    blurb: "T3D2 *STEP, NLGEOM, u = FL/EA",
+    inp: `*HEADING
+T3D2 NLGEOM — kleine Dehnung, ux = FL/EA = 0.5
+*NODE
+1, 0, 0, 0
+2, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP, NLGEOM
+*STATIC
+*CLOAD
+2, 1, 21000
+*NODE FILE
+U, RF
+*EL FILE
+S
+*END STEP
+`,
+  },
+  {
+    id: "plastic",
+    name: "Zugstab plastisch",
+    blurb: "T3D2 *PLASTIC, σ = 250, u ≈ 3.1",
+    inp: `*HEADING
+T3D2 *PLASTIC — J2 1D, σ=250, ux ≈ 3.095
+*NODE
+1, 0, 0, 0
+2, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*PLASTIC
+210, 0.0
+420, 0.01
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 50000
+*NODE FILE
+U, RF
+*EL FILE
+S
+*END STEP
+`,
+  },
 ];
 
 export const DEFAULT_EXAMPLE = EXAMPLES[0];

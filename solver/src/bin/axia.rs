@@ -35,7 +35,7 @@ fn print_help() {
     let exe = env::args().next().unwrap_or_else(|| "axia".into());
     println!(
         "\
-Axia FEM {VERSION} — linear static solver (CalculiX INP / FRD / DAT)
+Axia FEM {VERSION} — FEM solver (CalculiX INP / FRD / DAT)
 
 Native sparse backends: PARDISO (MKL / Panua) if the library is on the
 loader path, otherwise rivrs-sparse. The chosen solver is printed on stderr.

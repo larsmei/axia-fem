@@ -1255,4 +1255,142 @@ thermal bar
             "R1x={r1}, expected 42000"
         );
     }
+
+    #[test]
+    fn nlgeom_truss_matches_small_strain() {
+        let inp = r#"
+*HEADING
+nlgeom small
+*NODE
+1, 0, 0, 0
+2, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP, NLGEOM
+*STATIC
+*CLOAD
+2, 1, 21000
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((u2 - 0.5).abs() < 1e-3, "NLGEOM ux={u2}");
+    }
+
+    #[test]
+    fn plastic_truss_hardening() {
+        let inp = r#"
+*HEADING
+plastic bar
+*NODE
+1, 0, 0, 0
+2, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*PLASTIC
+210, 0.0
+420, 0.01
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 50000
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        // σ=250, H=21000, peeq=(250-210)/H=0.0019048, ε=250/E+peeq=0.003095, u=3.095
+        assert!(
+            (u2 - 3.095).abs() / 3.095 < 0.05,
+            "plastic ux={u2}, expected ~3.095"
+        );
+        assert!(u2 > 1.2, "should exceed elastic u=1.19");
+    }
+
+    #[test]
+    fn plastic_below_yield_is_elastic() {
+        let inp = r#"
+*HEADING
+elastic plastic
+*NODE
+1, 0, 0, 0
+2, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*PLASTIC
+210, 0.0
+420, 0.01
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 40000
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        // σ=200 < 210 → u = FL/EA = 0.95238
+        assert!((u2 - 0.95238).abs() < 1e-3, "elastic plastic ux={u2}");
+        assert!(out.iters >= 1);
+    }
+
+    #[test]
+    fn nlgeom_hex_is_rejected() {
+        let inp = r#"
+*HEADING
+nlgeom hex
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+*ELEMENT, TYPE=C3D8, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 3
+*STEP, NLGEOM
+*STATIC
+*CLOAD
+2, 1, 1
+*END STEP
+"#;
+        let e = match solve_native(inp) {
+            Ok(_) => panic!("expected NLGEOM on C3D8 to fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("T3D2") || e.contains("NLGEOM"),
+            "unexpected error: {e}"
+        );
+    }
 }

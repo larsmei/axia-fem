@@ -646,7 +646,6 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                         nlgeom: true,
                         increments: 1,
                     };
-                    model.warn("NLGEOM: geometrisch nichtlineare Statik (falls unterstützt).");
                 }
                 i += 1;
             }
@@ -912,6 +911,23 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                 };
                 model.elset_spring.insert(elset, k);
             }
+            "*PLASTIC" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let name = current_material
+                    .clone()
+                    .unwrap_or_else(|| "MATERIAL-1".into());
+                let mut pts = Vec::new();
+                let mut k = 0;
+                while k + 1 < toks.len() {
+                    let sy = parse_f64(&toks[k])?;
+                    let pe = parse_f64(&toks[k + 1])?;
+                    k += 2;
+                    pts.push((pe, sy));
+                }
+                pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                model.plastic.insert(name, pts);
+            }
             "*EXPANSION" => {
                 let (toks, ni) = collect_tokens(&lines, i + 1);
                 i = ni;
@@ -986,7 +1002,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                                 "{other} nicht unterstützt in dieser Version."
                             ));
                         }
-                        "*PLASTIC" | "*CONTACT" | "*AMPLITUDE" | "*INITIAL CONDITIONS"
+                        "*CONTACT" | "*AMPLITUDE" | "*INITIAL CONDITIONS"
                         | "*ORIENTATION" => {
                             model.warn(format!("{other} wird ignoriert."));
                             let (_toks, ni) = collect_tokens(&lines, i + 1);

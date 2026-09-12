@@ -1,8 +1,8 @@
 [package]
 name = "axia-fem"
-version = "0.7.0"
+version = "1.0.0"
 edition = "2021"
-description = "Linear static FEM solver with CalculiX INP/FRD compatibility"
+description = "FEM solver with CalculiX INP/FRD compatibility (linear, frequency, buckle, NLGEOM, *PLASTIC)"
 license = "MIT"
 authors = ["Lars Meindl"]
 repository = "https://github.com/larsmei/axia-fem"

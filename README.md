@@ -1,6 +1,6 @@
 # Axia
 
-Linear-statischer FEM-Solver. CalculiX-/Abaqus-kompatibles INP einlesen, rechnen, FRD/DAT schreiben.
+FEM-Solver. CalculiX-/Abaqus-kompatibles INP einlesen, rechnen, FRD/DAT schreiben.
 
 Zwei Frontends, ein Solver:
 
@@ -8,6 +8,8 @@ Zwei Frontends, ein Solver:
 - **Browser** — Rust als WebAssembly, 3D-Viewer, komplett clientseitig
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
+
+**1.0** — linear-statisch, Eigenfrequenz, Beulen, Wärmedehnung; **NLGEOM** und **\*PLASTIC** (J2, 1D) für T3D2-Fachwerke.
 
 ## CLI
 
@@ -38,6 +40,9 @@ Mitgelieferte Decks in [`examples/`](examples/):
 | `freq_t3d2.inp` | axiale Eigenfrequenz T3D2 |
 | `buckle_b31.inp` | Euler-Beulen Kragträger B31 |
 | `include_main.inp` | `*INCLUDE` (zieht `include_mat.inp`) |
+| `thermal_bar.inp` | eingespannter Stab, `*EXPANSION` / `*TEMPERATURE` |
+| `nlgeom_truss.inp` | T3D2 `*STEP, NLGEOM`, kleine Dehnung \(u=FL/EA\) |
+| `plastic_bar.inp` | T3D2 `*PLASTIC` (isotrope Verfestigung), \(u\approx 3{,}095\) |
 
 ### Binary bauen
 
@@ -80,6 +85,8 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 - Linear-statische Analyse, isotrope Elastizität, MPC-Elimination (`*EQUATION`)
 - `*FREQUENCY` (lumped mass, inverse subspace) und `*BUCKLE` (geometrische Steifigkeit)
 - `*EXPANSION` + `*TEMPERATURE` (isotrope Wärmedehnung, T3D2 und C3D8*)
+- `*STEP, NLGEOM` — geometrisch nichtlineare Statik, **T3D2** (korotational, Newton)
+- `*PLASTIC` — J2 mit isotroper Verfestigung, **T3D2** (Kurve \(\sigma_y(\bar\varepsilon^p)\))
 - Sparse-Assembly (Triplet → CSR)
 - Native Sparse-Solver: **PARDISO** (Intel MKL oder Panua, dynamisch geladen) mit **rivrs-sparse** als Fallback; WASM: dichte Cholesky / PCG
 - Der jeweils verwendete Solver wird beim Aufruf ausgegeben (`axia: sparse solver: …`) und steht in der Statistik
@@ -165,6 +172,23 @@ Gemischte Modelle (Kontinuum + Schale/Balken) verwenden 6 DOF pro Knoten. Unbenu
 
 `*TIE` (knotenweise, nächster Nachbar), `*RIGID BODY, REF NODE=`, `*COUPLING` + `*DISTRIBUTING`/`*KINEMATIC`, `*TRANSFORM, TYPE=R` (lokale DOFs, Ausgabe global).
 
+### Nichtlinear (1.0, T3D2)
+
+```
+*STEP, NLGEOM
+*STATIC
+```
+
+Korotationaler Fachwerkstab: Materialtangent \(E_t A/L_0\) plus geometrische Steifigkeit \(N/L\,(I-nn^T)\). Kleine Dehnung reproduziert \(u=FL/EA\).
+
+```
+*PLASTIC
+210, 0.0
+420, 0.01
+```
+
+CalculiX-Reihenfolge \(\sigma_y, \bar\varepsilon^p\). 1D-J2, \(\varepsilon=\sigma/E+\bar\varepsilon^p\). Kontinuum (C3D8 …) und gemischte Netze mit NLGEOM/`*PLASTIC` werden abgelehnt.
+
 ## Beispiele und Checks
 
 | Beispiel | Erwartung |
@@ -172,6 +196,8 @@ Gemischte Modelle (Kontinuum + Schale/Balken) verwenden 6 DOF pro Knoten. Unbenu
 | Zugstab C3D8 / C3D8I / C3D20 | Patch-Test: \(u_x = 0{,}01\), \(\sigma_{xx} = 210\) |
 | Wedge C3D6 | Patch-Test entlang der Prisma-Achse: \(u_z = 0{,}01\) |
 | T3D2 / `*EQUATION` | \(u = FL/EA\); zwei Stäbe in Serie \(u_{\mathrm{tip}}=0{,}5\) |
+| T3D2 NLGEOM | kleine Dehnung: \(u=0{,}5\) |
+| T3D2 `*PLASTIC` | \(\sigma=250\), \(u\approx 3{,}095\) (über elastisch \(1{,}19\)) |
 | Kragträger B32 | Timoshenko \(\delta = PL^3/3EI + PL/kAG \approx 0{,}1906\) |
 | Kragplatte S4R | Euler \(\delta \approx 1{,}905\) (8×2, \(\nu=0\): \(\lvert u\rvert_{\max} \approx 1{,}83\)) |
 | Quadratplatte S4R | Kirchhoff \(\delta_{\max} \approx 0{,}00406\,qa^4/D \approx 0{,}211\) |

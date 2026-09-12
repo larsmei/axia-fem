@@ -46,7 +46,7 @@ function Home() {
   const [deformed, setDeformed] = useState(true);
   const [scaleMul, setScaleMul] = useState(1);
   const [tab, setTab] = useState<"inp" | "view">("view");
-  const [log, setLog] = useState<string[]>(["Axia · linear-statisch · C3D8 / C3D20 / S4R / S8R / B32"]);
+  const [log, setLog] = useState<string[]>(["Axia · FEM · C3D8 / T3D2 / S4R / B32 · NLGEOM / *PLASTIC"]);
   const fileRef = useRef<HTMLInputElement>(null);
   const autoRan = useRef(false);
 
@@ -77,7 +77,7 @@ function Home() {
     const s = r.stats;
     if (s) {
       setLog((l) => [
-        `${s.solver} · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)} · ${s.timeMs.toFixed(0)} ms`,
+        `${s.procedure ? s.procedure + " · " : ""}${s.solver} · ${s.iterations} it · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)} · ${s.timeMs.toFixed(0)} ms`,
         ...l,
       ].slice(0, 12));
     }
@@ -114,7 +114,7 @@ function Home() {
       setMesh(r);
       const s = r.stats;
       const line = s
-        ? `${s.solver} · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)} · ${s.timeMs.toFixed(0)} ms`
+        ? `${s.procedure ? s.procedure + " · " : ""}${s.solver} · ${s.iterations} it · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)} · ${s.timeMs.toFixed(0)} ms`
         : "Fertig.";
       setLog((l) => [line, ...(r.warnings ?? []), ...l].slice(0, 12));
       setTab("view");
@@ -143,7 +143,7 @@ function Home() {
     if (s) {
       setLog((l) =>
         [
-          `${s.solver} · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)} · ${s.timeMs.toFixed(0)} ms`,
+          `${s.procedure ? s.procedure + " · " : ""}${s.solver} · ${s.iterations} it · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)} · ${s.timeMs.toFixed(0)} ms`,
           ...l,
         ].slice(0, 12),
       );
@@ -192,7 +192,7 @@ function Home() {
         <div className="min-w-0 flex-1">
           <div className="flex items-baseline gap-2">
             <h1 className="text-[15px] font-medium tracking-tight">Axia</h1>
-            <p className="hidden text-xs text-muted sm:block">Linearer FEM-Solver · INP / FRD</p>
+            <p className="hidden text-xs text-muted sm:block">FEM-Solver · INP / FRD</p>
           </div>
         </div>
         <label className="hidden sm:block">

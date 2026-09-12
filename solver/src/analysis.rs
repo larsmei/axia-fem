@@ -53,6 +53,20 @@ fn dof_of(ndn: usize, node_index: usize, dir: usize) -> usize {
 
 pub fn solve(model: Model) -> Result<SolveOutput> {
     let t0 = now_ms();
+    let nlgeom = matches!(
+        model.procedure,
+        Procedure::Static { nlgeom: true, .. }
+    );
+    let truss2_only = !model.elements.is_empty()
+        && model.elements.iter().all(|e| e.kind == ElemKind::Truss2);
+    if nlgeom || model.has_plastic() {
+        if !truss2_only {
+            return err(
+                "NLGEOM und *PLASTIC sind in 1.0 nur für T3D2-Fachwerke implementiert.",
+            );
+        }
+        return solve_truss_newton(model, t0, nlgeom);
+    }
     solve_linear(model, t0)
 }
 
@@ -687,4 +701,348 @@ fn now_ms() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64() * 1000.0)
         .unwrap_or(0.0)
+}
+
+fn yield_from_curve(curve: &[(f64, f64)], peeq: f64) -> (f64, f64) {
+    if curve.is_empty() {
+        return (f64::MAX, 0.0);
+    }
+    if peeq <= curve[0].0 {
+        return (curve[0].1, 0.0);
+    }
+    for w in curve.windows(2) {
+        let (p0, s0) = w[0];
+        let (p1, s1) = w[1];
+        if peeq <= p1 {
+            let t = if (p1 - p0).abs() < 1e-16 {
+                0.0
+            } else {
+                (peeq - p0) / (p1 - p0)
+            };
+            let sy = s0 + t * (s1 - s0);
+            let h = if (p1 - p0).abs() < 1e-16 {
+                0.0
+            } else {
+                (s1 - s0) / (p1 - p0)
+            };
+            return (sy, h.max(0.0));
+        }
+    }
+    let last = curve[curve.len() - 1];
+    (last.1, 0.0)
+}
+
+fn truss_1d_stress(e: f64, eps: f64, curve: Option<&[(f64, f64)]>) -> (f64, f64) {
+    // returns (sigma, tangent E_t)
+    let Some(c) = curve else {
+        return (e * eps, e);
+    };
+    if c.is_empty() {
+        return (e * eps, e);
+    }
+    let sign = if eps >= 0.0 { 1.0 } else { -1.0 };
+    let aeps = eps.abs();
+    // ε = σ/E + peeq, σ = sy(peeq)
+    let mut pe = 0.0;
+    let (sy0, _) = yield_from_curve(c, 0.0);
+    if aeps <= sy0 / e {
+        return (sign * e * aeps, e);
+    }
+    for _ in 0..40 {
+        let (sy, h) = yield_from_curve(c, pe);
+        let eps_of = sy / e + pe;
+        let r = aeps - eps_of;
+        if r.abs() < 1e-14 {
+            return (sign * sy, (e * h) / (e + h).max(1e-30));
+        }
+        let den = h / e + 1.0;
+        pe += r / den.max(1e-30);
+        pe = pe.max(0.0);
+    }
+    let (sy, h) = yield_from_curve(c, pe);
+    (sign * sy, (e * h) / (e + h).max(1e-30))
+}
+
+fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput> {
+    let ndn = 3;
+    let nnode = model.node_ids.len();
+    let ndof = ndn * nnode;
+    let mut prescribed: HashMap<usize, f64> = HashMap::new();
+    for bc in &model.bcs {
+        if bc.dof >= ndn {
+            continue;
+        }
+        let ni = model.node_index(bc.node)?;
+        prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
+    }
+    let mut f_ext = vec![0.0; ndof];
+    for c in &model.cloads {
+        if c.dof >= ndn {
+            continue;
+        }
+        let ni = model.node_index(c.node)?;
+        f_ext[dof_of(ndn, ni, c.dof)] += c.mag;
+    }
+    let mpcs = constraint::build_all_mpcs(&model, ndn)?;
+    let map = DofMap::build(ndof, &prescribed, &mpcs)?;
+    let nfree = map.n_ind;
+    if nfree == 0 {
+        return err("Truss-Newton: keine freien DOF.");
+    }
+    let mut u_full = map.u0.clone();
+    let mut solver = String::new();
+    let mut residual = 0.0;
+    let mut iters = 0usize;
+    for it in 0..25 {
+        iters = it + 1;
+        let mut trips: Vec<(usize, usize, f64)> = Vec::new();
+        let mut f_int = vec![0.0; ndof];
+        for el in &model.elements {
+            let xyz0 = elem_xyz(&model, &el.nodes)?;
+            let nn = el.kind.nnodes();
+            let i1 = if nn == 2 { 1 } else { nn - 1 };
+            let mut xyz = xyz0.clone();
+            let mut ue = vec![0.0; 3 * nn];
+            for a in 0..nn {
+                let ni = model.node_index(el.nodes[a])?;
+                for d in 0..3 {
+                    ue[3 * a + d] = u_full[dof_of(ndn, ni, d)];
+                    xyz[a][d] = xyz0[a][d] + ue[3 * a + d];
+                }
+            }
+            let mat = model.material_for(el)?;
+            let area = model.thickness_for(el);
+            let mut d = [
+                xyz[i1][0] - xyz[0][0],
+                xyz[i1][1] - xyz[0][1],
+                xyz[i1][2] - xyz[0][2],
+            ];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-18);
+            d[0] /= len;
+            d[1] /= len;
+            d[2] /= len;
+            let mut d0 = [
+                xyz0[i1][0] - xyz0[0][0],
+                xyz0[i1][1] - xyz0[0][1],
+                xyz0[i1][2] - xyz0[0][2],
+            ];
+            let l0 = (d0[0] * d0[0] + d0[1] * d0[1] + d0[2] * d0[2]).sqrt().max(1e-18);
+            d0[0] /= l0;
+            d0[1] /= l0;
+            d0[2] /= l0;
+            let eps = (len - l0) / l0;
+            let curve = model.plastic_for(el);
+            let (sig, et) = truss_1d_stress(mat.e, eps, curve);
+            let nforce = sig * area;
+            let kax = et * area / l0;
+            let nd = 3 * nn;
+            let mut ke = vec![0.0; nd * nd];
+            let geom = if nlgeom { nforce / len } else { 0.0 };
+            for a in [0usize, i1] {
+                for b in [0usize, i1] {
+                    let s_ax = if a == b { kax } else { -kax };
+                    let s_g = if a == b { geom } else { -geom };
+                    for i in 0..3 {
+                        for j in 0..3 {
+                            let ax = d[i] * d[j];
+                            let pr = if i == j { 1.0 } else { 0.0 } - d[i] * d[j];
+                            ke[(3 * a + i) * nd + (3 * b + j)] += s_ax * ax + s_g * pr;
+                        }
+                    }
+                }
+            }
+            let mut fe = vec![0.0; nd];
+            for k in 0..3 {
+                fe[k] -= nforce * d[k];
+                fe[3 * i1 + k] += nforce * d[k];
+            }
+            if mat.alpha.abs() > 0.0 {
+                let t0n = 0.5
+                    * (model.temperature_at(el.nodes[0]) + model.temperature_at(el.nodes[i1]));
+                let dth = t0n - mat.tref;
+                let nth = mat.e * area * mat.alpha * dth;
+                for k in 0..3 {
+                    fe[k] -= nth * d0[k];
+                    fe[3 * i1 + k] += nth * d0[k];
+                }
+            }
+            let mut gdofs = Vec::new();
+            for a in 0..nn {
+                let ni = model.node_index(el.nodes[a])?;
+                for d in 0..3 {
+                    gdofs.push(dof_of(ndn, ni, d));
+                }
+            }
+            for i in 0..nd {
+                f_int[gdofs[i]] += fe[i];
+                for j in 0..nd {
+                    let v = ke[i * nd + j];
+                    if v.abs() > 0.0 {
+                        trips.push((gdofs[i], gdofs[j], v));
+                    }
+                }
+            }
+        }
+        let mut r = vec![0.0; ndof];
+        for i in 0..ndof {
+            r[i] = f_ext[i] - f_int[i];
+        }
+        let (ff, rhs) = map.reduce_inc(&trips, &r);
+        let solved = solve_kff(nfree, ff, &rhs)?;
+        solver = solved.name;
+        residual = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let du_full = {
+            let mut t = vec![0.0; ndof];
+            // reconstruct increment: T * du (ignore u0)
+            for i in 0..ndof {
+                for &(j, c) in &map.t_row[i] {
+                    t[i] += c * solved.x[j];
+                }
+            }
+            t
+        };
+        for i in 0..ndof {
+            u_full[i] += du_full[i];
+        }
+        let dun = solved.x.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if residual < 1e-8 * (1.0 + f_ext.iter().map(|v| v * v).sum::<f64>().sqrt()) || dun < 1e-12
+        {
+            break;
+        }
+        if it == 24 {
+            return err(format!(
+                "Newton konvergierte nicht (r={residual:.3e} nach {iters} Iterationen)."
+            ));
+        }
+    }
+    let mut u = vec![[0.0; 3]; nnode];
+    let ur = vec![[0.0; 3]; nnode];
+    let mut rf = vec![[0.0; 3]; nnode];
+    let rm = vec![[0.0; 3]; nnode];
+    // reactions from last residual ~ f_int - f_ext at supports
+    let mut f_int = vec![0.0; ndof];
+    for el in &model.elements {
+        let xyz0 = elem_xyz(&model, &el.nodes)?;
+        let nn = el.kind.nnodes();
+        let i1 = if nn == 2 { 1 } else { nn - 1 };
+        let mut xyz = xyz0.clone();
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for d in 0..3 {
+                xyz[a][d] = xyz0[a][d] + u_full[dof_of(ndn, ni, d)];
+            }
+        }
+        let mat = model.material_for(el)?;
+        let area = model.thickness_for(el);
+        let mut d = [
+            xyz[i1][0] - xyz[0][0],
+            xyz[i1][1] - xyz[0][1],
+            xyz[i1][2] - xyz[0][2],
+        ];
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-18);
+        d[0] /= len;
+        d[1] /= len;
+        d[2] /= len;
+        let l0 = {
+            let dx = xyz0[i1][0] - xyz0[0][0];
+            let dy = xyz0[i1][1] - xyz0[0][1];
+            let dz = xyz0[i1][2] - xyz0[0][2];
+            (dx * dx + dy * dy + dz * dz).sqrt().max(1e-18)
+        };
+        let eps = (len - l0) / l0;
+        let (sig, _) = truss_1d_stress(mat.e, eps, model.plastic_for(el));
+        let nforce = sig * area;
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            let s = if a == 0 { -1.0 } else if a == i1 { 1.0 } else { 0.0 };
+            for k in 0..3 {
+                f_int[dof_of(ndn, ni, k)] += s * nforce * d[k];
+            }
+        }
+    }
+    for ni in 0..nnode {
+        for d in 0..3 {
+            u[ni][d] = u_full[dof_of(ndn, ni, d)];
+            rf[ni][d] = f_int[dof_of(ndn, ni, d)] - f_ext[dof_of(ndn, ni, d)];
+        }
+    }
+    let mut stress = vec![[0.0; 6]; nnode];
+    let mut strain = vec![[0.0; 6]; nnode];
+    let mut vm = vec![0.0; nnode];
+    let mut stress_gp = Vec::new();
+    for el in &model.elements {
+        let xyz0 = elem_xyz(&model, &el.nodes)?;
+        let nn = el.kind.nnodes();
+        let i1 = if nn == 2 { 1 } else { nn - 1 };
+        let mut xyz = xyz0.clone();
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for d in 0..3 {
+                xyz[a][d] += u[ni][d];
+            }
+        }
+        let mat = model.material_for(el)?;
+        let l0 = {
+            let dx = xyz0[i1][0] - xyz0[0][0];
+            let dy = xyz0[i1][1] - xyz0[0][1];
+            let dz = xyz0[i1][2] - xyz0[0][2];
+            (dx * dx + dy * dy + dz * dz).sqrt().max(1e-18)
+        };
+        let len = {
+            let dx = xyz[i1][0] - xyz[0][0];
+            let dy = xyz[i1][1] - xyz[0][1];
+            let dz = xyz[i1][2] - xyz[0][2];
+            (dx * dx + dy * dy + dz * dz).sqrt().max(1e-18)
+        };
+        let eps = (len - l0) / l0;
+        let (sig, _) = truss_1d_stress(mat.e, eps, model.plastic_for(el));
+        let mut d = [
+            xyz[i1][0] - xyz[0][0],
+            xyz[i1][1] - xyz[0][1],
+            xyz[i1][2] - xyz[0][2],
+        ];
+        d[0] /= len;
+        d[1] /= len;
+        d[2] /= len;
+        let s = [
+            sig * d[0] * d[0],
+            sig * d[1] * d[1],
+            sig * d[2] * d[2],
+            sig * d[0] * d[1],
+            sig * d[1] * d[2],
+            sig * d[2] * d[0],
+        ];
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            stress[ni] = s;
+            strain[ni][0] = eps * d[0] * d[0];
+            vm[ni] = sig.abs();
+        }
+        stress_gp.push((el.id, 1usize, s));
+    }
+    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain);
+    let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
+    let procedure = model.procedure.name().to_string();
+    Ok(SolveOutput {
+        model,
+        u,
+        ur,
+        rf,
+        rm,
+        stress,
+        strain,
+        von_mises: vm,
+        stress_gp,
+        frd: frd_s,
+        dat: dat_s,
+        nfree,
+        ndof,
+        solver,
+        iters,
+        residual,
+        time_ms: now_ms() - t0,
+        procedure,
+        frequencies: vec![],
+        buckles: vec![],
+    })
 }

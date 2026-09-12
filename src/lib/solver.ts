@@ -18,6 +18,9 @@ export type FemStats = {
   iterations: number;
   residual: number;
   timeMs: number;
+  procedure?: string;
+  frequencies?: number[];
+  buckles?: number[];
   uMax: number;
   vmMin: number;
   vmMax: number;

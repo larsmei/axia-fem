@@ -498,6 +498,7 @@ pub struct Model {
     pub node_transform: HashMap<i32, [[f64; 3]; 3]>,
     pub elset_spring: HashMap<String, f64>,
     pub temperatures: HashMap<i32, f64>,
+    pub plastic: HashMap<String, Vec<(f64, f64)>>, // material -> [(peeq, sy)]
     pub procedure: Procedure,
     pub dim: usize,
     pub output_u: bool,
@@ -533,6 +534,7 @@ impl Model {
             node_transform: HashMap::new(),
             elset_spring: HashMap::new(),
             temperatures: HashMap::new(),
+            plastic: HashMap::new(),
             procedure: Procedure::default(),
             dim: 3,
             output_u: true,
@@ -708,5 +710,21 @@ impl Model {
 
     pub fn temperature_at(&self, node: i32) -> f64 {
         self.temperatures.get(&node).copied().unwrap_or(0.0)
+    }
+
+    pub fn plastic_for(&self, el: &Element) -> Option<&[(f64, f64)]> {
+        if let Some(mname) = self.elset_material.get(&el.elset) {
+            if let Some(p) = self.plastic.get(mname) {
+                return Some(p.as_slice());
+            }
+        }
+        if self.plastic.len() == 1 {
+            return self.plastic.values().next().map(|v| v.as_slice());
+        }
+        None
+    }
+
+    pub fn has_plastic(&self) -> bool {
+        !self.plastic.is_empty()
     }
 }
