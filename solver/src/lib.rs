@@ -51,6 +51,9 @@ fn mesh_json(model: &Model) -> Value {
                     v["area"] = json!(sec.area);
                 }
             }
+            if e.kind.is_truss() || e.kind.is_spring() {
+                v["area"] = json!(model.thickness_for(e));
+            }
             if e.kind.is_shell() {
                 v["th"] = json!(model.thickness_for(e));
             }

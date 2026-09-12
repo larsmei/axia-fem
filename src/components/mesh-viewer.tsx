@@ -507,43 +507,78 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
         emitBeam(loc[0], loc[1], loc[2], el.secA ?? 8, el.secB ?? 8, el.n1 ?? [0, 0, -1], true);
       } else if ((t === "B31" || t === "B31R") && loc.length >= 2) {
         emitBeam(loc[0], loc[1], loc[0], el.secA ?? 8, el.secB ?? 8, el.n1 ?? [0, 0, -1], false);
+      } else if ((t === "T3D3") && loc.length >= 3) {
+        const i0 = loc[0];
+        const i1 = loc[1];
+        const L =
+          Math.hypot(
+            pos[3 * i1] - pos[3 * i0],
+            pos[3 * i1 + 1] - pos[3 * i0 + 1],
+            pos[3 * i1 + 2] - pos[3 * i0 + 2],
+          ) || 1;
+        const side = Math.max(Math.sqrt(Math.max(el.area ?? 0, 0)), L * 0.02, 0.5);
+        emitBeam(i0, i1, loc[2], side, side, [0, 0, 1], true);
+      } else if (
+        (t === "T3D2" || t === "T2D2" || t === "SPRINGA" || t === "SPRING2" || loc.length === 2) &&
+        loc.length >= 2
+      ) {
+        const i0 = loc[0];
+        const i1 = loc[1];
+        const L =
+          Math.hypot(
+            pos[3 * i1] - pos[3 * i0],
+            pos[3 * i1 + 1] - pos[3 * i0 + 1],
+            pos[3 * i1 + 2] - pos[3 * i0 + 2],
+          ) || 1;
+        const side = Math.max(Math.sqrt(Math.max(el.area ?? 0, 0)), L * 0.02, 0.5);
+        emitBeam(i0, i1, i0, side, side, [0, 0, 1], false);
       }
     }
 
-    if (positions.length === 0) return;
+    if (positions.length === 0 && extraEdges.length === 0 && edgeSet.size === 0) return;
 
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-    geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
-    geo.computeVertexNormals();
-    const mat = new THREE.MeshLambertMaterial({
-      vertexColors: true,
-      side: THREE.DoubleSide,
-      polygonOffset: true,
-      polygonOffsetFactor: 1,
-      polygonOffsetUnits: 1,
-    });
-    const solid = new THREE.Mesh(geo, mat);
-    scene.add(solid);
-    state.current.solid = solid;
+    let fitBox: THREE.Box3 | null = null;
+    if (positions.length > 0) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+      geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+      geo.computeVertexNormals();
+      const mat = new THREE.MeshLambertMaterial({
+        vertexColors: true,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: 1,
+        polygonOffsetUnits: 1,
+      });
+      const solid = new THREE.Mesh(geo, mat);
+      scene.add(solid);
+      state.current.solid = solid;
+      geo.computeBoundingBox();
+      fitBox = geo.boundingBox;
+    }
 
     const epos: number[] = [...extraEdges];
     for (const key of edgeSet) {
       const [a, b] = key.split("-").map(Number);
       epos.push(pos[3 * a], pos[3 * a + 1], pos[3 * a + 2], pos[3 * b], pos[3 * b + 1], pos[3 * b + 2]);
     }
-    const ego = new THREE.BufferGeometry();
-    ego.setAttribute("position", new THREE.Float32BufferAttribute(epos, 3));
-    const edges = new THREE.LineSegments(
-      ego,
-      new THREE.LineBasicMaterial({ color: 0x0a0c0e, transparent: true, opacity: 0.55 }),
-    );
-    scene.add(edges);
-    state.current.edges = edges;
+    if (epos.length > 0) {
+      const ego = new THREE.BufferGeometry();
+      ego.setAttribute("position", new THREE.Float32BufferAttribute(epos, 3));
+      const edges = new THREE.LineSegments(
+        ego,
+        new THREE.LineBasicMaterial({ color: 0x0a0c0e, transparent: true, opacity: 0.55 }),
+      );
+      scene.add(edges);
+      state.current.edges = edges;
+      if (!fitBox) {
+        ego.computeBoundingBox();
+        fitBox = ego.boundingBox;
+      }
+    }
 
     const lastFit = state.current as typeof state.current & { fitKey?: string };
-    geo.computeBoundingBox();
-    const bb = geo.boundingBox;
+    const bb = fitBox;
     const fitKey = `${mesh.nnode}-${mesh.nelem}-${mesh.heading}`;
     if (bb && lastFit.fitKey !== fitKey) {
       lastFit.fitKey = fitKey;

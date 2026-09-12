@@ -1,6 +1,6 @@
 [package]
 name = "axia-fem"
-version = "1.7.0"
+version = "1.7.1"
 edition = "2021"
 description = "FEM solver with CalculiX INP/FRD compatibility (linear, frequency, buckle, heat, dynamic, NLGEOM, J2, contact+friction, multi-step)"
 license = "MIT"
