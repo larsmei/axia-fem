@@ -14,6 +14,20 @@ type Props = {
   scale: number;
 };
 
+const HEX20_FACES = [
+  [0, 1, 2, 3, 8, 9, 10, 11],
+  [4, 7, 6, 5, 15, 14, 13, 12],
+  [0, 4, 5, 1, 16, 12, 17, 8],
+  [1, 5, 6, 2, 17, 13, 18, 9],
+  [2, 6, 7, 3, 18, 14, 19, 10],
+  [3, 7, 4, 0, 19, 15, 16, 11],
+];
+const TET10_FACES = [
+  [0, 1, 2, 4, 5, 6],
+  [0, 3, 1, 7, 8, 4],
+  [0, 2, 3, 6, 9, 7],
+  [1, 3, 2, 8, 9, 5],
+];
 const HEX_FACES = [
   [0, 1, 2, 3],
   [4, 5, 6, 7],
@@ -198,6 +212,158 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
       }
     };
 
+    const nodeColor = (i: number): [number, number, number] => {
+      if (values) {
+        const t = (values[i] - vmin) / (vmax - vmin);
+        return sampleColor(t);
+      }
+      return [0.72, 0.58, 0.38];
+    };
+
+    const mix3 = (
+      a: [number, number, number],
+      b: [number, number, number],
+      c: [number, number, number],
+      n1: number,
+      n2: number,
+      n3: number,
+    ): [number, number, number] => [
+      a[0] * n1 + b[0] * n2 + c[0] * n3,
+      a[1] * n1 + b[1] * n2 + c[1] * n3,
+      a[2] * n1 + b[2] * n2 + c[2] * n3,
+    ];
+
+    const extraEdges: number[] = [];
+
+    const emitBeam = (
+      i0: number,
+      i1: number,
+      i2: number,
+      wa: number,
+      hb: number,
+      n1h: number[],
+      quadratic: boolean,
+    ) => {
+      const nseg = quadratic ? 10 : 6;
+      const p0 = [pos[3 * i0], pos[3 * i0 + 1], pos[3 * i0 + 2]];
+      const p1 = [pos[3 * i1], pos[3 * i1 + 1], pos[3 * i1 + 2]];
+      const p2 = quadratic
+        ? [pos[3 * i2], pos[3 * i2 + 1], pos[3 * i2 + 2]]
+        : p0;
+      const c0 = nodeColor(i0);
+      const c1 = nodeColor(i1);
+      const c2 = quadratic ? nodeColor(i2) : c0;
+      const hx = n1h[0] ?? 0;
+      const hy = n1h[1] ?? 0;
+      const hz = n1h[2] ?? -1;
+      const ha = Math.max(wa, 1e-6) * 0.5;
+      const hbh = Math.max(hb, 1e-6) * 0.5;
+      type St = { c: number[]; n1: number[]; n2: number[]; col: [number, number, number] };
+      const st: St[] = [];
+      for (let s = 0; s <= nseg; s++) {
+        const xi = -1 + (2 * s) / nseg;
+        let N1: number, N2: number, N3: number, d1: number, d2: number, d3: number;
+        if (quadratic) {
+          N1 = 0.5 * xi * (xi - 1);
+          N2 = 0.5 * xi * (xi + 1);
+          N3 = 1 - xi * xi;
+          d1 = xi - 0.5;
+          d2 = xi + 0.5;
+          d3 = -2 * xi;
+        } else {
+          N1 = 0.5 * (1 - xi);
+          N2 = 0.5 * (1 + xi);
+          N3 = 0;
+          d1 = -0.5;
+          d2 = 0.5;
+          d3 = 0;
+        }
+        const cx = N1 * p0[0] + N2 * p1[0] + N3 * p2[0];
+        const cy = N1 * p0[1] + N2 * p1[1] + N3 * p2[1];
+        const cz = N1 * p0[2] + N2 * p1[2] + N3 * p2[2];
+        let tx = d1 * p0[0] + d2 * p1[0] + d3 * p2[0];
+        let ty = d1 * p0[1] + d2 * p1[1] + d3 * p2[1];
+        let tz = d1 * p0[2] + d2 * p1[2] + d3 * p2[2];
+        const tl = Math.hypot(tx, ty, tz) || 1;
+        tx /= tl;
+        ty /= tl;
+        tz /= tl;
+        let x1 = hx - (hx * tx + hy * ty + hz * tz) * tx;
+        let y1 = hy - (hx * tx + hy * ty + hz * tz) * ty;
+        let z1 = hz - (hx * tx + hy * ty + hz * tz) * tz;
+        let n1l = Math.hypot(x1, y1, z1);
+        if (n1l < 1e-8) {
+          const ax = Math.abs(tz) < 0.9 ? 0 : 1;
+          const ay = 0;
+          const az = Math.abs(tz) < 0.9 ? -1 : 0;
+          x1 = ax - (ax * tx + ay * ty + az * tz) * tx;
+          y1 = ay - (ax * tx + ay * ty + az * tz) * ty;
+          z1 = az - (ax * tx + ay * ty + az * tz) * tz;
+          n1l = Math.hypot(x1, y1, z1) || 1;
+        }
+        x1 /= n1l;
+        y1 /= n1l;
+        z1 /= n1l;
+        const x2 = ty * z1 - tz * y1;
+        const y2 = tz * x1 - tx * z1;
+        const z2 = tx * y1 - ty * x1;
+        st.push({
+          c: [cx, cy, cz],
+          n1: [x1, y1, z1],
+          n2: [x2, y2, z2],
+          col: mix3(c0, c1, c2, N1, N2, N3),
+        });
+      }
+      const corner = (s: St, sy: number, sz: number) => [
+        s.c[0] + sy * ha * s.n1[0] + sz * hbh * s.n2[0],
+        s.c[1] + sy * ha * s.n1[1] + sz * hbh * s.n2[1],
+        s.c[2] + sy * ha * s.n1[2] + sz * hbh * s.n2[2],
+      ];
+      const signs: [number, number][] = [
+        [-1, -1],
+        [1, -1],
+        [1, 1],
+        [-1, 1],
+      ];
+      const pushRaw = (
+        pa: number[],
+        pb: number[],
+        pc: number[],
+        ca: [number, number, number],
+        cb: [number, number, number],
+        cc: [number, number, number],
+      ) => {
+        positions.push(pa[0], pa[1], pa[2], pb[0], pb[1], pb[2], pc[0], pc[1], pc[2]);
+        colors.push(ca[0], ca[1], ca[2], cb[0], cb[1], cb[2], cc[0], cc[1], cc[2]);
+      };
+      for (let s = 0; s < nseg; s++) {
+        const a = st[s];
+        const b = st[s + 1];
+        extraEdges.push(a.c[0], a.c[1], a.c[2], b.c[0], b.c[1], b.c[2]);
+        for (let k = 0; k < 4; k++) {
+          const k2 = (k + 1) % 4;
+          const a0 = corner(a, signs[k][0], signs[k][1]);
+          const a1 = corner(a, signs[k2][0], signs[k2][1]);
+          const b0 = corner(b, signs[k][0], signs[k][1]);
+          const b1 = corner(b, signs[k2][0], signs[k2][1]);
+          pushRaw(a0, b0, b1, a.col, b.col, b.col);
+          pushRaw(a0, b1, a1, a.col, b.col, a.col);
+        }
+      }
+      const cap = (s: St, flip: boolean) => {
+        const q = signs.map(([sy, sz]) => corner(s, sy, sz));
+        if (flip) {
+          pushRaw(q[0], q[3], q[2], s.col, s.col, s.col);
+          pushRaw(q[0], q[2], q[1], s.col, s.col, s.col);
+        } else {
+          pushRaw(q[0], q[1], q[2], s.col, s.col, s.col);
+          pushRaw(q[0], q[2], q[3], s.col, s.col, s.col);
+        }
+      };
+      cap(st[0], true);
+      cap(st[st.length - 1], false);
+    };
+
     const edgeSet = new Set<string>();
     const addEdge = (a: number, b: number) => {
       const lo = Math.min(a, b);
@@ -224,20 +390,89 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
           addEdge(loc[f[1]], loc[f[2]]);
           addEdge(loc[f[2]], loc[f[0]]);
         }
-      } else if ((t === "CPS4" || t === "CPE4") && loc.length >= 4) {
+      } else if ((t === "CPS4" || t === "CPE4" || t === "S4" || t === "S4R") && loc.length >= 4) {
         pushTri(loc[0], loc[1], loc[2]);
         pushTri(loc[0], loc[2], loc[3]);
         addEdge(loc[0], loc[1]);
         addEdge(loc[1], loc[2]);
         addEdge(loc[2], loc[3]);
         addEdge(loc[3], loc[0]);
-      } else if ((t === "CPS3" || t === "CPE3") && loc.length >= 3) {
+      } else if ((t === "CPS3" || t === "CPE3" || t === "S3" || t === "S3R") && loc.length >= 3) {
         pushTri(loc[0], loc[1], loc[2]);
         addEdge(loc[0], loc[1]);
         addEdge(loc[1], loc[2]);
         addEdge(loc[2], loc[0]);
+      } else if ((t === "C3D20" || t === "C3D20R") && loc.length >= 20) {
+        for (const f of HEX20_FACES) {
+          const [c0, c1, c2, c3, m01, m12, m23, m30] = f.map((i) => loc[i]);
+          pushTri(c0, m01, m30);
+          pushTri(m01, c1, m12);
+          pushTri(m12, c2, m23);
+          pushTri(m23, c3, m30);
+          pushTri(m01, m12, m23);
+          pushTri(m01, m23, m30);
+          addEdge(c0, m01);
+          addEdge(m01, c1);
+          addEdge(c1, m12);
+          addEdge(m12, c2);
+          addEdge(c2, m23);
+          addEdge(m23, c3);
+          addEdge(c3, m30);
+          addEdge(m30, c0);
+        }
+      } else if (t === "C3D10" && loc.length >= 10) {
+        for (const f of TET10_FACES) {
+          const [c0, c1, c2, m01, m12, m20] = f.map((i) => loc[i]);
+          pushTri(c0, m01, m20);
+          pushTri(m01, c1, m12);
+          pushTri(m20, m12, c2);
+          pushTri(m01, m12, m20);
+          addEdge(c0, m01);
+          addEdge(m01, c1);
+          addEdge(c1, m12);
+          addEdge(m12, c2);
+          addEdge(c2, m20);
+          addEdge(m20, c0);
+        }
+      } else if (
+        (t === "CPS8" || t === "CPE8" || t === "CPS8R" || t === "CPE8R" || t === "S8" || t === "S8R") &&
+        loc.length >= 8
+      ) {
+        const [c0, c1, c2, c3, m01, m12, m23, m30] = loc;
+        pushTri(c0, m01, m30);
+        pushTri(m01, c1, m12);
+        pushTri(m12, c2, m23);
+        pushTri(m23, c3, m30);
+        pushTri(m01, m12, m23);
+        pushTri(m01, m23, m30);
+        addEdge(c0, m01);
+        addEdge(m01, c1);
+        addEdge(c1, m12);
+        addEdge(m12, c2);
+        addEdge(c2, m23);
+        addEdge(m23, c3);
+        addEdge(c3, m30);
+        addEdge(m30, c0);
+      } else if ((t === "CPS6" || t === "CPE6" || t === "S6") && loc.length >= 6) {
+        const [c0, c1, c2, m01, m12, m20] = loc;
+        pushTri(c0, m01, m20);
+        pushTri(m01, c1, m12);
+        pushTri(m20, m12, c2);
+        pushTri(m01, m12, m20);
+        addEdge(c0, m01);
+        addEdge(m01, c1);
+        addEdge(c1, m12);
+        addEdge(m12, c2);
+        addEdge(c2, m20);
+        addEdge(m20, c0);
+      } else if ((t === "B32" || t === "B32R") && loc.length >= 3) {
+        emitBeam(loc[0], loc[1], loc[2], el.secA ?? 8, el.secB ?? 8, el.n1 ?? [0, 0, -1], true);
+      } else if ((t === "B31" || t === "B31R") && loc.length >= 2) {
+        emitBeam(loc[0], loc[1], loc[0], el.secA ?? 8, el.secB ?? 8, el.n1 ?? [0, 0, -1], false);
       }
     }
+
+    if (positions.length === 0) return;
 
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
@@ -254,7 +489,7 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
     scene.add(solid);
     state.current.solid = solid;
 
-    const epos: number[] = [];
+    const epos: number[] = [...extraEdges];
     for (const key of edgeSet) {
       const [a, b] = key.split("-").map(Number);
       epos.push(pos[3 * a], pos[3 * a + 1], pos[3 * a + 2], pos[3 * b], pos[3 * b + 1], pos[3 * b + 2]);

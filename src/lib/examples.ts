@@ -373,7 +373,313 @@ S
 `;
 }
 
+function cantileverB32(): string {
+  const l = 200;
+  const nel = 8;
+  const nnode = 2 * nel + 1;
+  let nodes = "";
+  for (let i = 0; i < nnode; i++) {
+    const x = (l * i) / (nnode - 1);
+    nodes += `${i + 1}, ${x.toFixed(4)}, 0, 0\n`;
+  }
+  let elems = "";
+  for (let e = 0; e < nel; e++) {
+    const n1 = 2 * e + 1;
+    const mid = n1 + 1;
+    const n2 = n1 + 2;
+    elems += `${e + 1}, ${n1}, ${n2}, ${mid}\n`;
+  }
+  const tip = nnode;
+  return `*HEADING
+Kragträger B32 — Timoshenko, wie Abaqus
+** L=200, RECT 10×20 (n1=Z, Höhe Y), E=210000, P=100 in −Y
+** δ = PL³/3EI + PL/kAG ≈ 0.1906
+*NODE
+${nodes}*ELEMENT, TYPE=B32, ELSET=BEAM
+${elems}*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*BEAM SECTION, ELSET=BEAM, MATERIAL=STEEL, SECTION=RECT
+10, 20
+0, 0, 1
+*BOUNDARY
+1, 1, 6
+*STEP
+*STATIC
+*CLOAD
+${tip}, 2, -100
+*NODE FILE
+U, RF
+*EL FILE
+S
+*END STEP
+`;
+}
+
+function portalB32(): string {
+  const segs = (id0: number, e0: number, x0: number, y0: number, x1: number, y1: number) => {
+    const nodes: string[] = [];
+    const elems: string[] = [];
+    const n = 5;
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
+      nodes.push(
+        `${id0 + i}, ${(x0 + (x1 - x0) * t).toFixed(4)}, ${(y0 + (y1 - y0) * t).toFixed(4)}, 0`,
+      );
+    }
+    elems.push(`${e0}, ${id0}, ${id0 + 2}, ${id0 + 1}`);
+    elems.push(`${e0 + 1}, ${id0 + 2}, ${id0 + 4}, ${id0 + 3}`);
+    return { nodes, elems };
+  };
+  const c1 = segs(1, 1, 0, 0, 0, 200);
+  const c2 = segs(6, 3, 400, 0, 400, 200);
+  return `*HEADING
+Portalrahmen B32 — Stützen + Riegel, Last +X am Kopf
+*NODE
+${c1.nodes.join("\n")}
+${c2.nodes.join("\n")}
+11, 100, 200, 0
+12, 200, 200, 0
+13, 300, 200, 0
+*ELEMENT, TYPE=B32, ELSET=FRAME
+${c1.elems.join("\n")}
+${c2.elems.join("\n")}
+5, 5, 12, 11
+6, 12, 10, 13
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*BEAM SECTION, ELSET=FRAME, MATERIAL=STEEL, SECTION=RECT
+8, 16
+0, 0, 1
+*NSET, NSET=FIX
+1, 6
+*BOUNDARY
+FIX, 1, 6
+*STEP
+*STATIC
+*CLOAD
+10, 1, 50
+*NODE FILE
+U, RF
+*EL FILE
+S
+*END STEP
+`;
+}
+
+function cantileverCps8(): string {
+  const nx = 8;
+  const ny = 2;
+  const lx = 100;
+  const ly = 10;
+  let nodes = "";
+  let next = 1;
+  const idOf: number[][] = Array.from({ length: 2 * ny + 1 }, () =>
+    Array<number>(2 * nx + 1).fill(0),
+  );
+  for (let j = 0; j <= 2 * ny; j++) {
+    for (let i = 0; i <= 2 * nx; i++) {
+      if (i % 2 === 1 && j % 2 === 1) continue;
+      const x = (lx * i) / (2 * nx);
+      const y = (ly * j) / (2 * ny);
+      idOf[j][i] = next;
+      nodes += `${next}, ${x.toFixed(6)}, ${y.toFixed(6)}, 0\n`;
+      next += 1;
+    }
+  }
+  let elems = "";
+  let e = 1;
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const i0 = 2 * i;
+      const j0 = 2 * j;
+      const n1 = idOf[j0][i0];
+      const n2 = idOf[j0][i0 + 2];
+      const n3 = idOf[j0 + 2][i0 + 2];
+      const n4 = idOf[j0 + 2][i0];
+      const n5 = idOf[j0][i0 + 1];
+      const n6 = idOf[j0 + 1][i0 + 2];
+      const n7 = idOf[j0 + 2][i0 + 1];
+      const n8 = idOf[j0 + 1][i0];
+      elems += `${e}, ${n1}, ${n2}, ${n3}, ${n4}, ${n5}, ${n6}, ${n7}, ${n8}\n`;
+      e += 1;
+    }
+  }
+  let fix = "*NSET, NSET=FIX\n";
+  for (let j = 0; j <= 2 * ny; j++) if (idOf[j][0]) fix += `${idOf[j][0]},\n`;
+  const tip: number[] = [];
+  for (let j = 0; j <= 2 * ny; j++) if (idOf[j][2 * nx]) tip.push(idOf[j][2 * nx]);
+  const p = 100 / tip.length;
+  let cload = "*CLOAD\n";
+  for (const id of tip) cload += `${id}, 2, ${(-p).toFixed(6)}\n`;
+  return `*HEADING
+Kragträger CPS8 — quadratische Vierecke
+** L=100, h=10, t=1, P=100. Euler δ ≈ 1.905
+*NODE
+${nodes}*ELEMENT, TYPE=CPS8, ELSET=PLATE
+${elems}*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=PLATE, MATERIAL=STEEL
+1.0
+${fix}*BOUNDARY
+FIX, 1, 2
+*STEP
+*STATIC
+${cload}*NODE FILE
+U
+*EL FILE
+S
+*END STEP
+`;
+}
+
+const tensionC3d20 = `*HEADING
+Uniaxialer Zugstab — C3D20 Patch-Test
+** Ein quadratisches Hexaeder, 20 Knoten. Erwartung: ux=0.01, Sxx=210.
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+9, 5, 0, 0
+10, 10, 5, 0
+11, 5, 10, 0
+12, 0, 5, 0
+13, 5, 0, 10
+14, 10, 5, 10
+15, 5, 10, 10
+16, 0, 5, 10
+17, 0, 0, 5
+18, 10, 0, 5
+19, 10, 10, 5
+20, 0, 10, 5
+*ELEMENT, TYPE=C3D20, ELSET=SOLID
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=SOLID, MATERIAL=STEEL
+*NSET, NSET=FIXED
+1, 4, 5, 8, 12, 16, 17, 20
+*BOUNDARY
+FIXED, 1, 1
+1, 2, 3
+4, 3, 3
+*STEP
+*STATIC
+*DLOAD
+1, P4, 210
+*NODE FILE
+U, RF
+*EL FILE
+S
+*END STEP
+`;
+
+function cantileverS4(): string {
+  const nx = 8;
+  const ny = 2;
+  const { nodes, elems, id } = quadLattice(nx, ny, 100, 10);
+  let fix = "";
+  for (let j = 0; j <= ny; j++) fix += `${id(0, j)},\n`;
+  const p = (1 / (ny + 1)).toFixed(6);
+  let cload = "";
+  for (let j = 0; j <= ny; j++) cload += `${id(nx, j)}, 3, ${-Number(p)}\n`;
+  return `*HEADING
+Kragplatte S4R — Mindlin/MITC4, 6 DOF
+** L=100, b=10, t=1, E=210000, ν=0, P=1. Euler δ = PL³/3EI ≈ 1.905
+*NODE
+${nodes}*ELEMENT, TYPE=S4R, ELSET=PLATE
+${elems}*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.0
+*SHELL SECTION, ELSET=PLATE, MATERIAL=STEEL
+1.0
+*NSET, NSET=FIX
+${fix}*BOUNDARY
+FIX, 1, 6
+*STEP
+*STATIC
+*CLOAD
+${cload}*NODE FILE
+U
+*EL FILE
+S
+*END STEP
+`;
+}
+
+function ssPlateS4(): string {
+  const n = 8;
+  const a = 100;
+  const { nodes, elems, id } = quadLattice(n, n, a, a);
+  // simply supported: w=0 on all edges, plus in-plane pin
+  let bc = "";
+  for (let i = 0; i <= n; i++) {
+    bc += `${id(i, 0)}, 3, 3\n`;
+    bc += `${id(i, n)}, 3, 3\n`;
+  }
+  for (let j = 1; j < n; j++) {
+    bc += `${id(0, j)}, 3, 3\n`;
+    bc += `${id(n, j)}, 3, 3\n`;
+  }
+  bc += `${id(0, 0)}, 1, 2\n`;
+  bc += `${id(n, 0)}, 2, 2\n`;
+  return `*HEADING
+Gelagerte Quadratplatte S4R — Gleichlast
+** a=100, t=1, q=0.01, E=210000, ν=0.3
+** Kirchhoff δ_max ≈ 0.00406 q a⁴ / D ≈ 0.211
+*NODE
+${nodes}*ELEMENT, TYPE=S4R, ELSET=PLATE
+${elems}*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SHELL SECTION, ELSET=PLATE, MATERIAL=STEEL
+1.0
+*BOUNDARY
+${bc}*STEP
+*STATIC
+*DLOAD
+EALL, P, -0.01
+*NODE FILE
+U
+*EL FILE
+S
+*END STEP
+`;
+}
+
 export const EXAMPLES: Example[] = [
+  {
+    id: "b32",
+    name: "Kragträger B32",
+    blurb: "Timoshenko-Balken, Abaqus B32",
+    inp: cantileverB32(),
+  },
+  {
+    id: "s4r",
+    name: "Kragplatte S4R",
+    blurb: "Mindlin-Schale MITC4, 6 DOF",
+    inp: cantileverS4(),
+  },
+  {
+    id: "plate",
+    name: "Quadratplatte S4R",
+    blurb: "Allseitig gelagert, Gleichlast",
+    inp: ssPlateS4(),
+  },
+  {
+    id: "frame",
+    name: "Rahmen B32",
+    blurb: "Portalrahmen aus B32",
+    inp: portalB32(),
+  },
   {
     id: "patch",
     name: "Zugstab C3D8",
@@ -391,6 +697,18 @@ export const EXAMPLES: Example[] = [
     name: "Kragträger 2D",
     blurb: "CPS4, Vergleich Euler-Balken",
     inp: cantilever2d(),
+  },
+  {
+    id: "cps8",
+    name: "Kragträger CPS8",
+    blurb: "Quadratische Vierecke, 2. Ordnung",
+    inp: cantileverCps8(),
+  },
+  {
+    id: "c3d20",
+    name: "Zugstab C3D20",
+    blurb: "Ein 20-Knoten-Hexaeder",
+    inp: tensionC3d20.trimStart(),
   },
   {
     id: "beam3d",
@@ -412,4 +730,4 @@ export const EXAMPLES: Example[] = [
   },
 ];
 
-export const DEFAULT_EXAMPLE = EXAMPLES[2];
+export const DEFAULT_EXAMPLE = EXAMPLES[0];

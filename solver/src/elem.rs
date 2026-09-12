@@ -1,7 +1,10 @@
+use crate::beam;
 use crate::error::{err, Result};
-use crate::model::ElemKind;
+use crate::model::{BeamSection, ElemKind};
+use crate::quadratic;
+use crate::shell;
 
-const G2: f64 = 0.5773502691896257; // 1/sqrt(3)
+pub(crate) const G2: f64 = 0.5773502691896257; // 1/sqrt(3)
 
 pub fn invert3(a: [[f64; 3]; 3]) -> Result<([[f64; 3]; 3], f64)> {
     let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
@@ -83,7 +86,7 @@ pub fn d_plane_strain(e: f64, nu: f64) -> Result<[f64; 9]> {
     Ok(d)
 }
 
-fn gemm_bt_d_b(ke: &mut [f64], n: usize, b: &[f64], nrow: usize, d: &[f64], w: f64) {
+pub(crate) fn gemm_bt_d_b(ke: &mut [f64], n: usize, b: &[f64], nrow: usize, d: &[f64], w: f64) {
     // tmp = D * B  (nrow x n)
     let mut tmp = vec![0.0; nrow * n];
     for i in 0..nrow {
@@ -107,7 +110,7 @@ fn gemm_bt_d_b(ke: &mut [f64], n: usize, b: &[f64], nrow: usize, d: &[f64], w: f
     }
 }
 
-fn fill_b3(b: &mut [f64], nnode: usize, dndx: &[[f64; 3]]) {
+pub(crate) fn fill_b3(b: &mut [f64], nnode: usize, dndx: &[[f64; 3]]) {
     // B 6 x (3*nnode), row-major
     let n = 3 * nnode;
     for i in 0..nnode {
@@ -127,7 +130,7 @@ fn fill_b3(b: &mut [f64], nnode: usize, dndx: &[[f64; 3]]) {
     }
 }
 
-fn fill_b2(b: &mut [f64], nnode: usize, dndx: &[[f64; 2]]) {
+pub(crate) fn fill_b2(b: &mut [f64], nnode: usize, dndx: &[[f64; 2]]) {
     let n = 2 * nnode;
     for i in 0..nnode {
         let c = 2 * i;
@@ -339,6 +342,7 @@ pub fn element_ke(
     e: f64,
     nu: f64,
     thickness: f64,
+    section: Option<&BeamSection>,
 ) -> Result<KeFe> {
     match kind {
         ElemKind::Hex8 => {
@@ -394,6 +398,86 @@ pub fn element_ke(
                 volume: area * thickness,
             })
         }
+        ElemKind::Beam31 | ElemKind::Beam32 => {
+            let sec = section.ok_or_else(|| {
+                crate::error::FemError("Balkenelement ohne *BEAM SECTION.".into())
+            })?;
+            let (ke, len) = beam::stiffness(kind, xyz, e, nu, sec)?;
+            let ndof = 6 * kind.nnodes();
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; ndof],
+                ndof,
+                volume: len * sec.area,
+            })
+        }
+        ElemKind::Hex20 | ElemKind::Hex20R => {
+            let (ke, vol) = quadratic::hex20_stiffness(xyz, e, nu, kind.reduced_int())?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 60],
+                ndof: 60,
+                volume: vol,
+            })
+        }
+        ElemKind::Tet10 => {
+            let (ke, vol) = quadratic::tet10_stiffness(xyz, e, nu)?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 30],
+                ndof: 30,
+                volume: vol,
+            })
+        }
+        ElemKind::Quad8Ps | ElemKind::Quad8Pe | ElemKind::Quad8RPs | ElemKind::Quad8RPe => {
+            let mut p = [[0.0; 2]; 8];
+            for i in 0..8 {
+                p[i] = [xyz[i][0], xyz[i][1]];
+            }
+            let (ke, area) = quadratic::quad8_stiffness(
+                &p,
+                e,
+                nu,
+                thickness,
+                kind.is_plane_strain(),
+                kind.reduced_int(),
+            )?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 16],
+                ndof: 16,
+                volume: area * thickness,
+            })
+        }
+        ElemKind::Tri6Ps | ElemKind::Tri6Pe => {
+            let mut p = [[0.0; 2]; 6];
+            for i in 0..6 {
+                p[i] = [xyz[i][0], xyz[i][1]];
+            }
+            let (ke, area) =
+                quadratic::tri6_stiffness(&p, e, nu, thickness, kind.is_plane_strain())?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 12],
+                ndof: 12,
+                volume: area * thickness,
+            })
+        }
+        ElemKind::Shell4
+        | ElemKind::Shell4R
+        | ElemKind::Shell3
+        | ElemKind::Shell8
+        | ElemKind::Shell8R
+        | ElemKind::Shell6 => {
+            let (ke, area) = shell::stiffness(kind, xyz, e, nu, thickness)?;
+            let ndof = 6 * kind.nnodes();
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; ndof],
+                ndof,
+                volume: area * thickness,
+            })
+        }
     }
 }
 
@@ -405,6 +489,8 @@ pub fn element_nodal_stress(
     ue: &[f64],
     e: f64,
     nu: f64,
+    section: Option<&BeamSection>,
+    thickness: f64,
 ) -> Result<Vec<[f64; 6]>> {
     match kind {
         ElemKind::Hex8 => hex8_nodal_stress(xyz, ue, e, nu),
@@ -415,10 +501,30 @@ pub fn element_nodal_stress(
         ElemKind::Tri3Ps | ElemKind::Tri3Pe => {
             tri3_nodal_stress(xyz, ue, e, nu, kind.is_plane_strain())
         }
+        ElemKind::Beam31 | ElemKind::Beam32 => {
+            let sec = section.ok_or_else(|| {
+                crate::error::FemError("Balkenelement ohne *BEAM SECTION.".into())
+            })?;
+            beam::nodal_stress(kind, xyz, ue, e, nu, sec)
+        }
+        ElemKind::Hex20 | ElemKind::Hex20R => quadratic::hex20_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Tet10 => quadratic::tet10_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Quad8Ps | ElemKind::Quad8Pe | ElemKind::Quad8RPs | ElemKind::Quad8RPe => {
+            quadratic::quad8_nodal_stress(xyz, ue, e, nu, kind.is_plane_strain())
+        }
+        ElemKind::Tri6Ps | ElemKind::Tri6Pe => {
+            quadratic::tri6_nodal_stress(xyz, ue, e, nu, kind.is_plane_strain())
+        }
+        ElemKind::Shell4
+        | ElemKind::Shell4R
+        | ElemKind::Shell3
+        | ElemKind::Shell8
+        | ElemKind::Shell8R
+        | ElemKind::Shell6 => shell::nodal_stress(kind, xyz, ue, e, nu, thickness),
     }
 }
 
-fn sigma_from_b(b: &[f64], nrow: usize, n: usize, d: &[f64], ue: &[f64]) -> Vec<f64> {
+pub(crate) fn sigma_from_b(b: &[f64], nrow: usize, n: usize, d: &[f64], ue: &[f64]) -> Vec<f64> {
     let mut eps = vec![0.0; nrow];
     for r in 0..nrow {
         let mut s = 0.0;

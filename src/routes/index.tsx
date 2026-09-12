@@ -46,7 +46,7 @@ function Home() {
   const [deformed, setDeformed] = useState(true);
   const [scaleMul, setScaleMul] = useState(1);
   const [tab, setTab] = useState<"inp" | "view">("view");
-  const [log, setLog] = useState<string[]>(["Axia · linear-statisch · C3D8 / C3D4 / CPS4 / CPE4 / CPS3 / CPE3"]);
+  const [log, setLog] = useState<string[]>(["Axia · linear-statisch · C3D8 / C3D20 / S4R / S8R / B32"]);
   const fileRef = useRef<HTMLInputElement>(null);
   const autoRan = useRef(false);
 

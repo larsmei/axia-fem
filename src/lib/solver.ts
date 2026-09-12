@@ -2,6 +2,11 @@ export type FemElement = {
   id: number;
   type: string;
   nodes: number[];
+  secA?: number;
+  secB?: number;
+  n1?: number[];
+  area?: number;
+  th?: number;
 };
 
 export type FemStats = {
@@ -34,6 +39,7 @@ export type FemResult = {
   nelem?: number;
   warnings?: string[];
   u?: number[];
+  ur?: number[];
   stress?: number[];
   rf?: number[];
   vonMises?: number[];

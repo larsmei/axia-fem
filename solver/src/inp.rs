@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::{err, Result};
-use crate::model::{Boundary, Cload, Dload, ElemKind, Element, Material, Model};
+use crate::model::{BeamSection, Boundary, Cload, Dload, ElemKind, Element, Material, Model};
 
 fn strip_comment(line: &str) -> &str {
     let t = line.trim();
@@ -166,7 +166,7 @@ pub fn parse(inp: &str) -> Result<Model> {
                 })?;
                 let kind = ElemKind::from_ccx(&typ).ok_or_else(|| {
                     crate::error::FemError(format!(
-                        "Nicht unterstützter Elementtyp {typ}. Unterstützt: C3D8, C3D4, CPS4, CPE4, CPS3, CPE3."
+                        "Nicht unterstützter Elementtyp {typ}. Unterstützt: C3D8, C3D20, C3D4, C3D10, CPS4, CPS8, S4R, S8R, S3, S6, CPE*, B31, B32."
                     ))
                 })?;
                 let elset = params
@@ -334,6 +334,23 @@ pub fn parse(inp: &str) -> Result<Model> {
                 };
                 model.elset_thickness.insert(elset, t);
             }
+            "*BEAM SECTION" | "*BEAM GENERAL SECTION" => {
+                let elset = params.get("ELSET").cloned().unwrap_or_else(|| "EALL".into());
+                if let Some(mat) = params.get("MATERIAL") {
+                    model.elset_material.insert(elset.clone(), mat.clone());
+                }
+                let sectyp = params
+                    .get("SECTION")
+                    .cloned()
+                    .unwrap_or_else(|| "RECT".into());
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if toks.is_empty() {
+                    return err("*BEAM SECTION ohne Querschnittswerte");
+                }
+                let sec = parse_beam_section(&sectyp, &toks)?;
+                model.elset_beam.insert(elset, sec);
+            }
             "*BOUNDARY" => {
                 let (toks, ni) = collect_tokens(&lines, i + 1);
                 i = ni;
@@ -421,7 +438,7 @@ pub fn parse(inp: &str) -> Result<Model> {
                     if parse_i32(&name).is_ok() {
                         let id = parse_i32(&name)?;
                         for d in first..=last {
-                            if d >= 1 && d <= 3 {
+                            if d >= 1 && d <= 6 {
                                 model.bcs.push(Boundary {
                                     node: id,
                                     dof: d - 1,
@@ -430,14 +447,8 @@ pub fn parse(inp: &str) -> Result<Model> {
                             }
                         }
                     } else {
-                        // stash in nsets later — put the name as a comment card via a
-                        // dedicated vec. We'll use a hack: node = i32::MIN, value unused,
-                        // and keep names in warnings? Better add deferred field.
-                        // Use elset_material-like: push to a temp via nsets if exists, else
-                        // store in materials? Let's add deferred via a string in model.warnings
-                        // prefix "BCSET|"
                         for d in first..=last {
-                            if d >= 1 && d <= 3 {
+                            if d >= 1 && d <= 6 {
                                 model.warnings.push(format!(
                                     "__BC__|{name}|{}|{}|{val}",
                                     d - 1,
@@ -457,7 +468,7 @@ pub fn parse(inp: &str) -> Result<Model> {
                     let dof = parse_i32(&toks[k + 1])? as usize;
                     let mag = parse_f64(&toks[k + 2])?;
                     k += 3;
-                    if dof < 1 || dof > 3 {
+                    if dof < 1 || dof > 6 {
                         model.warn(format!("CLOAD Freiheitsgrad {dof} ignoriert"));
                         continue;
                     }
@@ -493,6 +504,25 @@ pub fn parse(inp: &str) -> Result<Model> {
                             mag,
                             dir: [dx, dy, dz],
                         });
+                    } else if typ == "PX" || typ == "PY" || typ == "PZ" {
+                        if k >= toks.len() {
+                            return err("*DLOAD PX/PY/PZ ohne Betrag");
+                        }
+                        let mag = parse_f64(&toks[k])?;
+                        k += 1;
+                        let dir = match typ.as_str() {
+                            "PX" => [1.0, 0.0, 0.0],
+                            "PY" => [0.0, 1.0, 0.0],
+                            _ => [0.0, 0.0, 1.0],
+                        };
+                        if let Ok(id) = parse_i32(&name) {
+                            model.dloads.push(Dload::BeamGlobal { elem: id, dir, mag });
+                        } else {
+                            model.warnings.push(format!(
+                                "__BG__|{name}|{}|{}|{}|{mag}",
+                                dir[0], dir[1], dir[2]
+                            ));
+                        }
                     } else if typ.starts_with('P') {
                         if k >= toks.len() {
                             return err("*DLOAD P ohne Betrag");
@@ -626,6 +656,43 @@ pub fn parse(inp: &str) -> Result<Model> {
     Ok(model)
 }
 
+fn parse_beam_section(sectyp: &str, toks: &[String]) -> Result<BeamSection> {
+    let ty = sectyp.to_ascii_uppercase();
+    let mut nums = Vec::new();
+    for t in toks {
+        nums.push(parse_f64(t)?);
+    }
+    let n_dim = match ty.as_str() {
+        "RECT" | "RECTANGULAR" => 2,
+        "CIRC" | "CIRCULAR" => 1,
+        "PIPE" => 2,
+        "GENERAL" | "ARBITRARY" => 5,
+        other => {
+            return err(format!(
+                "BEAM SECTION={other} nicht unterstützt. RECT, CIRC, PIPE, GENERAL."
+            ));
+        }
+    };
+    if nums.len() < n_dim {
+        return err(format!(
+            "*BEAM SECTION {ty} erwartet mindestens {n_dim} Werte"
+        ));
+    }
+    let mut n1 = [0.0, 0.0, -1.0];
+    if nums.len() >= n_dim + 3 {
+        n1 = [nums[n_dim], nums[n_dim + 1], nums[n_dim + 2]];
+        if (n1[0] * n1[0] + n1[1] * n1[1] + n1[2] * n1[2]).sqrt() < 1e-18 {
+            n1 = [0.0, 0.0, -1.0];
+        }
+    }
+    Ok(match ty.as_str() {
+        "RECT" | "RECTANGULAR" => BeamSection::rect(nums[0], nums[1], n1),
+        "CIRC" | "CIRCULAR" => BeamSection::circ(nums[0], n1),
+        "PIPE" => BeamSection::pipe(nums[0], nums[1], n1),
+        _ => BeamSection::general(nums[0], nums[1], nums[2], nums[3], nums[4], n1),
+    })
+}
+
 fn expand_deferred(model: &mut Model) -> Result<()> {
     let mut keep_warn = Vec::new();
     let warnings = std::mem::take(&mut model.warnings);
@@ -665,6 +732,23 @@ fn expand_deferred(model: &mut Model) -> Result<()> {
                 let elems = model.expand_elset(name)?;
                 for elem in elems {
                     model.dloads.push(Dload::Pressure { elem, face, mag });
+                }
+            }
+        } else if let Some(rest) = w.strip_prefix("__BG__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 5 {
+                let name = p[0];
+                let dx: f64 = p[1].parse().unwrap_or(0.0);
+                let dy: f64 = p[2].parse().unwrap_or(0.0);
+                let dz: f64 = p[3].parse().unwrap_or(0.0);
+                let mag: f64 = p[4].parse().unwrap_or(0.0);
+                let elems = model.expand_elset(name)?;
+                for elem in elems {
+                    model.dloads.push(Dload::BeamGlobal {
+                        elem,
+                        dir: [dx, dy, dz],
+                        mag,
+                    });
                 }
             }
         } else {

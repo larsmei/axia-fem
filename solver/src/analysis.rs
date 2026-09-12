@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::beam;
 use crate::dat;
 use crate::elem::{
     element_ke, element_nodal_stress, hex8_body_force, hex8_face_pressure, quad4_body_force,
@@ -9,11 +10,15 @@ use crate::error::{err, Result};
 use crate::frd;
 use crate::linalg::{chol_solve, csr_from_triplets, pcg};
 use crate::model::{Dload, ElemKind, Model};
+use crate::quadratic;
+use crate::shell;
 
 pub struct SolveOutput {
     pub model: Model,
     pub u: Vec<[f64; 3]>,
+    pub ur: Vec<[f64; 3]>,
     pub rf: Vec<[f64; 3]>,
+    pub rm: Vec<[f64; 3]>,
     pub stress: Vec<[f64; 6]>,
     pub strain: Vec<[f64; 6]>,
     pub von_mises: Vec<f64>,
@@ -37,27 +42,48 @@ fn elem_xyz(model: &Model, nodes: &[i32]) -> Result<Vec<[f64; 3]>> {
     Ok(xyz)
 }
 
-fn dof_of(dim: usize, node_index: usize, dir: usize) -> usize {
-    dim * node_index + dir
+fn dof_of(ndn: usize, node_index: usize, dir: usize) -> usize {
+    ndn * node_index + dir
 }
 
 pub fn solve(model: Model) -> Result<SolveOutput> {
     let t0 = now_ms();
-    let dim = model.dim;
+    let ndn = model.ndof_node();
     let nnode = model.node_ids.len();
-    let ndof = dim * nnode;
+    let ndof = ndn * nnode;
     if ndof == 0 {
         return err("Modell ohne Freiheitsgrade.");
+    }
+
+    let mut struct_node = vec![false; nnode];
+    if ndn == 6 {
+        for el in &model.elements {
+            if el.kind.is_beam() || el.kind.is_shell() {
+                for &id in &el.nodes {
+                    struct_node[model.node_index(id)?] = true;
+                }
+            }
+        }
     }
 
     // Constrained dofs: last BC wins
     let mut prescribed: HashMap<usize, f64> = HashMap::new();
     for bc in &model.bcs {
-        if bc.dof >= dim {
+        if bc.dof >= ndn {
             continue;
         }
         let ni = model.node_index(bc.node)?;
-        prescribed.insert(dof_of(dim, ni, bc.dof), bc.value);
+        prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
+    }
+    // Unused rotational DOFs on continuum-only nodes would be singular.
+    if ndn == 6 {
+        for ni in 0..nnode {
+            if !struct_node[ni] {
+                for r in 3..6 {
+                    prescribed.entry(dof_of(ndn, ni, r)).or_insert(0.0);
+                }
+            }
+        }
     }
 
     let mut is_free = vec![true; ndof];
@@ -80,11 +106,11 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
 
     let mut f_full = vec![0.0; ndof];
     for c in &model.cloads {
-        if c.dof >= dim {
+        if c.dof >= ndn {
             continue;
         }
         let ni = model.node_index(c.node)?;
-        f_full[dof_of(dim, ni, c.dof)] += c.mag;
+        f_full[dof_of(ndn, ni, c.dof)] += c.mag;
     }
 
     let mut trips: Vec<(usize, usize, f64)> = Vec::new();
@@ -92,14 +118,19 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
         let xyz = elem_xyz(&model, &el.nodes)?;
         let mat = model.material_for(el)?;
         let th = model.thickness_for(el);
-        let kef = element_ke(el.kind, &xyz, mat.e, mat.nu, th)?;
+        let sec = if el.kind.is_beam() {
+            Some(model.beam_section_for(el)?)
+        } else {
+            None
+        };
+        let kef = element_ke(el.kind, &xyz, mat.e, mat.nu, th, sec.as_ref())?;
         let nn = el.kind.nnodes();
-        let local_dim = el.kind.spatial_dim().min(dim);
+        let local_dim = el.kind.ndof_per_node();
         let mut gdofs = Vec::with_capacity(nn * local_dim);
         for a in 0..nn {
             let ni = model.node_index(el.nodes[a])?;
             for d in 0..local_dim {
-                gdofs.push(dof_of(dim, ni, d));
+                gdofs.push(dof_of(ndn, ni, d));
             }
         }
         let m = gdofs.len();
@@ -112,11 +143,39 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
             }
         }
 
-        // DLOAD on this element
         for dl in &model.dloads {
             match dl {
                 Dload::Pressure { elem, face, mag } if *elem == el.id => {
-                    apply_pressure(&model, el.kind, &xyz, *face, *mag, th, &gdofs, local_dim, &mut f_full)?;
+                    if el.kind.is_beam() {
+                        if let Some(sec) = sec.as_ref() {
+                            // P1/P2/P3 on a beam → local distributed load
+                            if *face >= 1 {
+                                let fe = beam::line_load_local(
+                                    el.kind,
+                                    &xyz,
+                                    sec,
+                                    (*face as usize).saturating_sub(1),
+                                    *mag,
+                                )?;
+                                scatter_fe(&fe, &gdofs, 6, local_dim, &mut f_full);
+                            }
+                        }
+                    } else if el.kind.is_shell() {
+                        let fe = shell::pressure_force(el.kind, &xyz, *mag)?;
+                        scatter_fe(&fe, &gdofs, 6, local_dim, &mut f_full);
+                    } else {
+                        apply_pressure(
+                            &model,
+                            el.kind,
+                            &xyz,
+                            *face,
+                            *mag,
+                            th,
+                            &gdofs,
+                            local_dim,
+                            &mut f_full,
+                        )?;
+                    }
                 }
                 Dload::Grav { mag, dir } => {
                     let mut ndir = *dir;
@@ -129,7 +188,38 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
                     let bx = mat.density * *mag * ndir[0];
                     let by = mat.density * *mag * ndir[1];
                     let bz = mat.density * *mag * ndir[2];
-                    apply_body(&model, el.kind, &xyz, bx, by, bz, th, &gdofs, local_dim, &mut f_full)?;
+                    if el.kind.is_beam() {
+                        if let Some(sec) = sec.as_ref() {
+                            let fe = beam::body_force(el.kind, &xyz, sec, bx, by, bz)?;
+                            scatter_fe(&fe, &gdofs, 6, local_dim, &mut f_full);
+                        }
+                    } else if el.kind.is_shell() {
+                        let fe = shell::body_force(el.kind, &xyz, bx, by, bz, th)?;
+                        scatter_fe(&fe, &gdofs, 6, local_dim, &mut f_full);
+                    } else {
+                        apply_body(
+                            &model,
+                            el.kind,
+                            &xyz,
+                            bx,
+                            by,
+                            bz,
+                            th,
+                            &gdofs,
+                            local_dim,
+                            &mut f_full,
+                        )?;
+                    }
+                }
+                Dload::BeamGlobal { elem, dir, mag } if *elem == el.id && el.kind.is_beam() => {
+                    let fe = beam::line_load_global(
+                        el.kind,
+                        &xyz,
+                        mag * dir[0],
+                        mag * dir[1],
+                        mag * dir[2],
+                    )?;
+                    scatter_fe(&fe, &gdofs, 6, local_dim, &mut f_full);
                 }
                 _ => {}
             }
@@ -194,11 +284,19 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
     }
 
     let mut u = vec![[0.0; 3]; nnode];
+    let mut ur = vec![[0.0; 3]; nnode];
     let mut rf = vec![[0.0; 3]; nnode];
+    let mut rm = vec![[0.0; 3]; nnode];
     for ni in 0..nnode {
-        for d in 0..dim {
-            u[ni][d] = u_full[dof_of(dim, ni, d)];
-            rf[ni][d] = rf_full[dof_of(dim, ni, d)];
+        for d in 0..3.min(ndn) {
+            u[ni][d] = u_full[dof_of(ndn, ni, d)];
+            rf[ni][d] = rf_full[dof_of(ndn, ni, d)];
+        }
+        if ndn >= 6 {
+            for d in 0..3 {
+                ur[ni][d] = u_full[dof_of(ndn, ni, 3 + d)];
+                rm[ni][d] = rf_full[dof_of(ndn, ni, 3 + d)];
+            }
         }
     }
 
@@ -210,15 +308,21 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
         let xyz = elem_xyz(&model, &el.nodes)?;
         let mat = model.material_for(el)?;
         let nn = el.kind.nnodes();
-        let local_dim = el.kind.spatial_dim().min(dim);
+        let local_dim = el.kind.ndof_per_node();
+        let th = model.thickness_for(el);
+        let sec = if el.kind.is_beam() {
+            Some(model.beam_section_for(el)?)
+        } else {
+            None
+        };
         let mut ue = vec![0.0; nn * local_dim];
         for a in 0..nn {
             let ni = model.node_index(el.nodes[a])?;
             for d in 0..local_dim {
-                ue[a * local_dim + d] = u[ni][d];
+                ue[a * local_dim + d] = u_full[dof_of(ndn, ni, d)];
             }
         }
-        let sn = element_nodal_stress(el.kind, &xyz, &ue, mat.e, mat.nu)?;
+        let sn = element_nodal_stress(el.kind, &xyz, &ue, mat.e, mat.nu, sec.as_ref(), th)?;
         for a in 0..nn {
             let ni = model.node_index(el.nodes[a])?;
             for c in 0..6 {
@@ -226,7 +330,6 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
             }
             cnt[ni] += 1.0;
         }
-        // one representative GP (mean of nodal) for DAT
         let mut mean = [0.0; 6];
         for a in 0..nn {
             for c in 0..6 {
@@ -265,7 +368,9 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
     Ok(SolveOutput {
         model,
         u,
+        ur,
         rf,
+        rm,
         stress,
         strain,
         von_mises: vm,
@@ -301,6 +406,10 @@ fn apply_pressure(
             let fe = hex8_face_pressure(&p, face, mag)?;
             scatter_fe(&fe, gdofs, 3, local_dim, f_full);
         }
+        ElemKind::Hex20 | ElemKind::Hex20R => {
+            let fe = quadratic::hex20_face_pressure(xyz, face, mag)?;
+            scatter_fe(&fe, gdofs, 3, local_dim, f_full);
+        }
         ElemKind::Quad4Ps | ElemKind::Quad4Pe => {
             if face <= 0 {
                 return Ok(());
@@ -310,6 +419,17 @@ fn apply_pressure(
                 p[i] = [xyz[i][0], xyz[i][1]];
             }
             let fe = quad4_edge_pressure(&p, face, mag, th)?;
+            scatter_fe(&fe, gdofs, 2, local_dim, f_full);
+        }
+        ElemKind::Quad8Ps | ElemKind::Quad8Pe | ElemKind::Quad8RPs | ElemKind::Quad8RPe => {
+            if face <= 0 {
+                return Ok(());
+            }
+            let mut p = [[0.0; 2]; 8];
+            for i in 0..8 {
+                p[i] = [xyz[i][0], xyz[i][1]];
+            }
+            let fe = quadratic::quad8_edge_pressure(&p, face, mag, th)?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
         }
         _ => {}
@@ -352,6 +472,30 @@ fn apply_body(
                 p[i] = [xyz[i][0], xyz[i][1]];
             }
             let fe = quad4_body_force(&p, bx, by, th)?;
+            scatter_fe(&fe, gdofs, 2, local_dim, f_full);
+        }
+        ElemKind::Hex20 | ElemKind::Hex20R => {
+            let fe = quadratic::hex20_body_force(xyz, bx, by, bz, kind.reduced_int())?;
+            scatter_fe(&fe, gdofs, 3, local_dim, f_full);
+        }
+        ElemKind::Tet10 => {
+            let fe = quadratic::tet10_body_force(xyz, bx, by, bz)?;
+            scatter_fe(&fe, gdofs, 3, local_dim, f_full);
+        }
+        ElemKind::Quad8Ps | ElemKind::Quad8Pe | ElemKind::Quad8RPs | ElemKind::Quad8RPe => {
+            let mut p = [[0.0; 2]; 8];
+            for i in 0..8 {
+                p[i] = [xyz[i][0], xyz[i][1]];
+            }
+            let fe = quadratic::quad8_body_force(&p, bx, by, th, kind.reduced_int())?;
+            scatter_fe(&fe, gdofs, 2, local_dim, f_full);
+        }
+        ElemKind::Tri6Ps | ElemKind::Tri6Pe => {
+            let mut p = [[0.0; 2]; 6];
+            for i in 0..6 {
+                p[i] = [xyz[i][0], xyz[i][1]];
+            }
+            let fe = quadratic::tri6_body_force(&p, bx, by, th)?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
         }
         _ => {}
