@@ -26,6 +26,8 @@ export type FemStats = {
   vmMax: number;
   nbc: number;
   ncload: number;
+  lambda?: number;
+  ninc?: number;
 };
 
 export type FemResult = {

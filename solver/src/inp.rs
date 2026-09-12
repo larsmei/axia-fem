@@ -658,6 +658,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                     model.procedure = crate::model::Procedure::Static {
                         nlgeom: true,
                         increments: 1,
+                        riks: false,
                     };
                 }
                 i += 1;
@@ -674,9 +675,57 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                     model.procedure,
                     crate::model::Procedure::Static { nlgeom: true, .. }
                 );
+                let riks = params.contains_key("RIKS");
+                if riks {
+                    let mut ctrl = crate::model::RiksCtrl::default();
+                    if let Some(v) = toks.get(0).and_then(|t| parse_f64(t).ok()) {
+                        if v > 0.0 {
+                            ctrl.dlam = v;
+                        }
+                    }
+                    if let Some(v) = toks.get(1).and_then(|t| parse_f64(t).ok()) {
+                        if v > 0.0 {
+                            ctrl.period = v;
+                        }
+                    }
+                    if let Some(v) = toks.get(2).and_then(|t| parse_f64(t).ok()) {
+                        if v > 0.0 {
+                            ctrl.dlam_min = v;
+                        }
+                    }
+                    if let Some(v) = toks.get(3).and_then(|t| parse_f64(t).ok()) {
+                        if v > 0.0 {
+                            ctrl.dlam_max = v;
+                        }
+                    }
+                    if let Some(v) = toks.get(4).and_then(|t| parse_i32(t).ok()) {
+                        if v > 0 {
+                            ctrl.max_inc = v as usize;
+                        }
+                    }
+                    if ctrl.dlam_max < ctrl.dlam_min {
+                        ctrl.dlam_max = ctrl.dlam_min;
+                    }
+                    if ctrl.dlam > ctrl.dlam_max {
+                        ctrl.dlam_max = ctrl.dlam;
+                    }
+                    model.riks = Some(ctrl);
+                    if !nlgeom {
+                        model.warn("*STATIC, RIKS: NLGEOM wird eingeschaltet.");
+                    }
+                }
                 model.procedure = crate::model::Procedure::Static {
-                    nlgeom,
-                    increments: inc.max(1),
+                    nlgeom: nlgeom || riks,
+                    increments: if riks {
+                        model
+                            .riks
+                            .map(|c| c.max_inc)
+                            .unwrap_or(inc)
+                            .max(1)
+                    } else {
+                        inc.max(1)
+                    },
+                    riks,
                 };
             }
             "*FREQUENCY" => {

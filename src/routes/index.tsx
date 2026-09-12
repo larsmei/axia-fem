@@ -77,7 +77,7 @@ function Home() {
     const s = r.stats;
     if (s) {
       setLog((l) => [
-        `${s.procedure ? s.procedure + " · " : ""}${s.solver} · ${s.iterations} it · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)} · ${s.timeMs.toFixed(0)} ms`,
+        `${s.procedure ? s.procedure + " · " : ""}${s.solver} · ${s.iterations} it · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)}${s.lambda != null && s.procedure?.includes("RIKS") ? ` · λ ${formatNum(s.lambda, 4)}` : ""} · ${s.timeMs.toFixed(0)} ms`,
         ...l,
       ].slice(0, 12));
     }
@@ -114,7 +114,7 @@ function Home() {
       setMesh(r);
       const s = r.stats;
       const line = s
-        ? `${s.procedure ? s.procedure + " · " : ""}${s.solver} · ${s.iterations} it · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)} · ${s.timeMs.toFixed(0)} ms`
+        ? `${s.procedure ? s.procedure + " · " : ""}${s.solver} · ${s.iterations} it · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)}${s.lambda != null && s.procedure?.includes("RIKS") ? ` · λ ${formatNum(s.lambda, 4)}` : ""} · ${s.timeMs.toFixed(0)} ms`
         : "Fertig.";
       setLog((l) => [line, ...(r.warnings ?? []), ...l].slice(0, 12));
       setTab("view");
@@ -143,7 +143,7 @@ function Home() {
     if (s) {
       setLog((l) =>
         [
-          `${s.procedure ? s.procedure + " · " : ""}${s.solver} · ${s.iterations} it · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)} · ${s.timeMs.toFixed(0)} ms`,
+          `${s.procedure ? s.procedure + " · " : ""}${s.solver} · ${s.iterations} it · ${s.nnode} Knoten · ${s.nelem} Elemente · ${s.nfree}/${s.ndof} DOF · |u|max ${formatNum(s.uMax, 5)} · σvm ${formatNum(s.vmMax, 3)}${s.lambda != null && s.procedure?.includes("RIKS") ? ` · λ ${formatNum(s.lambda, 4)}` : ""} · ${s.timeMs.toFixed(0)} ms`,
           ...l,
         ].slice(0, 12),
       );

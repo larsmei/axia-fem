@@ -9,7 +9,7 @@ Zwei Frontends, ein Solver:
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
 
-**1.7.1** — Viewer zeichnet T3D2/T3D3/SPRINGA (Fachwerk NLGEOM). **1.7** — Coulomb-`*FRICTION`, `NLGEOM`+`*PLASTIC` auf Kontinuum. **1.6** — `*CONTACT PAIR` Node-to-Surface, Penalty, reibungsfrei. **1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
+**1.8** — `*STATIC, RIKS` (Crisfield-Bogenlänge, Snap-Through). **1.7.1** — Viewer zeichnet T3D2/T3D3/SPRINGA (Fachwerk NLGEOM). **1.7** — Coulomb-`*FRICTION`, `NLGEOM`+`*PLASTIC` auf Kontinuum. **1.6** — `*CONTACT PAIR` Node-to-Surface, Penalty, reibungsfrei. **1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
 
 ## CLI
 
@@ -52,6 +52,8 @@ Mitgelieferte Decks in [`examples/`](examples/):
 | `contact_blocks.inp` | zwei C3D8, `*CONTACT PAIR`, \(u_{z,\mathrm{mid}}=-0{,}005\) |
 | `contact_friction.inp` | Coulomb-Haften \(\mu=0{,}8\), \(u_{x,\mathrm{slave}}\approx 0\) |
 | `nlgeom_plastic_c3d8.inp` | C3D8 `NLGEOM`+`*PLASTIC`, \(u_x\approx 0{,}03095\) |
+| `riks_truss.inp` | von Mises-Fachwerk, `*STATIC, RIKS`, Snap-Through |
+| `riks_c3d8.inp` | C3D8 Riks, Patch \(u_x=0{,}01\), \(\lambda=1\) |
 | `heat_bar.inp` | stationäre Wärmeleitung T3D2, \(T(L/2)=50\) |
 | `dynamic_sdof.inp` | Newmark, SDOF \(u(T/2)=-u_0\) |
 
@@ -101,6 +103,7 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 - `*STEP, NLGEOM` — geometrisch nichtlineare Statik
   - **T3D2** korotational, Newton (`*CONTROLS, MAXITER=`, `RTOL=`)
   - **Kontinuum** C3D8/C3D8I/C3D8R/C3D20/C3D20R/C3D4/C3D10/C3D6/C3D15: Total-Lagrange, St. Venant–Kirchhoff. Kleine Dehnung reproduziert den linearen Patch-Test. Lasten auf der Referenzkonfiguration (dead load).
+- `*STATIC, RIKS` — modifiziertes Riks-/Crisfield-Bogenlängenverfahren (Snap-Through, Lastfaktor \(\lambda\)). Schaltet NLGEOM ein. T3D2 und Kontinuum.
 - Mehrere `*STEP` / `*END STEP` — Lasten und Lager kumulativ, letzter Schritt bestimmt die Ausgabe
 - `*PLASTIC` — J2 mit isotroper Verfestigung (Kurve \(\sigma_y(\bar\varepsilon^p)\))
   - **T3D2** 1D-Return-Map
@@ -242,6 +245,19 @@ Penalty, Node-to-Surface. Slave-Knoten gegen Master-Flächen (C3D8/C3D20/C3D4/C3
 
 `*FRICTION` — Coulomb auf Knotenkräften, small sliding. Haften wenn \(|F_t|\le\mu |F_n|\), sonst Gleiten. Würfel auf Fundament, \(\mu=0.8\): Scherung bei haftendem Interface. Nicht mit `NLGEOM` oder `*PLASTIC` kombiniert.
 
+### Riks (1.8)
+
+```
+*STEP, NLGEOM
+*STATIC, RIKS
+0.05, 1.0, 1e-4, 0.2, 80
+*CLOAD
+3, 2, -200
+```
+
+Datenzeile wie CalculiX: Anfangsinkrement \(\Delta\lambda\), Period (Ziel-\(\lambda\)), min, max, max. Inkremente. Last \(F=\lambda F_{\mathrm{ref}}\). Constraint: Crisfield zylindrisch \(\Delta u\cdot\Delta u=\Delta\ell^2\), Vorzeichen aus \(v\cdot\Delta u_{\mathrm{prev}}\). Limitpunkt / Snap-Through (von Mises-Fachwerk) wird durchlaufen; \(\lambda\) darf fallen. Ausgabe: \(\lambda\), Inkrementzahl. Nicht mit Kontakt kombiniert.
+
+
 ### Wärmeleitung und Dynamik (1.1)
 
 ```
@@ -290,6 +306,8 @@ Newmark (mittlere Beschleunigung). Lumped mass wie `*FREQUENCY`. Lasten mit `*AM
 | zwei C3D8 Kontakt | \(u_{z,\mathrm{Interface}}=-0{,}005\) |
 | Coulomb-Haften \(\mu=0{,}8\) | \(u_{x,\mathrm{slave}}\approx 0\) |
 | C3D8 NLGEOM+J2 | \(u_x\approx 0{,}03095\) |
+| T3D2 `*STATIC, RIKS` | Snap-Through, Apex \(u_y < -0{,}8\), \(\lambda\approx 1\) |
+| C3D8 Riks Patch | \(u_x=0{,}01\), \(\lambda=1\) |
 | Wärmeleitung T3D2 | \(T(0)=0\), \(T(L)=100\) → \(T(L/2)=50\) |
 | SDOF `*DYNAMIC` | \(k=100\), \(m=1\), \(u(T/2)=-u_0\) |
 | Kragträger B32 | Timoshenko \(\delta = PL^3/3EI + PL/kAG \approx 0{,}1906\) |

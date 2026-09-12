@@ -14,7 +14,7 @@ use crate::frd;
 use crate::heat;
 use crate::linalg::solve_kff;
 use crate::material::truss_1d_stress;
-use crate::model::{Dload, ElemKind, FluxKind, InitKind, Model, Procedure};
+use crate::model::{Dload, ElemKind, FluxKind, InitKind, Model, Procedure, RiksCtrl};
 use crate::nlgeom;
 use crate::plastic;
 use crate::quadratic;
@@ -43,6 +43,8 @@ pub struct SolveOutput {
     pub buckles: Vec<f64>,
     pub nsteps: usize,
     pub peeq: Vec<f64>,
+    pub lambda: f64,
+    pub ninc: usize,
 }
 
 fn elem_xyz(model: &Model, nodes: &[i32]) -> Result<Vec<[f64; 3]>> {
@@ -94,18 +96,30 @@ fn solve_one(model: Model, t0: f64) -> Result<SolveOutput> {
         model.procedure,
         Procedure::Static { nlgeom: true, .. }
     );
+    let riks = matches!(model.procedure, Procedure::Static { riks: true, .. });
     let truss2_only = !model.elements.is_empty()
         && model.elements.iter().all(|e| e.kind == ElemKind::Truss2);
     let continuum_only = !model.elements.is_empty()
         && model.elements.iter().all(|e| nlgeom::is_nl_continuum(e.kind));
+    let riks_ok = !model.elements.is_empty()
+        && model
+            .elements
+            .iter()
+            .all(|e| e.kind.is_truss() || nlgeom::is_nl_continuum(e.kind));
     if model.has_contact() {
-        if nlgeom || model.has_plastic() {
-            return err("*CONTACT PAIR ist nicht mit NLGEOM oder *PLASTIC kombiniert.");
+        if nlgeom || model.has_plastic() || riks {
+            return err("*CONTACT PAIR ist nicht mit NLGEOM, RIKS oder *PLASTIC kombiniert.");
         }
         if !matches!(model.procedure, Procedure::Static { .. }) {
             return err("*CONTACT PAIR nur für *STATIC.");
         }
         return solve_contact(model, t0);
+    }
+    if riks {
+        if !riks_ok {
+            return err("RIKS ist für T3D2 und Kontinuum (C3D*) implementiert; gemischte Netze nicht.");
+        }
+        return solve_riks(model, t0);
     }
     if nlgeom || model.has_plastic() {
         if truss2_only {
@@ -656,6 +670,8 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         frequencies,
         buckles,
         nsteps,
+        lambda: 1.0,
+        ninc: 1,
         peeq: Vec::new(),
     })
 }
@@ -1186,6 +1202,8 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
         frequencies: Vec::new(),
         buckles: Vec::new(),
         nsteps,
+        lambda: 1.0,
+        ninc: 1,
         peeq: Vec::new(),
     })
 }
@@ -1518,6 +1536,8 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         frequencies: vec![],
         buckles: vec![],
         nsteps,
+        lambda: 1.0,
+        ninc: 1,
         peeq: Vec::new(),
     })
 }
@@ -1704,6 +1724,8 @@ fn solve_continuum_plastic(model: Model, t0: f64) -> Result<SolveOutput> {
         frequencies: vec![],
         buckles: vec![],
         nsteps,
+        lambda: 1.0,
+        ninc: 1,
         peeq,
     })
 }
@@ -1896,6 +1918,8 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
         frequencies: vec![],
         buckles: vec![],
         nsteps,
+        lambda: 1.0,
+        ninc: 1,
         peeq,
     })
 }
@@ -2184,6 +2208,477 @@ fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput
         frequencies: vec![],
         buckles: vec![],
         nsteps,
+        lambda: 1.0,
+        ninc: 1,
         peeq: Vec::new(),
+    })
+}
+
+struct NlAsm {
+    trips: Vec<(usize, usize, f64)>,
+    f_int: Vec<f64>,
+    cauchy: Vec<[f64; 6]>,
+    gl: Vec<[f64; 6]>,
+    peeq_e: Vec<f64>,
+}
+
+fn vdot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+fn vnorm(a: &[f64]) -> f64 {
+    vdot(a, a).sqrt()
+}
+
+fn expand_red(map: &DofMap, x: &[f64], ndof: usize) -> Vec<f64> {
+    let mut t = vec![0.0; ndof];
+    for i in 0..ndof {
+        for &(j, c) in &map.t_row[i] {
+            if j < x.len() {
+                t[i] += c * x[j];
+            }
+        }
+    }
+    t
+}
+
+/// Crisfield cylindrical constraint; Ramm (linearized) if the discriminant is negative.
+fn crisfield_dlam(du_i: &[f64], du_ii: &[f64], du_acc: &[f64], dl: f64) -> f64 {
+    let n = du_i.len();
+    let a = vdot(du_i, du_i);
+    let mut b = 0.0;
+    let mut c = -dl * dl;
+    for i in 0..n {
+        let s = du_acc[i] + du_ii[i];
+        b += 2.0 * s * du_i[i];
+        c += s * s;
+    }
+    let disc = b * b - 4.0 * a * c;
+    if a.abs() < 1e-30 || disc < 0.0 {
+        let den = vdot(du_acc, du_i);
+        if den.abs() < 1e-30 {
+            return 0.0;
+        }
+        return -vdot(du_acc, du_ii) / den;
+    }
+    let sd = disc.sqrt();
+    let l1 = (-b + sd) / (2.0 * a);
+    let l2 = (-b - sd) / (2.0 * a);
+    let score = |l: f64| {
+        let mut s = 0.0;
+        for i in 0..n {
+            s += (du_acc[i] + du_ii[i] + l * du_i[i]) * du_acc[i];
+        }
+        s
+    };
+    if score(l1) >= score(l2) {
+        l1
+    } else {
+        l2
+    }
+}
+
+fn assemble_nl(
+    model: &Model,
+    u_full: &[f64],
+    hist: &[Vec<plastic::GpHist>],
+) -> Result<NlAsm> {
+    let ndn = 3;
+    let ndof = u_full.len();
+    let mut trips = Vec::new();
+    let mut f_int = vec![0.0; ndof];
+    let mut cauchy = vec![[0.0; 6]; model.elements.len()];
+    let mut gl = vec![[0.0; 6]; model.elements.len()];
+    let mut peeq_e = vec![0.0; model.elements.len()];
+    for (ei, el) in model.elements.iter().enumerate() {
+        let xyz0 = elem_xyz(model, &el.nodes)?;
+        let nn = el.kind.nnodes();
+        if el.kind.is_truss() {
+            let i1 = if nn == 2 { 1 } else { nn - 1 };
+            let mut xyz = xyz0.clone();
+            let mut gdofs = Vec::with_capacity(3 * nn);
+            for a in 0..nn {
+                let ni = model.node_index(el.nodes[a])?;
+                for d in 0..3 {
+                    let g = dof_of(ndn, ni, d);
+                    gdofs.push(g);
+                    xyz[a][d] = xyz0[a][d] + u_full[g];
+                }
+            }
+            let mat = model.material_for(el)?;
+            let area = model.thickness_for(el);
+            let mut d = [
+                xyz[i1][0] - xyz[0][0],
+                xyz[i1][1] - xyz[0][1],
+                xyz[i1][2] - xyz[0][2],
+            ];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-18);
+            d[0] /= len;
+            d[1] /= len;
+            d[2] /= len;
+            let l0 = {
+                let dx = xyz0[i1][0] - xyz0[0][0];
+                let dy = xyz0[i1][1] - xyz0[0][1];
+                let dz = xyz0[i1][2] - xyz0[0][2];
+                (dx * dx + dy * dy + dz * dz).sqrt().max(1e-18)
+            };
+            let eps = (len - l0) / l0;
+            let (sig, et) = truss_1d_stress(mat.e, eps, model.plastic_for(el));
+            let nforce = sig * area;
+            let kax = et * area / l0;
+            let nd = 3 * nn;
+            let mut ke = vec![0.0; nd * nd];
+            let geom = nforce / len;
+            for a in [0usize, i1] {
+                for b in [0usize, i1] {
+                    let s_ax = if a == b { kax } else { -kax };
+                    let s_g = if a == b { geom } else { -geom };
+                    for i in 0..3 {
+                        for j in 0..3 {
+                            let ax = d[i] * d[j];
+                            let pr = if i == j { 1.0 } else { 0.0 } - d[i] * d[j];
+                            ke[(3 * a + i) * nd + (3 * b + j)] += s_ax * ax + s_g * pr;
+                        }
+                    }
+                }
+            }
+            let mut fe = vec![0.0; nd];
+            for k in 0..3 {
+                fe[k] -= nforce * d[k];
+                fe[3 * i1 + k] += nforce * d[k];
+            }
+            for i in 0..nd {
+                f_int[gdofs[i]] += fe[i];
+                for j in 0..nd {
+                    let v = ke[i * nd + j];
+                    if v.abs() > 0.0 {
+                        trips.push((gdofs[i], gdofs[j], v));
+                    }
+                }
+            }
+            cauchy[ei] = [
+                sig * d[0] * d[0],
+                sig * d[1] * d[1],
+                sig * d[2] * d[2],
+                sig * d[0] * d[1],
+                sig * d[1] * d[2],
+                sig * d[2] * d[0],
+            ];
+            gl[ei][0] = eps;
+        } else if nlgeom::is_nl_continuum(el.kind) {
+            let mut ue = vec![0.0; 3 * nn];
+            let mut gdofs = Vec::with_capacity(3 * nn);
+            for a in 0..nn {
+                let ni = model.node_index(el.nodes[a])?;
+                for d in 0..3 {
+                    let g = dof_of(ndn, ni, d);
+                    gdofs.push(g);
+                    ue[3 * a + d] = u_full[g];
+                }
+            }
+            let mat = model.material_for(el)?;
+            let empty: Vec<plastic::GpHist> = Vec::new();
+            let h = hist.get(ei).map(|v| v.as_slice()).unwrap_or(&empty);
+            let nl = if let Some(curve) = model.plastic_for(el) {
+                plastic::continuum_plastic_nl(el.kind, &xyz0, &ue, mat.e, mat.nu, curve, h)?
+            } else {
+                nlgeom::continuum_nl(el.kind, &xyz0, &ue, mat.e, mat.nu)?
+            };
+            cauchy[ei] = nl.cauchy;
+            gl[ei] = nl.gl;
+            peeq_e[ei] = nl.peeq;
+            let nd = gdofs.len();
+            for i in 0..nd {
+                f_int[gdofs[i]] += nl.fe[i];
+                for j in 0..nd {
+                    let v = nl.ke[i * nd + j];
+                    if v.abs() > 0.0 {
+                        trips.push((gdofs[i], gdofs[j], v));
+                    }
+                }
+            }
+        } else {
+            return err(format!(
+                "RIKS: Element {} ({}) nicht unterstützt.",
+                el.id,
+                el.kind.ccx_name()
+            ));
+        }
+    }
+    Ok(NlAsm {
+        trips,
+        f_int,
+        cauchy,
+        gl,
+        peeq_e,
+    })
+}
+
+/// Modified Riks / Crisfield arc-length (CalculiX `*STATIC, RIKS`).
+fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
+    let ctrl = model.riks.unwrap_or(RiksCtrl::default());
+    let ndn = 3;
+    let nnode = model.node_ids.len();
+    let ndof = ndn * nnode;
+    let mut prescribed: HashMap<usize, f64> = HashMap::new();
+    for bc in &model.bcs {
+        if bc.dof >= ndn {
+            continue;
+        }
+        let ni = model.node_index(bc.node)?;
+        prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
+    }
+    let f_ext = assemble_fext(&model, ndn, ndof)?;
+    let fext_n = vnorm(&f_ext);
+    if fext_n < 1e-30 {
+        return err("RIKS: keine Last (*CLOAD/*DLOAD).");
+    }
+    let mpcs = constraint::build_all_mpcs(&model, ndn)?;
+    let map = DofMap::build(ndof, &prescribed, &mpcs)?;
+    let nfree = map.n_ind;
+    if nfree == 0 {
+        return err("RIKS: keine freien DOF.");
+    }
+    let (_, f_red) = map.reduce_inc(&[], &f_ext);
+    let hist: Vec<Vec<plastic::GpHist>> = model
+        .elements
+        .iter()
+        .map(|el| vec![plastic::GpHist::default(); plastic::n_gauss(el.kind).max(1)])
+        .collect();
+
+    let mut u_full = map.u0.clone();
+    let mut lam = 0.0;
+    let mut u_conv = u_full.clone();
+    let mut lam_conv = 0.0;
+    let mut du_prev = vec![0.0; nfree];
+    let mut dl = 0.0;
+    let mut total_iters = 0usize;
+    let mut ninc = 0usize;
+    let mut residual = 0.0;
+    let mut solver_name = String::new();
+    let mut last = assemble_nl(&model, &u_full, &hist)?;
+    let mut retries = 0usize;
+    let mut inc = 0usize;
+
+    while inc < ctrl.max_inc.max(1) {
+        last = assemble_nl(&model, &u_full, &hist)?;
+        let (ff, _) = map.reduce_inc(&last.trips, &last.f_int);
+        let vsol = match solve_kff(nfree, ff, &f_red) {
+            Ok(s) => s,
+            Err(_) => {
+                retries += 1;
+                if retries > 8 {
+                    return err(format!(
+                        "Riks: Tangente singulär bei λ={lam:.4} (Inkrement {inc})."
+                    ));
+                }
+                dl *= 0.5;
+                u_full.clone_from(&u_conv);
+                lam = lam_conv;
+                continue;
+            }
+        };
+        solver_name = vsol.name.clone();
+        let v = vsol.x;
+        let vnorm_v = vnorm(&v).max(1e-30);
+        let s = if inc == 0 || vdot(&v, &du_prev) >= 0.0 {
+            1.0
+        } else {
+            -1.0
+        };
+
+        let mut dlam;
+        let du_pred: Vec<f64>;
+        if inc == 0 {
+            dlam = ctrl.dlam.abs().clamp(ctrl.dlam_min, ctrl.dlam_max.max(ctrl.dlam_min));
+            if lam + dlam > ctrl.period {
+                dlam = (ctrl.period - lam).max(ctrl.dlam_min);
+            }
+            du_pred = v.iter().map(|x| dlam * x).collect();
+            dl = vnorm(&du_pred).max(1e-18);
+        } else {
+            dlam = s * dl / vnorm_v;
+            if dlam.abs() > ctrl.dlam_max {
+                dlam = s * ctrl.dlam_max;
+                dl = dlam.abs() * vnorm_v;
+            }
+            if dlam.abs() < ctrl.dlam_min {
+                dlam = s * ctrl.dlam_min;
+                dl = dlam.abs() * vnorm_v;
+            }
+            if dlam > 0.0 && lam + dlam > ctrl.period {
+                dlam = ctrl.period - lam;
+                du_pred = v.iter().map(|x| dlam * x).collect();
+                dl = vnorm(&du_pred).max(1e-18);
+            } else {
+                du_pred = v.iter().map(|x| dlam * x).collect();
+            }
+        }
+
+        let du_full = expand_red(&map, &du_pred, ndof);
+        for i in 0..ndof {
+            u_full[i] += du_full[i];
+        }
+        lam += dlam;
+        let mut du_acc = du_pred;
+
+        let mut conv = false;
+        let mut it_count = 0usize;
+        for it in 0..model.max_newton.max(1) {
+            it_count = it + 1;
+            total_iters += 1;
+            last = assemble_nl(&model, &u_full, &hist)?;
+            let mut r_full = vec![0.0; ndof];
+            for i in 0..ndof {
+                r_full[i] = lam * f_ext[i] - last.f_int[i];
+            }
+            let (ff, r_red) = map.reduce_inc(&last.trips, &r_full);
+            residual = vnorm(&r_red);
+            let fscale = (lam.abs() * vnorm(&f_red)).max(1.0);
+            if residual < model.newton_tol * fscale {
+                conv = true;
+                break;
+            }
+            let du_i = match solve_kff(nfree, ff.clone(), &f_red) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let du_ii = match solve_kff(nfree, ff, &r_red) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            solver_name = du_ii.name.clone();
+            let dlam_c = crisfield_dlam(&du_i.x, &du_ii.x, &du_acc, dl);
+            let mut du_c = vec![0.0; nfree];
+            for i in 0..nfree {
+                du_c[i] = du_ii.x[i] + dlam_c * du_i.x[i];
+            }
+            let du_c_full = expand_red(&map, &du_c, ndof);
+            for i in 0..ndof {
+                u_full[i] += du_c_full[i];
+            }
+            lam += dlam_c;
+            for i in 0..nfree {
+                du_acc[i] += du_c[i];
+            }
+            if vnorm(&du_c) < 1e-14 {
+                conv = true;
+                break;
+            }
+        }
+        if !conv {
+            retries += 1;
+            if retries > 8 {
+                return err(format!(
+                    "Riks Inkrement {} konvergierte nicht (λ={lam:.4}, r={residual:.3e}).",
+                    inc + 1
+                ));
+            }
+            dl *= 0.5;
+            u_full.clone_from(&u_conv);
+            lam = lam_conv;
+            continue;
+        }
+        retries = 0;
+        inc += 1;
+        ninc = inc;
+        du_prev = du_acc;
+        u_conv.clone_from(&u_full);
+        lam_conv = lam;
+        let n_des = 4.0;
+        dl *= (n_des / (it_count as f64).max(1.0)).sqrt();
+        if lam >= ctrl.period - 1e-8 {
+            break;
+        }
+    }
+    if ninc == 0 {
+        return err("Riks: kein Inkrement konvergiert.");
+    }
+
+    last = assemble_nl(&model, &u_full, &hist)?;
+    let mut r_full = vec![0.0; ndof];
+    for i in 0..ndof {
+        r_full[i] = lam * f_ext[i] - last.f_int[i];
+    }
+    let (_, r_red) = map.reduce_inc(&[], &r_full);
+    residual = vnorm(&r_red);
+
+    let solver = format!(
+        "Riks (λ={lam:.4}, {ninc} inc, {solver_name}, {total_iters} iters)"
+    );
+
+    let mut u = vec![[0.0; 3]; nnode];
+    let ur = vec![[0.0; 3]; nnode];
+    let mut rf = vec![[0.0; 3]; nnode];
+    let rm = vec![[0.0; 3]; nnode];
+    for ni in 0..nnode {
+        for d in 0..3 {
+            u[ni][d] = u_full[dof_of(ndn, ni, d)];
+            rf[ni][d] = last.f_int[dof_of(ndn, ni, d)] - lam * f_ext[dof_of(ndn, ni, d)];
+        }
+    }
+    let mut accs = vec![[0.0; 6]; nnode];
+    let mut cnt = vec![0.0; nnode];
+    let mut gacc = vec![[0.0; 6]; nnode];
+    let mut pacc = vec![0.0; nnode];
+    let mut stress_gp = Vec::new();
+    for (ei, el) in model.elements.iter().enumerate() {
+        let s = last.cauchy[ei];
+        let g = last.gl[ei];
+        let p = last.peeq_e[ei];
+        for &id in &el.nodes {
+            let ni = model.node_index(id)?;
+            for c in 0..6 {
+                accs[ni][c] += s[c];
+                gacc[ni][c] += g[c];
+            }
+            pacc[ni] += p;
+            cnt[ni] += 1.0;
+        }
+        stress_gp.push((el.id, 1usize, s));
+    }
+    let mut stress = vec![[0.0; 6]; nnode];
+    let mut strain = vec![[0.0; 6]; nnode];
+    let mut vm = vec![0.0; nnode];
+    let mut peeq = vec![0.0; nnode];
+    for i in 0..nnode {
+        if cnt[i] > 0.0 {
+            for c in 0..6 {
+                stress[i][c] = accs[i][c] / cnt[i];
+                strain[i][c] = gacc[i][c] / cnt[i];
+            }
+            peeq[i] = pacc[i] / cnt[i];
+        }
+        vm[i] = von_mises(&stress[i]);
+    }
+    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &peeq);
+    let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
+    let procedure = model.procedure.name().to_string();
+    let nsteps = model.steps.len().max(1);
+    Ok(SolveOutput {
+        model,
+        u,
+        ur,
+        rf,
+        rm,
+        stress,
+        strain,
+        von_mises: vm,
+        stress_gp,
+        frd: frd_s,
+        dat: dat_s,
+        nfree,
+        ndof,
+        solver,
+        iters: total_iters,
+        residual,
+        time_ms: now_ms() - t0,
+        procedure,
+        frequencies: vec![],
+        buckles: vec![],
+        nsteps,
+        lambda: lam,
+        ninc,
+        peeq,
     })
 }

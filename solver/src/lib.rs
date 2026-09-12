@@ -142,6 +142,8 @@ fn solve_json(inp: &str) -> Result<Value> {
         "frequencies": out.frequencies,
         "buckles": out.buckles,
         "nsteps": out.nsteps,
+        "lambda": out.lambda,
+        "ninc": out.ninc,
         "timeMs": out.time_ms,
         "uMax": umax,
         "vmMin": vmin,
@@ -2439,5 +2441,148 @@ FIXED, 1, 1
         let pe = out.peeq.iter().copied().fold(0.0_f64, f64::max);
         assert!(pe > 0.001, "peeq={pe}");
         assert!(out.solver.contains("J2"));
+    }
+
+    #[test]
+    fn riks_parses_static_card() {
+        let inp = r#"
+*HEADING
+riks parse
+*NODE
+1, 0, 0, 0
+2, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP
+*STATIC, RIKS
+0.25, 1.0, 1e-5, 0.5, 40
+*CLOAD
+2, 1, 21000
+*END STEP
+"#;
+        let m = crate::inp::parse(inp).unwrap();
+        match m.procedure {
+            crate::model::Procedure::Static {
+                nlgeom,
+                riks,
+                increments,
+            } => {
+                assert!(nlgeom);
+                assert!(riks);
+                assert_eq!(increments, 40);
+            }
+            other => panic!("expected STATIC RIKS, got {other:?}"),
+        }
+        let c = m.riks.expect("RiksCtrl");
+        assert!((c.dlam - 0.25).abs() < 1e-12);
+        assert!((c.period - 1.0).abs() < 1e-12);
+        assert!((c.dlam_max - 0.5).abs() < 1e-12);
+        assert_eq!(c.max_inc, 40);
+    }
+
+    #[test]
+    fn riks_truss_matches_nlgeom() {
+        let inp = r#"
+*HEADING
+T3D2 RIKS — ux = FL/EA = 0.5
+*NODE
+1, 0, 0, 0
+2, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP, NLGEOM
+*STATIC, RIKS
+1.0, 1.0
+*CLOAD
+2, 1, 21000
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((u2 - 0.5).abs() < 2e-3, "RIKS ux={u2}");
+        assert!((out.lambda - 1.0).abs() < 1e-3, "λ={}", out.lambda);
+        assert!(out.solver.contains("Riks"));
+        assert!(out.procedure.contains("RIKS"));
+    }
+
+    #[test]
+    fn riks_c3d8_matches_nlgeom() {
+        let mut inp = cube_tension();
+        inp = inp.replace("*STEP\n*STATIC", "*STEP, NLGEOM\n*STATIC, RIKS\n1.0, 1.0");
+        let out = solve_native(&inp).unwrap();
+        let mut ux_loaded = Vec::new();
+        for (i, &id) in out.model.node_ids.iter().enumerate() {
+            if id == 2 || id == 3 || id == 6 || id == 7 {
+                ux_loaded.push(out.u[i][0]);
+            }
+        }
+        let mean: f64 = ux_loaded.iter().sum::<f64>() / ux_loaded.len() as f64;
+        assert!(
+            (mean - 0.01).abs() < 1e-4,
+            "RIKS C3D8 ux={mean}, expected 0.01"
+        );
+        assert!((out.lambda - 1.0).abs() < 2e-3, "λ={}", out.lambda);
+        assert!(out.solver.contains("Riks"));
+    }
+
+    #[test]
+    fn riks_von_mises_truss_snap_through() {
+        // Two-bar toggle: peak load ~80, F_ref=200 → λ=1 is on the tension branch.
+        let inp = r#"
+*HEADING
+von Mises truss — Riks snap-through
+*NODE
+1, 0, 0, 0
+2, 20, 0, 0
+3, 10, 1, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 3
+2, 2, 3
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+1.0
+*BOUNDARY
+1, 1, 3
+2, 1, 3
+3, 3, 3
+*STEP, NLGEOM
+*STATIC, RIKS
+0.05, 1.0, 1e-4, 0.2, 80
+*CONTROLS, MAXITER=25
+*CLOAD
+3, 2, -200
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let uy = out.u[out.model.node_index(3).unwrap()][1];
+        assert!(
+            uy < -0.8,
+            "apex uy={uy}, expected snap-through (uy < -0.8, y < 0.2)"
+        );
+        assert!(
+            (out.lambda - 1.0).abs() < 0.05,
+            "λ={} expected ~1",
+            out.lambda
+        );
+        assert!(out.ninc > 1, "need several increments, got {}", out.ninc);
+        assert!(out.solver.contains("Riks"));
     }
 }

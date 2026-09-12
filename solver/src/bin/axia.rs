@@ -282,6 +282,9 @@ fn print_solve_summary(out: &SolveOutput) {
         out.ndof, out.nfree
     );
     eprintln!("  solver     {}  ({} iter, r = {:.3e})", out.solver, out.iters, out.residual);
+    if out.procedure.contains("RIKS") {
+        eprintln!("  λ          {:.6}  ({} increments)", out.lambda, out.ninc);
+    }
     eprintln!("  |u|_max    {umax:.6e}");
     eprintln!("  σ_vm       {vmin:.6e} … {vmax:.6e}");
     eprintln!("  time       {:.3} ms", out.time_ms);
@@ -316,6 +319,8 @@ fn stats_json(out: &SolveOutput) -> String {
         "vmMax": vmax,
         "peeqMax": out.peeq.iter().copied().fold(0.0_f64, f64::max),
         "nsteps": out.nsteps,
+        "lambda": out.lambda,
+        "ninc": out.ninc,
         "nbc": out.model.bcs.len(),
         "ncload": out.model.cloads.len(),
         "ndload": out.model.dloads.len(),

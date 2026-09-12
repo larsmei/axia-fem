@@ -680,9 +680,35 @@ pub struct InitCond {
     pub kind: InitKind,
 }
 
+/// CalculiX `*STATIC, RIKS` data line: initial Δλ, period, min, max, max increments.
+#[derive(Clone, Copy, Debug)]
+pub struct RiksCtrl {
+    pub dlam: f64,
+    pub period: f64,
+    pub dlam_min: f64,
+    pub dlam_max: f64,
+    pub max_inc: usize,
+}
+
+impl Default for RiksCtrl {
+    fn default() -> Self {
+        Self {
+            dlam: 1.0,
+            period: 1.0,
+            dlam_min: 1e-5,
+            dlam_max: 1.0,
+            max_inc: 100,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Procedure {
-    Static { nlgeom: bool, increments: usize },
+    Static {
+        nlgeom: bool,
+        increments: usize,
+        riks: bool,
+    },
     Frequency { nmodes: usize },
     Buckle { nmodes: usize },
     HeatTransfer { steady: bool, dt: f64, period: f64 },
@@ -702,6 +728,7 @@ impl Default for Procedure {
         Self::Static {
             nlgeom: false,
             increments: 1,
+            riks: false,
         }
     }
 }
@@ -709,6 +736,12 @@ impl Default for Procedure {
 impl Procedure {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Static {
+                nlgeom: true,
+                riks: true,
+                ..
+            } => "STATIC, NLGEOM, RIKS",
+            Self::Static { riks: true, .. } => "STATIC, RIKS",
             Self::Static { nlgeom: true, .. } => "STATIC, NLGEOM",
             Self::Static { .. } => "STATIC",
             Self::Frequency { .. } => "FREQUENCY",
@@ -760,6 +793,7 @@ pub struct Model {
     pub steps: Vec<AnalysisStep>,
     pub max_newton: usize,
     pub newton_tol: f64,
+    pub riks: Option<RiksCtrl>,
     pub dim: usize,
     pub output_u: bool,
     pub output_s: bool,
@@ -810,6 +844,7 @@ impl Model {
             steps: Vec::new(),
             max_newton: 25,
             newton_tol: 1e-8,
+            riks: None,
             dim: 3,
             output_u: true,
             output_s: true,

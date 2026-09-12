@@ -1301,6 +1301,41 @@ U
 *END STEP
 `,
   },
+  {
+    id: "riks",
+    name: "Riks Snap-Through",
+    blurb: "von Mises-Fachwerk, *STATIC, RIKS",
+    inp: `*HEADING
+von Mises truss — *STATIC, RIKS snap-through
+*NODE
+1, 0, 0, 0
+2, 20, 0, 0
+3, 10, 1, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 3
+2, 2, 3
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+1.0
+*BOUNDARY
+1, 1, 3
+2, 1, 3
+3, 3, 3
+*STEP, NLGEOM
+*STATIC, RIKS
+0.05, 1.0, 1e-4, 0.2, 80
+*CONTROLS, MAXITER=25
+*CLOAD
+3, 2, -200
+*NODE FILE
+U, RF
+*EL FILE
+S
+*END STEP
+`,
+  },
 ];
 
 export const DEFAULT_EXAMPLE = EXAMPLES[0];
