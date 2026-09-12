@@ -10,7 +10,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use axia_fem::{parse_model, solve_native, Model, SolveOutput};
+use axia_fem::{
+    parse_model, parse_model_with_base, solve_native, solve_native_with_base, Model, SolveOutput,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -34,6 +36,9 @@ fn print_help() {
     println!(
         "\
 Axia FEM {VERSION} — linear static solver (CalculiX INP / FRD / DAT)
+
+Native sparse backends: PARDISO (MKL / Panua) if the library is on the
+loader path, otherwise rivrs-sparse. The chosen solver is printed on stderr.
 
 USAGE:
     {exe} [OPTIONS] <JOB>
@@ -254,6 +259,7 @@ fn print_model_summary(model: &Model, verbose: bool) {
 fn print_solve_summary(out: &SolveOutput) {
     let umax = u_max(out);
     let (vmin, vmax) = vm_range(out);
+    eprintln!("  procedure  {}", out.procedure);
     eprintln!(
         "  dofs       {}  ({} free)",
         out.ndof, out.nfree
@@ -280,6 +286,7 @@ fn stats_json(out: &SolveOutput) -> String {
         "elements": types,
         "ndof": out.ndof,
         "nfree": out.nfree,
+        "procedure": out.procedure,
         "ndofNode": out.model.ndof_node(),
         "solver": out.solver,
         "iterations": out.iters,
@@ -313,7 +320,11 @@ fn run() -> Result<(), String> {
     let stem = stem_from(&args, input_path.as_deref());
 
     if args.check {
-        let model = parse_model(&inp).map_err(|e| e.to_string())?;
+        let model = if let Some(p) = input_path.as_ref().and_then(|p| p.parent()) {
+            parse_model_with_base(&inp, Some(p)).map_err(|e| e.to_string())?
+        } else {
+            parse_model(&inp).map_err(|e| e.to_string())?
+        };
         if args.json {
             let types: serde_json::Map<String, serde_json::Value> = type_counts(&model)
                 .into_iter()
@@ -342,7 +353,11 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let out = solve_native(&inp).map_err(|e| e.to_string())?;
+    let out = if let Some(p) = input_path.as_ref().and_then(|p| p.parent()) {
+        solve_native_with_base(&inp, Some(p)).map_err(|e| e.to_string())?
+    } else {
+        solve_native(&inp).map_err(|e| e.to_string())?
+    };
 
     if args.json {
         println!("{}", stats_json(&out));

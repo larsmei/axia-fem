@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 
 use crate::beam;
+use crate::constraint::{self, DofMap};
 use crate::dat;
 use crate::elem::{
     element_ke, element_nodal_stress, hex8_body_force, hex8_face_pressure, quad4_body_force,
     quad4_edge_pressure, tet4_body_force, von_mises,
 };
 use crate::error::{err, Result};
+use crate::extra;
 use crate::frd;
-use crate::linalg::{chol_solve, csr_from_triplets, pcg};
-use crate::model::{Dload, ElemKind, Model};
+use crate::linalg::solve_kff;
+use crate::model::{Dload, ElemKind, Model, Procedure};
 use crate::quadratic;
 use crate::shell;
 
@@ -31,6 +33,7 @@ pub struct SolveOutput {
     pub iters: usize,
     pub residual: f64,
     pub time_ms: f64,
+    pub procedure: String,
 }
 
 fn elem_xyz(model: &Model, nodes: &[i32]) -> Result<Vec<[f64; 3]>> {
@@ -48,6 +51,19 @@ fn dof_of(ndn: usize, node_index: usize, dir: usize) -> usize {
 
 pub fn solve(model: Model) -> Result<SolveOutput> {
     let t0 = now_ms();
+    match model.procedure {
+        Procedure::Frequency { .. } => {
+            return err("*FREQUENCY ist in dieser Version noch nicht aktiv. Bitte *STATIC verwenden.");
+        }
+        Procedure::Buckle { .. } => {
+            return err("*BUCKLE ist in dieser Version noch nicht aktiv. Bitte *STATIC verwenden.");
+        }
+        _ => {}
+    }
+    solve_linear(model, t0)
+}
+
+fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     let ndn = model.ndof_node();
     let nnode = model.node_ids.len();
     let ndof = ndn * nnode;
@@ -61,6 +77,18 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
             if el.kind.is_beam() || el.kind.is_shell() {
                 for &id in &el.nodes {
                     struct_node[model.node_index(id)?] = true;
+                }
+            }
+        }
+        for rb in &model.rigid_bodies {
+            if let Ok(i) = model.node_index(rb.ref_node) {
+                struct_node[i] = true;
+            }
+        }
+        for c in &model.couplings {
+            if c.kinematic {
+                if let Ok(i) = model.node_index(c.ref_node) {
+                    struct_node[i] = true;
                 }
             }
         }
@@ -86,24 +114,6 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
         }
     }
 
-    let mut is_free = vec![true; ndof];
-    for (&d, _) in &prescribed {
-        if d < ndof {
-            is_free[d] = false;
-        }
-    }
-    let mut free_of = vec![-1isize; ndof];
-    let mut nfree = 0usize;
-    for d in 0..ndof {
-        if is_free[d] {
-            free_of[d] = nfree as isize;
-            nfree += 1;
-        }
-    }
-    if nfree == 0 {
-        return err("Alle Freiheitsgrade sind gelagert — nichts zu lösen.");
-    }
-
     let mut f_full = vec![0.0; ndof];
     for c in &model.cloads {
         if c.dof >= ndn {
@@ -117,13 +127,26 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
     for el in &model.elements {
         let xyz = elem_xyz(&model, &el.nodes)?;
         let mat = model.material_for(el)?;
-        let th = model.thickness_for(el);
+        let th = if el.kind.is_spring() {
+            model.spring_k_for(el)?
+        } else {
+            model.thickness_for(el)
+        };
         let sec = if el.kind.is_beam() {
             Some(model.beam_section_for(el)?)
         } else {
             None
         };
-        let kef = element_ke(el.kind, &xyz, mat.e, mat.nu, th, sec.as_ref())?;
+        let mut kef = element_ke(el.kind, &xyz, mat.e, mat.nu, th, sec.as_ref())?;
+        if !model.node_transform.is_empty() {
+            constraint::transform_ke(
+                &mut kef.ke,
+                el.kind.nnodes(),
+                el.kind.ndof_per_node(),
+                &el.nodes,
+                &model.node_transform,
+            );
+        }
         let nn = el.kind.nnodes();
         let local_dim = el.kind.ndof_per_node();
         let mut gdofs = Vec::with_capacity(nn * local_dim);
@@ -226,52 +249,16 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
         }
     }
 
-    // Reduce to free system: Kff u_f = f_f - Kfp u_p
-    let mut rhs = vec![0.0; nfree];
-    for d in 0..ndof {
-        if is_free[d] {
-            rhs[free_of[d] as usize] += f_full[d];
-        }
-    }
-    let mut ff_trips: Vec<(usize, usize, f64)> = Vec::new();
-    for (i, j, v) in &trips {
-        let fi = free_of[*i];
-        let fj = free_of[*j];
-        if fi >= 0 && fj >= 0 {
-            ff_trips.push((fi as usize, fj as usize, *v));
-        } else if fi >= 0 && fj < 0 {
-            let up = prescribed.get(j).copied().unwrap_or(0.0);
-            rhs[fi as usize] -= *v * up;
-        }
-    }
+    let mpcs = constraint::build_all_mpcs(&model, ndn)?;
+    let map = DofMap::build(ndof, &prescribed, &mpcs)?;
+    let nfree = map.n_ind;
+    let (ff_trips, rhs) = map.reduce(&trips, &f_full);
 
-    const DENSE_LIMIT: usize = 900;
-    let (u_free, solver, iters, residual) = if nfree <= DENSE_LIMIT {
-        let csr = csr_from_triplets(nfree, ff_trips);
-        let mut dense = csr.to_dense();
-        let x = chol_solve(&mut dense, nfree, &rhs)?;
-        let mut r = vec![0.0; nfree];
-        csr.matvec(&x, &mut r);
-        let mut res = 0.0;
-        for i in 0..nfree {
-            let d = r[i] - rhs[i];
-            res += d * d;
-        }
-        (x, "Cholesky".to_string(), 1usize, res.sqrt())
-    } else {
-        let csr = csr_from_triplets(nfree, ff_trips);
-        let (x, info) = pcg(&csr, &rhs, 1e-8, (4 * nfree).max(200))?;
-        (x, "PCG".to_string(), info.iters, info.residual)
-    };
-
-    let mut u_full = vec![0.0; ndof];
-    for d in 0..ndof {
-        if is_free[d] {
-            u_full[d] = u_free[free_of[d] as usize];
-        } else if let Some(&v) = prescribed.get(&d) {
-            u_full[d] = v;
-        }
-    }
+    let solved = solve_kff(nfree, ff_trips, &rhs)?;
+    let solver = solved.name;
+    let iters = solved.iters;
+    let residual = solved.residual;
+    let u_full = map.reconstruct(&solved.x);
 
     // Reactions: R = K u - F_applied (nonzero on supports)
     let mut ku = vec![0.0; ndof];
@@ -364,6 +351,7 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
     let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain);
     let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
     let dt = now_ms() - t0;
+    let procedure = model.procedure.name().to_string();
 
     Ok(SolveOutput {
         model,
@@ -383,6 +371,7 @@ pub fn solve(model: Model) -> Result<SolveOutput> {
         iters,
         residual,
         time_ms: dt,
+        procedure,
     })
 }
 
@@ -398,12 +387,16 @@ fn apply_pressure(
     f_full: &mut [f64],
 ) -> Result<()> {
     match kind {
-        ElemKind::Hex8 => {
+        ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R => {
             let mut p = [[0.0; 3]; 8];
             for i in 0..8 {
                 p[i] = xyz[i];
             }
             let fe = hex8_face_pressure(&p, face, mag)?;
+            scatter_fe(&fe, gdofs, 3, local_dim, f_full);
+        }
+        ElemKind::Wedge6 => {
+            let fe = extra::wedge6_face_pressure(xyz, face, mag)?;
             scatter_fe(&fe, gdofs, 3, local_dim, f_full);
         }
         ElemKind::Hex20 | ElemKind::Hex20R => {
@@ -450,12 +443,20 @@ fn apply_body(
     f_full: &mut [f64],
 ) -> Result<()> {
     match kind {
-        ElemKind::Hex8 => {
+        ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R => {
             let mut p = [[0.0; 3]; 8];
             for i in 0..8 {
                 p[i] = xyz[i];
             }
             let fe = hex8_body_force(&p, bx, by, bz)?;
+            scatter_fe(&fe, gdofs, 3, local_dim, f_full);
+        }
+        ElemKind::Wedge6 => {
+            let fe = extra::wedge6_body_force(xyz, bx, by, bz)?;
+            scatter_fe(&fe, gdofs, 3, local_dim, f_full);
+        }
+        ElemKind::Truss2 | ElemKind::Truss3 => {
+            let fe = extra::truss_body_force(xyz, th, bx, by, bz);
             scatter_fe(&fe, gdofs, 3, local_dim, f_full);
         }
         ElemKind::Tet4 => {

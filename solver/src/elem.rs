@@ -1,5 +1,6 @@
 use crate::beam;
 use crate::error::{err, Result};
+use crate::extra;
 use crate::model::{BeamSection, ElemKind};
 use crate::quadratic;
 use crate::shell;
@@ -143,7 +144,7 @@ pub(crate) fn fill_b2(b: &mut [f64], nnode: usize, dndx: &[[f64; 2]]) {
     }
 }
 
-const HEX_XI: [[f64; 3]; 8] = [
+pub(crate) const HEX_XI: [[f64; 3]; 8] = [
     [-1.0, -1.0, -1.0],
     [1.0, -1.0, -1.0],
     [1.0, 1.0, -1.0],
@@ -154,7 +155,7 @@ const HEX_XI: [[f64; 3]; 8] = [
     [-1.0, 1.0, 1.0],
 ];
 
-fn hex8_shape(xi: f64, eta: f64, zeta: f64) -> ([f64; 8], [[f64; 3]; 8]) {
+pub(crate) fn hex8_shape(xi: f64, eta: f64, zeta: f64) -> ([f64; 8], [[f64; 3]; 8]) {
     let mut n = [0.0; 8];
     let mut dn = [[0.0; 3]; 8];
     for i in 0..8 {
@@ -169,7 +170,7 @@ fn hex8_shape(xi: f64, eta: f64, zeta: f64) -> ([f64; 8], [[f64; 3]; 8]) {
     (n, dn)
 }
 
-fn hex8_dndx(xyz: &[[f64; 3]; 8], xi: f64, eta: f64, zeta: f64) -> Result<([[f64; 3]; 8], f64, [f64; 8])> {
+pub(crate) fn hex8_dndx(xyz: &[[f64; 3]; 8], xi: f64, eta: f64, zeta: f64) -> Result<([[f64; 3]; 8], f64, [f64; 8])> {
     let (n, dn) = hex8_shape(xi, eta, zeta);
     let mut j = [[0.0; 3]; 3];
     for a in 0..8 {
@@ -242,7 +243,7 @@ fn tet4_stiffness(xyz: &[[f64; 3]; 4], e: f64, nu: f64) -> Result<(Vec<f64>, f64
     Ok((ke, vol, dndx))
 }
 
-const QUAD_XI: [[f64; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+pub(crate) const QUAD_XI: [[f64; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
 
 fn quad4_shape(xi: f64, eta: f64) -> ([f64; 4], [[f64; 2]; 4]) {
     let mut n = [0.0; 4];
@@ -356,6 +357,52 @@ pub fn element_ke(
                 ke,
                 fe: vec![0.0; ndof],
                 ndof,
+                volume: vol,
+            })
+        }
+        ElemKind::Hex8I => {
+            let (ke, vol) = extra::hex8i_stiffness(xyz, e, nu)?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 24],
+                ndof: 24,
+                volume: vol,
+            })
+        }
+        ElemKind::Hex8R => {
+            let (ke, vol) = extra::hex8r_stiffness(xyz, e, nu)?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 24],
+                ndof: 24,
+                volume: vol,
+            })
+        }
+        ElemKind::Wedge6 => {
+            let (ke, vol) = extra::wedge6_stiffness(xyz, e, nu)?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 18],
+                ndof: 18,
+                volume: vol,
+            })
+        }
+        ElemKind::Truss2 | ElemKind::Truss3 => {
+            let (ke, vol) = extra::truss_stiffness(xyz, e, thickness.max(1e-30))?;
+            let ndof = 3 * kind.nnodes();
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; ndof],
+                ndof,
+                volume: vol,
+            })
+        }
+        ElemKind::SpringA => {
+            let (ke, vol) = extra::spring_stiffness(xyz, thickness)?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 6],
+                ndof: 6,
                 volume: vol,
             })
         }
@@ -494,6 +541,11 @@ pub fn element_nodal_stress(
 ) -> Result<Vec<[f64; 6]>> {
     match kind {
         ElemKind::Hex8 => hex8_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Hex8I => extra::hex8i_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Hex8R => extra::hex8r_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Wedge6 => extra::wedge6_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Truss2 | ElemKind::Truss3 => extra::truss_nodal_stress(xyz, ue, e, thickness),
+        ElemKind::SpringA => Ok(extra::spring_nodal_stress(xyz, ue, thickness)),
         ElemKind::Tet4 => tet4_nodal_stress(xyz, ue, e, nu),
         ElemKind::Quad4Ps | ElemKind::Quad4Pe => {
             quad4_nodal_stress(xyz, ue, e, nu, kind.is_plane_strain())
@@ -544,7 +596,7 @@ pub(crate) fn sigma_from_b(b: &[f64], nrow: usize, n: usize, d: &[f64], ue: &[f6
     sig
 }
 
-fn hex8_nodal_stress(xyz: &[[f64; 3]], ue: &[f64], e: f64, nu: f64) -> Result<Vec<[f64; 6]>> {
+pub(crate) fn hex8_nodal_stress(xyz: &[[f64; 3]], ue: &[f64], e: f64, nu: f64) -> Result<Vec<[f64; 6]>> {
     let mut p = [[0.0; 3]; 8];
     for i in 0..8 {
         p[i] = xyz[i];

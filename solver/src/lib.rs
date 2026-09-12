@@ -1,14 +1,19 @@
 mod analysis;
 mod beam;
+mod constraint;
 mod dat;
 mod elem;
 mod error;
+mod extra;
 mod frd;
 mod inp;
 mod linalg;
 mod model;
 mod quadratic;
 mod shell;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod sparse_native;
 
 use serde_json::{json, Value};
 
@@ -54,6 +59,7 @@ fn mesh_json(model: &Model) -> Value {
                 "E": m.e,
                 "nu": m.nu,
                 "density": m.density,
+        "alpha": m.alpha,
             })
         })
         .collect();
@@ -121,6 +127,7 @@ fn solve_json(inp: &str) -> Result<Value> {
         "solver": out.solver,
         "iterations": out.iters,
         "residual": out.residual,
+        "procedure": out.procedure,
         "timeMs": out.time_ms,
         "uMax": umax,
         "vmMin": vmin,
@@ -161,8 +168,20 @@ pub fn parse_model(inp: &str) -> Result<Model> {
     inp::parse(inp)
 }
 
+pub fn parse_model_with_base(inp: &str, base: Option<&std::path::Path>) -> Result<Model> {
+    inp::parse_with_base(inp, base)
+}
+
 pub fn solve_native(inp: &str) -> Result<analysis::SolveOutput> {
     let model = inp::parse(inp)?;
+    analysis::solve(model)
+}
+
+pub fn solve_native_with_base(
+    inp: &str,
+    base: Option<&std::path::Path>,
+) -> Result<analysis::SolveOutput> {
+    let model = inp::parse_with_base(inp, base)?;
     analysis::solve(model)
 }
 
@@ -246,6 +265,12 @@ S
         assert!(out.frd.contains("STRESS"));
         assert!(out.frd.contains(" 9999"));
         assert!(out.dat.contains("displacements"));
+        #[cfg(not(target_arch = "wasm32"))]
+        assert!(
+            out.solver.contains("PARDISO") || out.solver.contains("rivrs-sparse"),
+            "native backend expected, got {}",
+            out.solver
+        );
     }
 
     fn beam_2d() -> String {
@@ -787,5 +812,190 @@ S4 membrane patch
             (wmax - 0.211).abs() < 0.04,
             "wmax={wmax}, expected ~0.211"
         );
+    }
+
+    #[test]
+    fn patch_test_c3d8i() {
+        let inp = cube_tension().replace("C3D8", "C3D8I");
+        let out = solve_native(&inp).unwrap();
+        let mut ux = Vec::new();
+        for (i, &id) in out.model.node_ids.iter().enumerate() {
+            if id == 2 || id == 3 || id == 6 || id == 7 {
+                ux.push(out.u[i][0]);
+            }
+        }
+        let mean: f64 = ux.iter().sum::<f64>() / ux.len() as f64;
+        assert!((mean - 0.01).abs() < 1e-5, "C3D8I ux={mean}");
+    }
+
+    #[test]
+    fn patch_test_c3d8r() {
+        let inp = cube_tension().replace("C3D8", "C3D8R");
+        let out = solve_native(&inp).unwrap();
+        let mut ux = Vec::new();
+        for (i, &id) in out.model.node_ids.iter().enumerate() {
+            if id == 2 || id == 3 || id == 6 || id == 7 {
+                ux.push(out.u[i][0]);
+            }
+        }
+        let mean: f64 = ux.iter().sum::<f64>() / ux.len() as f64;
+        assert!((mean - 0.01).abs() < 2e-4, "C3D8R ux={mean}");
+    }
+
+    #[test]
+    fn patch_test_c3d6() {
+        let inp = r#"
+*HEADING
+C3D6 uniaxial along prism axis
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 0, 10, 0
+4, 0, 0, 10
+5, 10, 0, 10
+6, 0, 10, 10
+*ELEMENT, TYPE=C3D6, ELSET=S
+1, 1, 2, 3, 4, 5, 6
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 3, 3
+2, 3, 3
+3, 3, 3
+1, 1, 2
+2, 2, 2
+*STEP
+*STATIC
+*CLOAD
+4, 3, 3500
+5, 3, 3500
+6, 3, 3500
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u4 = out.u[out.model.node_index(4).unwrap()][2];
+        // A = 50, F = 10500, σ = 210, uz = FL/EA = 0.01
+        assert!((u4 - 0.01).abs() < 2e-4, "C3D6 uz={u4}");
+    }
+
+    #[test]
+    fn t3d2_axial() {
+        let inp = r#"
+*HEADING
+T3D2 bar
+*NODE
+1, 0, 0, 0
+2, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 21000
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        // FL/EA = 21000*1000/(210000*200)=0.5
+        assert!((u2 - 0.5).abs() < 1e-6, "T3D2 ux={u2}");
+    }
+
+    #[test]
+    fn equation_ties_two_nodes() {
+        let inp = r#"
+*HEADING
+two bars + equation
+*NODE
+1, 0, 0, 0
+2, 500, 0, 0
+3, 500, 0, 0
+4, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+2, 3, 4
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*EQUATION
+2
+2, 1, 1.0, 3, 1, -1.0
+*BOUNDARY
+1, 1, 3
+3, 2, 3
+2, 2, 3
+4, 2, 3
+*STEP
+*STATIC
+*CLOAD
+4, 1, 21000
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        let u3 = out.u[out.model.node_index(3).unwrap()][0];
+        let u4 = out.u[out.model.node_index(4).unwrap()][0];
+        assert!((u2 - u3).abs() < 1e-8, "equation u2={u2} u3={u3}");
+        // two springs in series, each k=EA/L=210000*200/500=84000, keq=42000
+        // u4 = F/keq = 21000/42000 = 0.5
+        assert!((u4 - 0.5).abs() < 1e-5, "u4={u4}");
+        assert!((u2 - 0.25).abs() < 1e-5, "u2={u2}");
+    }
+
+    #[test]
+    fn springa_axial() {
+        let inp = r#"
+*HEADING
+spring
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=SPRINGA, ELSET=S
+1, 1, 2
+*SPRING, ELSET=S
+1000
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 10
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((u2 - 0.01).abs() < 1e-8, "spring ux={u2}");
+    }
+
+    #[test]
+    fn include_expands() {
+        let dir = std::env::temp_dir().join("axia_include_test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("mat.inp"),
+            "*MATERIAL, NAME=STEEL\n*ELASTIC\n210000, 0.3\n",
+        )
+        .unwrap();
+        let main = format!(
+            "*HEADING\ninc\n*NODE\n1,0,0,0\n2,1000,0,0\n*ELEMENT, TYPE=T3D2, ELSET=T\n1,1,2\n*INCLUDE, INPUT=mat.inp\n*SOLID SECTION, ELSET=T, MATERIAL=STEEL\n200\n*BOUNDARY\n1,1,3\n*STEP\n*STATIC\n*CLOAD\n2,1,21000\n*END STEP\n"
+        );
+        std::fs::write(dir.join("job.inp"), &main).unwrap();
+        let text = std::fs::read_to_string(dir.join("job.inp")).unwrap();
+        let model = crate::inp::parse_with_base(&text, Some(&dir)).unwrap();
+        assert!(model.materials.contains_key("STEEL"));
+        let out = crate::analysis::solve(model).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((u2 - 0.5).abs() < 1e-6);
     }
 }

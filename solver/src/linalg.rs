@@ -179,3 +179,71 @@ pub fn pcg(a: &Csr, b: &[f64], tol: f64, max_iter: usize) -> Result<(Vec<f64>, C
     }
     Ok((x, CgInfo { iters, residual }))
 }
+
+pub struct SparseResult {
+    pub x: Vec<f64>,
+    pub name: String,
+    pub iters: usize,
+    pub residual: f64,
+}
+
+fn residual_of(a: &Csr, x: &[f64], b: &[f64]) -> f64 {
+    let mut ax = vec![0.0; a.n];
+    a.matvec(x, &mut ax);
+    let mut s = 0.0;
+    for i in 0..a.n {
+        let d = ax[i] - b[i];
+        s += d * d;
+    }
+    s.sqrt()
+}
+
+/// Factor and solve K_ff x = rhs.
+///
+/// Native builds: PARDISO (MKL, then Panua) if the shared library is on the
+/// loader path, otherwise rivrs-sparse. WASM keeps the in-crate Cholesky/PCG.
+pub fn solve_kff(n: usize, trips: Vec<(usize, usize, f64)>, rhs: &[f64]) -> Result<SparseResult> {
+    let csr = csr_from_triplets(n, trips);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match crate::sparse_native::solve_kff(&csr, rhs) {
+            Ok(s) => {
+                return Ok(SparseResult {
+                    x: s.x,
+                    name: s.name,
+                    iters: s.iters,
+                    residual: s.residual,
+                });
+            }
+            Err(e) => {
+                eprintln!("axia: rivrs-sparse failed ({e}), falling back to in-crate solver");
+            }
+        }
+    }
+
+    const DENSE_LIMIT: usize = 900;
+    if n <= DENSE_LIMIT {
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!("axia: sparse solver: dense Cholesky (fallback)");
+        let mut dense = csr.to_dense();
+        let x = chol_solve(&mut dense, n, rhs)?;
+        let residual = residual_of(&csr, &x, rhs);
+        Ok(SparseResult {
+            x,
+            name: "Cholesky".into(),
+            iters: 1,
+            residual,
+        })
+    } else {
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!("axia: sparse solver: PCG (fallback)");
+        let (x, info) = pcg(&csr, rhs, 1e-8, (4 * n).max(200))?;
+        Ok(SparseResult {
+            x,
+            name: "PCG".into(),
+            iters: info.iters,
+            residual: info.residual,
+        })
+    }
+}

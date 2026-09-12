@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::error::{err, Result};
-use crate::model::{BeamSection, Boundary, Cload, Dload, ElemKind, Element, Material, Model};
+use crate::model::{
+    BeamSection, Boundary, Cload, Coupling, Dload, ElemKind, Element, Equation, Material, Model,
+    RigidBody, Surface, Tie, Transform,
+};
 
 fn strip_comment(line: &str) -> &str {
     let t = line.trim();
@@ -90,12 +94,95 @@ fn next_nonempty(lines: &[&str], mut i: usize) -> usize {
 }
 
 pub fn parse(inp: &str) -> Result<Model> {
+    parse_with_base(inp, None)
+}
+
+pub fn parse_with_base(inp: &str, base: Option<&Path>) -> Result<Model> {
+    let expanded = expand_includes(inp, base, 0)?;
+    parse_expanded(&expanded)
+}
+
+fn expand_includes(inp: &str, base: Option<&Path>, depth: usize) -> Result<String> {
+    if depth > 16 {
+        return err("*INCLUDE: Verschachtelung zu tief.");
+    }
+    let mut out = String::with_capacity(inp.len());
+    for line in inp.lines() {
+        let raw = strip_comment(line);
+        if raw.trim().is_empty() {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if is_keyword_line(raw) {
+            let (kw, params) = parse_keyword(raw);
+            if kw == "*INCLUDE" {
+                let file = include_filename(raw, line).ok_or_else(|| {
+                    crate::error::FemError("*INCLUDE ohne INPUT=".into())
+                })?;
+                let path = resolve_include(base, &file);
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = path;
+                    out.push_str(&format!("** INCLUDE skipped in WASM: {file}\n"));
+                    continue;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let text = std::fs::read_to_string(&path).map_err(|e| {
+                        crate::error::FemError(format!(
+                            "*INCLUDE kann '{}' nicht lesen: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    let nested_base = path.parent().map(|p| p.to_path_buf());
+                    let nested = expand_includes(&text, nested_base.as_deref(), depth + 1)?;
+                    out.push_str(&nested);
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn resolve_include(base: Option<&Path>, file: &str) -> PathBuf {
+    let p = PathBuf::from(file.trim().trim_matches('"').trim_matches('\''));
+    if p.is_absolute() {
+        p
+    } else if let Some(b) = base {
+        b.join(p)
+    } else {
+        p
+    }
+}
+
+fn include_filename(raw_upper_line: &str, original: &str) -> Option<String> {
+    let _ = raw_upper_line;
+    let upper = original.to_ascii_uppercase();
+    let key = if let Some(i) = upper.find("INPUT") {
+        i
+    } else {
+        return None;
+    };
+    let rest = original[key + 5..].trim().trim_start_matches('=').trim();
+    let token = rest.split([',', ' ', '\t']).find(|s| !s.is_empty())?;
+    Some(token.trim_matches('"').trim_matches('\'').to_string())
+}
+
+fn parse_expanded(inp: &str) -> Result<Model> {
     let mut model = Model::new();
     let owned: Vec<String> = inp.lines().map(|l| l.to_string()).collect();
     let lines: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
     let n = lines.len();
     let mut i = 0;
     let mut current_material: Option<String> = None;
+    let mut current_coupling: Option<usize> = None;
     let mut saw_step = false;
 
     while i < n {
@@ -166,7 +253,7 @@ pub fn parse(inp: &str) -> Result<Model> {
                 })?;
                 let kind = ElemKind::from_ccx(&typ).ok_or_else(|| {
                     crate::error::FemError(format!(
-                        "Nicht unterstützter Elementtyp {typ}. Unterstützt: C3D8, C3D20, C3D4, C3D10, CPS4, CPS8, S4R, S8R, S3, S6, CPE*, B31, B32."
+                        "Nicht unterstützter Elementtyp {typ}. Unterstützt: C3D8/C3D8I/C3D8R, C3D20, C3D4, C3D10, C3D6, CPS*, CPE*, S3/S4/S6/S8, B31/B32, T3D2/T3D3, SPRINGA."
                     ))
                 })?;
                 let elset = params
@@ -555,16 +642,298 @@ pub fn parse(inp: &str) -> Result<Model> {
             "*STEP" => {
                 saw_step = true;
                 if params.contains_key("NLGEOM") {
-                    model.warn("NLGEOM wird ignoriert — nur linear-statisch.");
+                    model.procedure = crate::model::Procedure::Static {
+                        nlgeom: true,
+                        increments: 1,
+                    };
+                    model.warn("NLGEOM: geometrisch nichtlineare Statik (falls unterstützt).");
                 }
                 i += 1;
             }
             "*STATIC" => {
-                let (_toks, ni) = collect_tokens(&lines, i + 1);
+                let (toks, ni) = collect_tokens(&lines, i + 1);
                 i = ni;
+                let inc = if !toks.is_empty() {
+                    parse_f64(&toks[0]).ok().map(|v| v.max(1.0) as usize).unwrap_or(1)
+                } else {
+                    1
+                };
+                let nlgeom = matches!(
+                    model.procedure,
+                    crate::model::Procedure::Static { nlgeom: true, .. }
+                );
+                model.procedure = crate::model::Procedure::Static {
+                    nlgeom,
+                    increments: inc.max(1),
+                };
             }
-            "*END STEP" => {
+            "*FREQUENCY" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let n = if !toks.is_empty() {
+                    parse_i32(&toks[0]).unwrap_or(10).max(1) as usize
+                } else {
+                    10
+                };
+                model.procedure = crate::model::Procedure::Frequency { nmodes: n };
+            }
+            "*BUCKLE" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let n = if !toks.is_empty() {
+                    parse_i32(&toks[0]).unwrap_or(1).max(1) as usize
+                } else {
+                    1
+                };
+                model.procedure = crate::model::Procedure::Buckle { nmodes: n };
+            }
+            "*EQUATION" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut k = 0;
+                while k < toks.len() {
+                    let nterms = parse_i32(&toks[k]).unwrap_or(0) as usize;
+                    k += 1;
+                    if nterms == 0 {
+                        break;
+                    }
+                    let mut terms = Vec::new();
+                    let mut rhs = 0.0;
+                    for _ in 0..nterms {
+                        if k + 2 >= toks.len() {
+                            return err("*EQUATION: zu wenige Terme");
+                        }
+                        let node = parse_i32(&toks[k])?;
+                        let dof = parse_i32(&toks[k + 1])? as usize;
+                        let coef = parse_f64(&toks[k + 2])?;
+                        k += 3;
+                        if dof >= 1 && dof <= 6 {
+                            terms.push((node, dof - 1, coef));
+                        }
+                    }
+                    // optional constant
+                    if k < toks.len() && parse_i32(&toks[k]).is_err() {
+                        if let Ok(v) = parse_f64(&toks[k]) {
+                            rhs = v;
+                            k += 1;
+                        }
+                    }
+                    model.equations.push(Equation { terms, rhs });
+                }
+            }
+            "*SURFACE" => {
+                let name = params
+                    .get("NAME")
+                    .cloned()
+                    .ok_or_else(|| crate::error::FemError("*SURFACE ohne NAME=".into()))?;
+                let ty = params
+                    .get("TYPE")
+                    .cloned()
+                    .unwrap_or_else(|| "ELEMENT".into());
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut surf = Surface {
+                    name: name.clone(),
+                    nodes: Vec::new(),
+                    faces: Vec::new(),
+                };
+                if ty == "NODE" {
+                    for t in &toks {
+                        if let Ok(id) = parse_i32(t) {
+                            surf.nodes.push(id);
+                        } else {
+                            model
+                                .warnings
+                                .push(format!("__SN__|{name}|{}", t.to_ascii_uppercase()));
+                        }
+                    }
+                } else {
+                    let mut k = 0;
+                    while k < toks.len() {
+                        let label = toks[k].to_ascii_uppercase();
+                        k += 1;
+                        let face = if k < toks.len() {
+                            let f = toks[k].to_ascii_uppercase();
+                            if f.starts_with('S') {
+                                k += 1;
+                                if f == "SPOS" || f == "SNEG" {
+                                    1
+                                } else {
+                                    f.trim_start_matches('S').parse::<i32>().unwrap_or(1)
+                                }
+                            } else {
+                                1
+                            }
+                        } else {
+                            1
+                        };
+                        if let Ok(id) = parse_i32(&label) {
+                            surf.faces.push((id, face));
+                        } else {
+                            model
+                                .warnings
+                                .push(format!("__SF__|{name}|{label}|{face}"));
+                        }
+                    }
+                }
+                model.surfaces.insert(name.to_ascii_uppercase(), surf);
+            }
+            "*TIE" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let tol = params
+                    .get("POSITION TOLERANCE")
+                    .or_else(|| params.get("POSITIONTOLERANCE"))
+                    .and_then(|s| parse_f64(s).ok())
+                    .unwrap_or(0.0);
+                if toks.len() >= 2 {
+                    model.ties.push(Tie {
+                        slave: toks[0].to_ascii_uppercase(),
+                        master: toks[1].to_ascii_uppercase(),
+                        position_tol: tol,
+                    });
+                }
+            }
+            "*RIGID BODY" => {
                 i += 1;
+                let nset = params
+                    .get("NSET")
+                    .cloned()
+                    .ok_or_else(|| crate::error::FemError("*RIGID BODY ohne NSET=".into()))?;
+                let refn = params
+                    .get("REF NODE")
+                    .or_else(|| params.get("REFNODE"))
+                    .ok_or_else(|| crate::error::FemError("*RIGID BODY ohne REF NODE=".into()))?;
+                let ref_node = parse_i32(refn)?;
+                model.rigid_bodies.push(RigidBody {
+                    nset: nset.to_ascii_uppercase(),
+                    ref_node,
+                });
+            }
+            "*COUPLING" => {
+                let surf = params
+                    .get("SURFACE")
+                    .cloned()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                let refn = params
+                    .get("REF NODE")
+                    .or_else(|| params.get("REFNODE"))
+                    .ok_or_else(|| crate::error::FemError("*COUPLING ohne REF NODE=".into()))?;
+                let ref_node = parse_i32(refn)?;
+                model.couplings.push(Coupling {
+                    ref_node,
+                    surface: surf,
+                    kinematic: false,
+                    dofs: vec![0, 1, 2],
+                });
+                current_coupling = Some(model.couplings.len() - 1);
+                i += 1;
+            }
+            "*DISTRIBUTING" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if let Some(idx) = current_coupling {
+                    model.couplings[idx].kinematic = false;
+                    if toks.len() >= 2 {
+                        let a = parse_i32(&toks[0]).unwrap_or(1);
+                        let b = parse_i32(&toks[1]).unwrap_or(3);
+                        model.couplings[idx].dofs = (a.max(1)..=b.max(a)).map(|d| (d - 1) as usize).collect();
+                    }
+                }
+            }
+            "*KINEMATIC" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if let Some(idx) = current_coupling {
+                    model.couplings[idx].kinematic = true;
+                    if toks.len() >= 2 {
+                        let a = parse_i32(&toks[0]).unwrap_or(1);
+                        let b = parse_i32(&toks[1]).unwrap_or(3);
+                        model.couplings[idx].dofs = (a.max(1)..=b.max(a)).map(|d| (d - 1) as usize).collect();
+                    }
+                }
+            }
+            "*TRANSFORM" => {
+                let nset = params
+                    .get("NSET")
+                    .cloned()
+                    .ok_or_else(|| crate::error::FemError("*TRANSFORM ohne NSET=".into()))?;
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if toks.len() < 6 {
+                    return err("*TRANSFORM erwartet zwei Richtungsvektoren (6 Zahlen).");
+                }
+                let a = [
+                    parse_f64(&toks[0])?,
+                    parse_f64(&toks[1])?,
+                    parse_f64(&toks[2])?,
+                ];
+                let b = [
+                    parse_f64(&toks[3])?,
+                    parse_f64(&toks[4])?,
+                    parse_f64(&toks[5])?,
+                ];
+                let e1 = unit(a);
+                let mut e3 = cross(e1, b);
+                let n3 = (e3[0] * e3[0] + e3[1] * e3[1] + e3[2] * e3[2]).sqrt();
+                if n3 < 1e-18 {
+                    return err("*TRANSFORM: Vektoren sind parallel.");
+                }
+                e3[0] /= n3;
+                e3[1] /= n3;
+                e3[2] /= n3;
+                let e2 = cross(e3, e1);
+                // columns = local axes in global
+                let axes = [
+                    [e1[0], e2[0], e3[0]],
+                    [e1[1], e2[1], e3[1]],
+                    [e1[2], e2[2], e3[2]],
+                ];
+                model.transforms.push(Transform {
+                    nset: nset.to_ascii_uppercase(),
+                    axes,
+                });
+            }
+            "*SPRING" => {
+                let elset = params
+                    .get("ELSET")
+                    .cloned()
+                    .unwrap_or_else(|| "EALL".into());
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                // optional dof line then stiffness, or just stiffness
+                let k = if toks.len() >= 2 {
+                    parse_f64(&toks[toks.len() - 1])?
+                } else if toks.len() == 1 {
+                    parse_f64(&toks[0])?
+                } else {
+                    return err("*SPRING ohne Steifigkeit");
+                };
+                model.elset_spring.insert(elset, k);
+            }
+            "*EXPANSION" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if toks.is_empty() {
+                    return err("*EXPANSION ohne Wert");
+                }
+                let alpha = parse_f64(&toks[0])?;
+                let name = current_material
+                    .clone()
+                    .unwrap_or_else(|| "MATERIAL-1".into());
+                model.materials.entry(name).or_default().alpha = alpha;
+            }
+            "*TEMPERATURE" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut k = 0;
+                while k + 1 < toks.len() {
+                    let name = toks[k].to_ascii_uppercase();
+                    let t = parse_f64(&toks[k + 1])?;
+                    k += 2;
+                    model.warnings.push(format!("__TP__|{name}|{t}"));
+                }
             }
             "*NODE FILE" | "*NODE OUTPUT" => {
                 let (toks, ni) = collect_tokens(&lines, i + 1);
@@ -603,23 +972,22 @@ pub fn parse(inp: &str) -> Result<Model> {
                 i = ni;
             }
             "*INCLUDE" => {
-                model.warn("*INCLUDE wird nicht unterstützt.");
                 i += 1;
             }
-            "*PREPRINT" | "*END STEP " => {
+            "*PREPRINT" | "*END STEP" | "*END STEP " => {
                 i += 1;
             }
             other => {
                 if other.starts_with('*') {
                     match other {
-                        "*FREQUENCY" | "*DYNAMIC" | "*BUCKLE" | "*HEAT TRANSFER"
+                        "*DYNAMIC" | "*HEAT TRANSFER"
                         | "*COUPLED TEMPERATURE-DISPLACEMENT" | "*VISCO" | "*CREEP" => {
                             return err(format!(
-                                "{other} nicht unterstützt. Axia rechnet linear-statisch (*STATIC)."
+                                "{other} nicht unterstützt in dieser Version."
                             ));
                         }
-                        "*PLASTIC" | "*CONTACT" | "*TIE" | "*EQUATION" | "*TRANSFORM"
-                        | "*AMPLITUDE" | "*INITIAL CONDITIONS" | "*TEMPERATURE" | "*ORIENTATION" => {
+                        "*PLASTIC" | "*CONTACT" | "*AMPLITUDE" | "*INITIAL CONDITIONS"
+                        | "*ORIENTATION" => {
                             model.warn(format!("{other} wird ignoriert."));
                             let (_toks, ni) = collect_tokens(&lines, i + 1);
                             i = ni;
@@ -751,10 +1119,59 @@ fn expand_deferred(model: &mut Model) -> Result<()> {
                     });
                 }
             }
+        } else if let Some(rest) = w.strip_prefix("__SN__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 2 {
+                let sname = p[0].to_ascii_uppercase();
+                let set = p[1];
+                if let Ok(nodes) = model.expand_nset(set) {
+                    if let Some(s) = model.surfaces.get_mut(&sname) {
+                        s.nodes.extend(nodes);
+                    }
+                }
+            }
+        } else if let Some(rest) = w.strip_prefix("__SF__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 3 {
+                let sname = p[0].to_ascii_uppercase();
+                let set = p[1];
+                let face: i32 = p[2].parse().unwrap_or(1);
+                if let Ok(elems) = model.expand_elset(set) {
+                    if let Some(s) = model.surfaces.get_mut(&sname) {
+                        for e in elems {
+                            s.faces.push((e, face));
+                        }
+                    }
+                }
+            }
+        } else if let Some(rest) = w.strip_prefix("__TP__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 2 {
+                let name = p[0];
+                let t: f64 = p[1].parse().unwrap_or(0.0);
+                if let Ok(nodes) = model.expand_nset(name) {
+                    for n in nodes {
+                        model.temperatures.insert(n, t);
+                    }
+                }
+            }
         } else {
             keep_warn.push(w);
         }
     }
     model.warnings = keep_warn;
     Ok(())
+}
+
+fn unit(v: [f64; 3]) -> [f64; 3] {
+    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-30);
+    [v[0] / n, v[1] / n, v[2] / n]
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
 }

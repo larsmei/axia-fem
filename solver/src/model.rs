@@ -3,10 +3,13 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ElemKind {
     Hex8,
+    Hex8I,
+    Hex8R,
     Hex20,
     Hex20R,
     Tet4,
     Tet10,
+    Wedge6,
     Quad4Ps,
     Quad4Pe,
     Quad8Ps,
@@ -25,16 +28,22 @@ pub enum ElemKind {
     Shell8,
     Shell8R,
     Shell6,
+    Truss2,
+    Truss3,
+    SpringA,
 }
 
 impl ElemKind {
     pub fn from_ccx(name: &str) -> Option<Self> {
         Some(match name {
-            "C3D8" | "C3D8R" | "C3D8I" => Self::Hex8,
+            "C3D8" => Self::Hex8,
+            "C3D8R" => Self::Hex8R,
+            "C3D8I" => Self::Hex8I,
             "C3D20" => Self::Hex20,
             "C3D20R" => Self::Hex20R,
             "C3D4" => Self::Tet4,
             "C3D10" | "C3D10M" => Self::Tet10,
+            "C3D6" => Self::Wedge6,
             "CPS4" | "CPS4R" => Self::Quad4Ps,
             "CPE4" | "CPE4R" | "CPE4I" => Self::Quad4Pe,
             "CPS8" => Self::Quad8Ps,
@@ -53,16 +62,20 @@ impl ElemKind {
             "S6" | "STRI65" => Self::Shell6,
             "B31" | "B31R" => Self::Beam31,
             "B32" | "B32R" => Self::Beam32,
+            "T3D2" | "T2D2" => Self::Truss2,
+            "T3D3" => Self::Truss3,
+            "SPRINGA" | "SPRING2" => Self::SpringA,
             _ => return None,
         })
     }
 
     pub fn nnodes(self) -> usize {
         match self {
-            Self::Hex8 => 8,
+            Self::Hex8 | Self::Hex8I | Self::Hex8R => 8,
             Self::Hex20 | Self::Hex20R => 20,
             Self::Tet4 => 4,
             Self::Tet10 => 10,
+            Self::Wedge6 => 6,
             Self::Quad4Ps | Self::Quad4Pe => 4,
             Self::Quad8Ps | Self::Quad8Pe | Self::Quad8RPs | Self::Quad8RPe => 8,
             Self::Tri3Ps | Self::Tri3Pe => 3,
@@ -72,18 +85,26 @@ impl ElemKind {
             Self::Shell4 | Self::Shell4R => 4,
             Self::Shell3 => 3,
             Self::Shell8 | Self::Shell8R => 8,
+            Self::Truss2 | Self::SpringA => 2,
+            Self::Truss3 => 3,
         }
     }
 
     pub fn spatial_dim(self) -> usize {
         match self {
             Self::Hex8
+            | Self::Hex8I
+            | Self::Hex8R
             | Self::Hex20
             | Self::Hex20R
             | Self::Tet4
             | Self::Tet10
+            | Self::Wedge6
             | Self::Beam31
             | Self::Beam32
+            | Self::Truss2
+            | Self::Truss3
+            | Self::SpringA
             | Self::Shell4
             | Self::Shell4R
             | Self::Shell3
@@ -125,6 +146,14 @@ impl ElemKind {
         )
     }
 
+    pub fn is_truss(self) -> bool {
+        matches!(self, Self::Truss2 | Self::Truss3)
+    }
+
+    pub fn is_spring(self) -> bool {
+        matches!(self, Self::SpringA)
+    }
+
     pub fn is_quadratic(self) -> bool {
         matches!(
             self,
@@ -147,7 +176,7 @@ impl ElemKind {
     pub fn reduced_int(self) -> bool {
         matches!(
             self,
-            Self::Hex20R | Self::Quad8RPs | Self::Quad8RPe | Self::Shell4R | Self::Shell8R
+            Self::Hex20R | Self::Hex8R | Self::Quad8RPs | Self::Quad8RPe | Self::Shell4R | Self::Shell8R
         )
     }
 
@@ -161,10 +190,13 @@ impl ElemKind {
     pub fn ccx_name(self) -> &'static str {
         match self {
             Self::Hex8 => "C3D8",
+            Self::Hex8I => "C3D8I",
+            Self::Hex8R => "C3D8R",
             Self::Hex20 => "C3D20",
             Self::Hex20R => "C3D20R",
             Self::Tet4 => "C3D4",
             Self::Tet10 => "C3D10",
+            Self::Wedge6 => "C3D6",
             Self::Quad4Ps => "CPS4",
             Self::Quad4Pe => "CPE4",
             Self::Quad8Ps => "CPS8",
@@ -183,13 +215,17 @@ impl ElemKind {
             Self::Shell8 => "S8",
             Self::Shell8R => "S8R",
             Self::Shell6 => "S6",
+            Self::Truss2 => "T3D2",
+            Self::Truss3 => "T3D3",
+            Self::SpringA => "SPRINGA",
         }
     }
 
     /// cgx / FRD element type numbers
     pub fn frd_type(self) -> i32 {
         match self {
-            Self::Hex8 => 1,
+            Self::Hex8 | Self::Hex8I | Self::Hex8R => 1,
+            Self::Wedge6 => 2,
             Self::Hex20 | Self::Hex20R => 4,
             Self::Tet4 => 3,
             Self::Tet10 => 6,
@@ -202,8 +238,8 @@ impl ElemKind {
             | Self::Quad8RPe
             | Self::Shell8
             | Self::Shell8R => 10,
-            Self::Beam31 => 11,
-            Self::Beam32 => 12,
+            Self::Beam31 | Self::Truss2 | Self::SpringA => 11,
+            Self::Beam32 | Self::Truss3 => 12,
         }
     }
 }
@@ -221,6 +257,8 @@ pub struct Material {
     pub e: f64,
     pub nu: f64,
     pub density: f64,
+    pub alpha: f64,
+    pub tref: f64,
 }
 
 impl Default for Material {
@@ -229,6 +267,8 @@ impl Default for Material {
             e: 210000.0,
             nu: 0.3,
             density: 0.0,
+            alpha: 0.0,
+            tref: 0.0,
         }
     }
 }
@@ -367,6 +407,73 @@ pub enum Dload {
 }
 
 #[derive(Clone, Debug)]
+pub struct Equation {
+    pub terms: Vec<(i32, usize, f64)>,
+    pub rhs: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Surface {
+    pub name: String,
+    pub nodes: Vec<i32>,
+    pub faces: Vec<(i32, i32)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Tie {
+    pub slave: String,
+    pub master: String,
+    pub position_tol: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RigidBody {
+    pub nset: String,
+    pub ref_node: i32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Coupling {
+    pub ref_node: i32,
+    pub surface: String,
+    pub kinematic: bool,
+    pub dofs: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Transform {
+    pub nset: String,
+    pub axes: [[f64; 3]; 3],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Procedure {
+    Static { nlgeom: bool, increments: usize },
+    Frequency { nmodes: usize },
+    Buckle { nmodes: usize },
+}
+
+impl Default for Procedure {
+    fn default() -> Self {
+        Self::Static {
+            nlgeom: false,
+            increments: 1,
+        }
+    }
+}
+
+impl Procedure {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Static { nlgeom: true, .. } => "STATIC, NLGEOM",
+            Self::Static { .. } => "STATIC",
+            Self::Frequency { .. } => "FREQUENCY",
+            Self::Buckle { .. } => "BUCKLE",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Model {
     pub heading: String,
     pub node_ids: Vec<i32>,
@@ -382,6 +489,16 @@ pub struct Model {
     pub bcs: Vec<Boundary>,
     pub cloads: Vec<Cload>,
     pub dloads: Vec<Dload>,
+    pub equations: Vec<Equation>,
+    pub surfaces: HashMap<String, Surface>,
+    pub ties: Vec<Tie>,
+    pub rigid_bodies: Vec<RigidBody>,
+    pub couplings: Vec<Coupling>,
+    pub transforms: Vec<Transform>,
+    pub node_transform: HashMap<i32, [[f64; 3]; 3]>,
+    pub elset_spring: HashMap<String, f64>,
+    pub temperatures: HashMap<i32, f64>,
+    pub procedure: Procedure,
     pub dim: usize,
     pub output_u: bool,
     pub output_s: bool,
@@ -407,6 +524,16 @@ impl Model {
             bcs: Vec::new(),
             cloads: Vec::new(),
             dloads: Vec::new(),
+            equations: Vec::new(),
+            surfaces: HashMap::new(),
+            ties: Vec::new(),
+            rigid_bodies: Vec::new(),
+            couplings: Vec::new(),
+            transforms: Vec::new(),
+            node_transform: HashMap::new(),
+            elset_spring: HashMap::new(),
+            temperatures: HashMap::new(),
+            procedure: Procedure::default(),
             dim: 3,
             output_u: true,
             output_s: true,
@@ -429,7 +556,11 @@ impl Model {
     }
 
     pub fn ndof_node(&self) -> usize {
-        if self.has_beams() || self.has_shells() {
+        if self.has_beams()
+            || self.has_shells()
+            || !self.rigid_bodies.is_empty()
+            || self.couplings.iter().any(|c| c.kinematic)
+        {
             6
         } else {
             self.dim
@@ -465,8 +596,36 @@ impl Model {
             self.warn("2D- und 3D-Elemente gemischt — 3D-Freiheitsgrade werden verwendet.");
             self.dim = 3;
         }
-        if self.has_beams() || self.has_shells() {
+        if self.has_beams() || self.has_shells() || !self.rigid_bodies.is_empty() {
             self.dim = 3;
+        }
+        self.expand_transforms();
+        self.expand_surfaces();
+    }
+
+    fn expand_transforms(&mut self) {
+        let mut map = HashMap::new();
+        let nsets = self.nsets.clone();
+        for t in &self.transforms {
+            if let Some(nodes) = nsets.get(&t.nset) {
+                for &id in nodes {
+                    map.insert(id, t.axes);
+                }
+            }
+        }
+        self.node_transform = map;
+    }
+
+    fn expand_surfaces(&mut self) {
+        let nsets = self.nsets.clone();
+        let elsets = self.elsets.clone();
+        for s in self.surfaces.values_mut() {
+            let mut extra_nodes = Vec::new();
+            for n in s.nodes.clone() {
+                extra_nodes.push(n);
+            }
+            // faces already stored; collect nodes from named sets left as-is
+            let _ = (&nsets, &elsets, extra_nodes);
         }
     }
 
@@ -532,5 +691,22 @@ impl Model {
             "Keine *BEAM SECTION für Element {} (ELSET={})",
             el.id, el.elset
         ))
+    }
+
+    pub fn spring_k_for(&self, el: &Element) -> crate::error::Result<f64> {
+        if let Some(&k) = self.elset_spring.get(&el.elset) {
+            return Ok(k);
+        }
+        if self.elset_spring.len() == 1 {
+            return Ok(*self.elset_spring.values().next().unwrap());
+        }
+        crate::error::err(format!(
+            "Keine *SPRING-Steifigkeit für Element {} (ELSET={})",
+            el.id, el.elset
+        ))
+    }
+
+    pub fn temperature_at(&self, node: i32) -> f64 {
+        self.temperatures.get(&node).copied().unwrap_or(0.0)
     }
 }
