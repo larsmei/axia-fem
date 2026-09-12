@@ -34,6 +34,8 @@ pub struct SolveOutput {
     pub residual: f64,
     pub time_ms: f64,
     pub procedure: String,
+    pub frequencies: Vec<f64>,
+    pub buckles: Vec<f64>,
 }
 
 fn elem_xyz(model: &Model, nodes: &[i32]) -> Result<Vec<[f64; 3]>> {
@@ -51,15 +53,6 @@ fn dof_of(ndn: usize, node_index: usize, dir: usize) -> usize {
 
 pub fn solve(model: Model) -> Result<SolveOutput> {
     let t0 = now_ms();
-    match model.procedure {
-        Procedure::Frequency { .. } => {
-            return err("*FREQUENCY ist in dieser Version noch nicht aktiv. Bitte *STATIC verwenden.");
-        }
-        Procedure::Buckle { .. } => {
-            return err("*BUCKLE ist in dieser Version noch nicht aktiv. Bitte *STATIC verwenden.");
-        }
-        _ => {}
-    }
     solve_linear(model, t0)
 }
 
@@ -115,6 +108,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     }
 
     let mut f_full = vec![0.0; ndof];
+    let mut m_full = vec![0.0; ndof];
     for c in &model.cloads {
         if c.dof >= ndn {
             continue;
@@ -162,6 +156,21 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                 let v = kef.ke[i * kef.ndof + j];
                 if v.abs() > 0.0 {
                     trips.push((gdofs[i], gdofs[j], v));
+                }
+            }
+        }
+        if mat.density.abs() > 0.0 && kef.volume.abs() > 0.0 {
+            let mnode = mat.density * kef.volume / nn as f64;
+            for a in 0..nn {
+                let ni = model.node_index(el.nodes[a])?;
+                for d in 0..3.min(local_dim) {
+                    m_full[dof_of(ndn, ni, d)] += mnode;
+                }
+                if local_dim >= 6 {
+                    let c2 = kef.volume.abs().powf(2.0 / 3.0).max(1e-6);
+                    for r in 3..6 {
+                        m_full[dof_of(ndn, ni, r)] += mnode * c2 * 1e-6;
+                    }
                 }
             }
         }
@@ -255,8 +264,39 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut solver = "prescribed".to_string();
     let mut iters = 0usize;
     let mut residual = 0.0;
+    let mut frequencies = Vec::new();
+    let mut buckles = Vec::new();
+
     let mut u_full = if nfree == 0 {
         map.u0.clone()
+    } else if let Procedure::Frequency { nmodes } = model.procedure {
+        let mut m_ind = vec![0.0; nfree];
+        for d in 0..ndof {
+            for &(a, ta) in &map.t_row[d] {
+                m_ind[a] += ta * ta * m_full[d];
+            }
+        }
+        if m_ind.iter().all(|v| *v <= 0.0) {
+            return err("*FREQUENCY: *DENSITY fehlt oder Masse ist null.");
+        }
+        let (ff_trips, _) = map.reduce(&trips, &f_full);
+        let ev = crate::eigen::subspace_gen(nfree, ff_trips, &m_ind, nmodes.max(1))?;
+        frequencies = ev
+            .values
+            .iter()
+            .map(|l| {
+                if *l > 0.0 {
+                    l.sqrt() / (2.0 * std::f64::consts::PI)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        solver = format!("eigen ({} modes, {})", frequencies.len(), "subspace");
+        iters = 1;
+        residual = 0.0;
+        let mode0 = ev.vectors.first().cloned().unwrap_or_else(|| vec![0.0; nfree]);
+        map.reconstruct(&mode0)
     } else {
         let (ff_trips, rhs) = map.reduce(&trips, &f_full);
         let solved = solve_kff(nfree, ff_trips, &rhs)?;
@@ -356,6 +396,99 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         strain[i][5] = stress[i][5] / g2;
     }
 
+    if let Procedure::Buckle { nmodes } = model.procedure {
+        if nfree > 0 {
+            let mut kg_trips: Vec<(usize, usize, f64)> = Vec::new();
+            for el in &model.elements {
+                let xyz = elem_xyz(&model, &el.nodes)?;
+                let nn = el.kind.nnodes();
+                let local_dim = el.kind.ndof_per_node();
+                let mut ue = vec![0.0; nn * local_dim];
+                let mut gdofs = Vec::new();
+                for a in 0..nn {
+                    let ni = model.node_index(el.nodes[a])?;
+                    for d in 0..local_dim {
+                        gdofs.push(dof_of(ndn, ni, d));
+                        ue[a * local_dim + d] = u_full[dof_of(ndn, ni, d)];
+                    }
+                }
+                let kg = if el.kind.is_truss() {
+                    let area = model.thickness_for(el);
+                    let mat = model.material_for(el)?;
+                    let i1 = if nn == 2 { 1 } else { 2 };
+                    let mut d = [
+                        xyz[i1][0] - xyz[0][0],
+                        xyz[i1][1] - xyz[0][1],
+                        xyz[i1][2] - xyz[0][2],
+                    ];
+                    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-18);
+                    d[0] /= len;
+                    d[1] /= len;
+                    d[2] /= len;
+                    let du = [
+                        ue[3 * i1] - ue[0],
+                        ue[3 * i1 + 1] - ue[1],
+                        ue[3 * i1 + 2] - ue[2],
+                    ];
+                    let n_ax = mat.e * area * (du[0] * d[0] + du[1] * d[1] + du[2] * d[2]) / len;
+                    crate::eigen::truss_kg(&xyz, n_ax)
+                } else if el.kind.is_beam() {
+                    let sec = model.beam_section_for(el)?;
+                    let mat = model.material_for(el)?;
+                    let dx = xyz[1][0] - xyz[0][0];
+                    let dy = xyz[1][1] - xyz[0][1];
+                    let dz = xyz[1][2] - xyz[0][2];
+                    let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-18);
+                    let axial = (ue[6] - ue[0]) * dx / len
+                        + (ue[7] - ue[1]) * dy / len
+                        + (ue[8] - ue[2]) * dz / len;
+                    let n_ax = mat.e * sec.area * axial / len;
+                    crate::eigen::beam_kg(&xyz, n_ax, nn)?
+                } else if matches!(el.kind, ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R) {
+                    let mut mean = [0.0; 6];
+                    if let Some((_, _, s)) = stress_gp.iter().find(|(id, _, _)| *id == el.id) {
+                        mean = *s;
+                    }
+                    crate::eigen::hex8_kg(&xyz, &mean)?
+                } else {
+                    continue;
+                };
+                let m = gdofs.len();
+                for i in 0..m {
+                    for j in 0..m {
+                        let v = kg[i * m + j];
+                        if v.abs() > 0.0 {
+                            kg_trips.push((gdofs[i], gdofs[j], v));
+                        }
+                    }
+                }
+            }
+            let (k_ff, _) = map.reduce(&trips, &f_full);
+            let (kg_ff, _) = map.reduce(&kg_trips, &f_full);
+            let a_ff: Vec<_> = kg_ff.into_iter().map(|(i, j, v)| (i, j, -v)).collect();
+            match crate::eigen::subspace_ab(nfree, k_ff, a_ff, nmodes.max(1)) {
+                Ok(ev) => {
+                    buckles = ev.values;
+                    solver = format!("buckle ({} factors)", buckles.len());
+                    if let Some(v0) = ev.vectors.first() {
+                        u_full = map.reconstruct(v0);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+            for ni in 0..nnode {
+                for d in 0..3.min(ndn) {
+                    u[ni][d] = u_full[dof_of(ndn, ni, d)];
+                }
+                if ndn >= 6 {
+                    for d in 0..3 {
+                        ur[ni][d] = u_full[dof_of(ndn, ni, 3 + d)];
+                    }
+                }
+            }
+        }
+    }
+
     let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain);
     let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
     let dt = now_ms() - t0;
@@ -380,6 +513,8 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         residual,
         time_ms: dt,
         procedure,
+        frequencies,
+        buckles,
     })
 }
 

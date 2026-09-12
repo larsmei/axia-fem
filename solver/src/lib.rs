@@ -4,6 +4,7 @@ mod constraint;
 mod dat;
 mod elem;
 mod error;
+mod eigen;
 mod extra;
 mod frd;
 mod inp;
@@ -128,6 +129,8 @@ fn solve_json(inp: &str) -> Result<Value> {
         "iterations": out.iters,
         "residual": out.residual,
         "procedure": out.procedure,
+        "frequencies": out.frequencies,
+        "buckles": out.buckles,
         "timeMs": out.time_ms,
         "uMax": umax,
         "vmMin": vmin,
@@ -1149,5 +1152,71 @@ rbe3
         let u3 = out.u[out.model.node_index(3).unwrap()][0];
         assert!(u2 > 0.0, "u2={u2}");
         assert!((u3 - 0.5 * u2).abs() < 1e-6, "u3={u3} should be avg of 0 and u2={u2}");
+    }
+
+    #[test]
+    fn frequency_t3d2_axial() {
+        let inp = r#"
+*HEADING
+freq
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+100, 0.0
+*DENSITY
+1.0
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+1.0
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP
+*FREQUENCY
+1
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        assert!(!out.frequencies.is_empty(), "no frequencies");
+        let f = out.frequencies[0];
+        // k=EA/L=100, m=rhoAL/2=0.5, f=sqrt(k/m)/(2π)=2.2508
+        assert!(
+            (f - 2.2508).abs() / 2.2508 < 0.08,
+            "f={f}, expected ~2.251 Hz"
+        );
+    }
+
+    #[test]
+    fn buckle_b31_cantilever() {
+        // L=1000, RECT 10×20, Imin=1666.67, E=210000, P=1
+        // Euler cantilever π²EI/(4L²) ≈ 863.7
+        let nseg = 8usize;
+        let l = 1000.0;
+        let mut s = String::from("*HEADING\nbuckle\n*NODE\n");
+        for i in 0..=nseg {
+            s.push_str(&format!("{}, {}, 0, 0\n", i + 1, l * i as f64 / nseg as f64));
+        }
+        s.push_str("*ELEMENT, TYPE=B31, ELSET=B\n");
+        for e in 0..nseg {
+            s.push_str(&format!("{}, {}, {}\n", e + 1, e + 1, e + 2));
+        }
+        s.push_str(
+            "*MATERIAL, NAME=STEEL\n*ELASTIC\n210000, 0.3\n\
+             *BEAM SECTION, ELSET=B, MATERIAL=STEEL, SECTION=RECT\n\
+             10, 20\n0, 0, 1\n*BOUNDARY\n1, 1, 6\n*STEP\n*BUCKLE\n1\n*CLOAD\n",
+        );
+        s.push_str(&format!("{}, 1, -1\n*END STEP\n", nseg + 1));
+        let out = solve_native(&s).unwrap();
+        assert!(!out.buckles.is_empty(), "no buckle factors");
+        let lam = out.buckles[0].abs();
+        let expect = std::f64::consts::PI.powi(2) * 210000.0 * (20.0 * 10.0_f64.powi(3) / 12.0)
+            / (4.0 * l.powi(2));
+        assert!(
+            (lam - expect).abs() / expect < 0.25,
+            "λ={lam}, Euler cantilever={expect}"
+        );
     }
 }

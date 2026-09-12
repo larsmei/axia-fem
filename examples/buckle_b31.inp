@@ -1,0 +1,37 @@
+*HEADING
+B31 cantilever Euler buckle, P=1 → λ ≈ π² E Imin / (4 L²)
+*NODE
+1, 0, 0, 0
+2, 125, 0, 0
+3, 250, 0, 0
+4, 375, 0, 0
+5, 500, 0, 0
+6, 625, 0, 0
+7, 750, 0, 0
+8, 875, 0, 0
+9, 1000, 0, 0
+*ELEMENT, TYPE=B31, ELSET=B
+1, 1, 2
+2, 2, 3
+3, 3, 4
+4, 4, 5
+5, 5, 6
+6, 6, 7
+7, 7, 8
+8, 8, 9
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*BEAM SECTION, ELSET=B, MATERIAL=STEEL, SECTION=RECT
+10, 20
+0, 0, 1
+*BOUNDARY
+1, 1, 6
+*STEP
+*BUCKLE
+1
+*CLOAD
+9, 1, -1
+*NODE FILE
+U
+*END STEP

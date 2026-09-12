@@ -35,6 +35,8 @@ Mitgelieferte Decks in [`examples/`](examples/):
 | `truss_t3d2.inp` | Fachwerkstab T3D2, \(u = FL/EA\) |
 | `equation_bars.inp` | zwei Stäbe gekoppelt mit `*EQUATION` |
 | `tie_bars.inp` | dasselbe mit `*TIE` |
+| `freq_t3d2.inp` | axiale Eigenfrequenz T3D2 |
+| `buckle_b31.inp` | Euler-Beulen Kragträger B31 |
 | `include_main.inp` | `*INCLUDE` (zieht `include_mat.inp`) |
 
 ### Binary bauen
@@ -76,6 +78,7 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 - Schnitte: `*SOLID SECTION`, `*SHELL SECTION`, `*BEAM SECTION` (`RECT`, `CIRC`, `PIPE`, `GENERAL`), `*SPRING`
 - Lasten und Lager: `*BOUNDARY` (DOF 1–6), `*CLOAD`, `*DLOAD` (`P`, `P1…P6`, `GRAV`, `PX`/`PY`/`PZ`)
 - Linear-statische Analyse, isotrope Elastizität, MPC-Elimination (`*EQUATION`)
+- `*FREQUENCY` (lumped mass, inverse subspace) und `*BUCKLE` (geometrische Steifigkeit)
 - Sparse-Assembly (Triplet → CSR)
 - Native Sparse-Solver: **PARDISO** (Intel MKL oder Panua, dynamisch geladen) mit **rivrs-sparse** als Fallback; WASM: dichte Cholesky / PCG
 - Der jeweils verwendete Solver wird beim Aufruf ausgegeben (`axia: sparse solver: …`) und steht in der Statistik

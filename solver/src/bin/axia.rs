@@ -260,6 +260,14 @@ fn print_solve_summary(out: &SolveOutput) {
     let umax = u_max(out);
     let (vmin, vmax) = vm_range(out);
     eprintln!("  procedure  {}", out.procedure);
+    if !out.frequencies.is_empty() {
+        let s: Vec<String> = out.frequencies.iter().map(|f| format!("{f:.6}")).collect();
+        eprintln!("  freq [Hz]  {}", s.join(", "));
+    }
+    if !out.buckles.is_empty() {
+        let s: Vec<String> = out.buckles.iter().map(|f| format!("{f:.6}")).collect();
+        eprintln!("  buckle λ   {}", s.join(", "));
+    }
     eprintln!(
         "  dofs       {}  ({} free)",
         out.ndof, out.nfree
@@ -287,6 +295,8 @@ fn stats_json(out: &SolveOutput) -> String {
         "ndof": out.ndof,
         "nfree": out.nfree,
         "procedure": out.procedure,
+        "frequencies": out.frequencies,
+        "buckles": out.buckles,
         "ndofNode": out.model.ndof_node(),
         "solver": out.solver,
         "iterations": out.iters,
