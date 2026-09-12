@@ -14,6 +14,7 @@ use crate::heat;
 use crate::linalg::solve_kff;
 use crate::material::truss_1d_stress;
 use crate::model::{Dload, ElemKind, FluxKind, InitKind, Model, Procedure};
+use crate::nlgeom;
 use crate::quadratic;
 use crate::shell;
 
@@ -92,13 +93,18 @@ fn solve_one(model: Model, t0: f64) -> Result<SolveOutput> {
     );
     let truss2_only = !model.elements.is_empty()
         && model.elements.iter().all(|e| e.kind == ElemKind::Truss2);
+    let continuum_only = !model.elements.is_empty()
+        && model.elements.iter().all(|e| nlgeom::is_nl_continuum(e.kind));
     if nlgeom || model.has_plastic() {
-        if !truss2_only {
-            return err(
-                "NLGEOM und *PLASTIC sind in 1.0 nur für T3D2-Fachwerke implementiert.",
-            );
+        if truss2_only {
+            return solve_truss_newton(model, t0, nlgeom);
         }
-        return solve_truss_newton(model, t0, nlgeom);
+        if nlgeom && continuum_only && !model.has_plastic() {
+            return solve_continuum_newton(model, t0);
+        }
+        return err(
+            "NLGEOM ist für T3D2 und Kontinuum (C3D*) implementiert; *PLASTIC nur für T3D2.",
+        );
     }
     solve_linear(model, t0)
 }
@@ -1179,6 +1185,232 @@ fn now_ms() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64() * 1000.0)
         .unwrap_or(0.0)
+}
+
+fn assemble_fext(model: &Model, ndn: usize, ndof: usize) -> Result<Vec<f64>> {
+    let mut f = vec![0.0; ndof];
+    add_cloads(model, ndn, 0.0, &mut f)?;
+    for el in &model.elements {
+        let xyz = elem_xyz(model, &el.nodes)?;
+        let nn = el.kind.nnodes();
+        let local_dim = el.kind.ndof_per_node();
+        let mut gdofs = Vec::with_capacity(nn * local_dim);
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for d in 0..local_dim {
+                gdofs.push(dof_of(ndn, ni, d));
+            }
+        }
+        let th = model.thickness_for(el);
+        let mat = model.material_for(el)?;
+        for dl in &model.dloads {
+            match dl {
+                Dload::Pressure { elem, face, mag } if *elem == el.id => {
+                    apply_pressure(
+                        model,
+                        el.kind,
+                        &xyz,
+                        *face,
+                        *mag,
+                        th,
+                        &gdofs,
+                        local_dim,
+                        &mut f,
+                    )?;
+                }
+                Dload::Grav { mag, dir } => {
+                    let mut ndir = *dir;
+                    let len = (ndir[0] * ndir[0] + ndir[1] * ndir[1] + ndir[2] * ndir[2]).sqrt();
+                    if len > 0.0 {
+                        ndir[0] /= len;
+                        ndir[1] /= len;
+                        ndir[2] /= len;
+                    }
+                    let bx = mat.density * *mag * ndir[0];
+                    let by = mat.density * *mag * ndir[1];
+                    let bz = mat.density * *mag * ndir[2];
+                    apply_body(
+                        model,
+                        el.kind,
+                        &xyz,
+                        bx,
+                        by,
+                        bz,
+                        th,
+                        &gdofs,
+                        local_dim,
+                        &mut f,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(f)
+}
+
+fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
+    let ndn = 3;
+    let nnode = model.node_ids.len();
+    let ndof = ndn * nnode;
+    let mut prescribed: HashMap<usize, f64> = HashMap::new();
+    for bc in &model.bcs {
+        if bc.dof >= ndn {
+            continue;
+        }
+        let ni = model.node_index(bc.node)?;
+        prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
+    }
+    let f_ext = assemble_fext(&model, ndn, ndof)?;
+    let mpcs = constraint::build_all_mpcs(&model, ndn)?;
+    let map = DofMap::build(ndof, &prescribed, &mpcs)?;
+    let nfree = map.n_ind;
+    if nfree == 0 {
+        return err("NLGEOM Kontinuum: keine freien DOF.");
+    }
+    let mut u_full = map.u0.clone();
+    let mut solver = String::new();
+    let mut residual = 0.0;
+    let mut iters = 0usize;
+    let mut last_cauchy: Vec<[f64; 6]> = vec![[0.0; 6]; model.elements.len()];
+    let mut last_gl: Vec<[f64; 6]> = vec![[0.0; 6]; model.elements.len()];
+    let mut last_fint = vec![0.0; ndof];
+    for it in 0..model.max_newton.max(1) {
+        iters = it + 1;
+        let mut trips: Vec<(usize, usize, f64)> = Vec::new();
+        let mut f_int = vec![0.0; ndof];
+        for (ei, el) in model.elements.iter().enumerate() {
+            let xyz0 = elem_xyz(&model, &el.nodes)?;
+            let nn = el.kind.nnodes();
+            let mut ue = vec![0.0; 3 * nn];
+            let mut gdofs = Vec::with_capacity(3 * nn);
+            for a in 0..nn {
+                let ni = model.node_index(el.nodes[a])?;
+                for d in 0..3 {
+                    let g = dof_of(ndn, ni, d);
+                    gdofs.push(g);
+                    ue[3 * a + d] = u_full[g];
+                }
+            }
+            let mat = model.material_for(el)?;
+            let nl = nlgeom::continuum_nl(el.kind, &xyz0, &ue, mat.e, mat.nu)?;
+            last_cauchy[ei] = nl.cauchy;
+            last_gl[ei] = nl.gl;
+            let nd = gdofs.len();
+            for i in 0..nd {
+                f_int[gdofs[i]] += nl.fe[i];
+                for j in 0..nd {
+                    let v = nl.ke[i * nd + j];
+                    if v.abs() > 0.0 {
+                        trips.push((gdofs[i], gdofs[j], v));
+                    }
+                }
+            }
+        }
+        last_fint.clone_from(&f_int);
+        let mut r = vec![0.0; ndof];
+        for i in 0..ndof {
+            r[i] = f_ext[i] - f_int[i];
+        }
+        let (ff, rhs) = map.reduce_inc(&trips, &r);
+        residual = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let fref = f_ext.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if residual < model.newton_tol * (1.0 + fref) {
+            break;
+        }
+        if it + 1 == model.max_newton.max(1) {
+            return err(format!(
+                "Newton konvergierte nicht (r={residual:.3e} nach {iters} Iterationen)."
+            ));
+        }
+        let solved = solve_kff(nfree, ff, &rhs)?;
+        solver = solved.name;
+        let mut du_full = vec![0.0; ndof];
+        for i in 0..ndof {
+            for &(j, c) in &map.t_row[i] {
+                du_full[i] += c * solved.x[j];
+            }
+        }
+        for i in 0..ndof {
+            u_full[i] += du_full[i];
+        }
+        let dun = solved.x.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if dun < 1e-14 {
+            break;
+        }
+    }
+    if solver.is_empty() {
+        solver = "Newton (equilibrium)".into();
+    } else {
+        solver = format!("Newton ({solver}, {iters} iters)");
+    }
+
+    let mut u = vec![[0.0; 3]; nnode];
+    let ur = vec![[0.0; 3]; nnode];
+    let mut rf = vec![[0.0; 3]; nnode];
+    let rm = vec![[0.0; 3]; nnode];
+    for ni in 0..nnode {
+        for d in 0..3 {
+            u[ni][d] = u_full[dof_of(ndn, ni, d)];
+            rf[ni][d] = last_fint[dof_of(ndn, ni, d)] - f_ext[dof_of(ndn, ni, d)];
+        }
+    }
+    let mut accs = vec![[0.0; 6]; nnode];
+    let mut cnt = vec![0.0; nnode];
+    let mut gacc = vec![[0.0; 6]; nnode];
+    let mut stress_gp = Vec::new();
+    for (ei, el) in model.elements.iter().enumerate() {
+        let s = last_cauchy[ei];
+        let g = last_gl[ei];
+        for &id in &el.nodes {
+            let ni = model.node_index(id)?;
+            for c in 0..6 {
+                accs[ni][c] += s[c];
+                gacc[ni][c] += g[c];
+            }
+            cnt[ni] += 1.0;
+        }
+        stress_gp.push((el.id, 1usize, s));
+    }
+    let mut stress = vec![[0.0; 6]; nnode];
+    let mut strain = vec![[0.0; 6]; nnode];
+    let mut vm = vec![0.0; nnode];
+    for i in 0..nnode {
+        if cnt[i] > 0.0 {
+            for c in 0..6 {
+                stress[i][c] = accs[i][c] / cnt[i];
+                strain[i][c] = gacc[i][c] / cnt[i];
+            }
+        }
+        vm[i] = von_mises(&stress[i]);
+    }
+    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain);
+    let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
+    let procedure = model.procedure.name().to_string();
+    let nsteps = model.steps.len().max(1);
+    Ok(SolveOutput {
+        model,
+        u,
+        ur,
+        rf,
+        rm,
+        stress,
+        strain,
+        von_mises: vm,
+        stress_gp,
+        frd: frd_s,
+        dat: dat_s,
+        nfree,
+        ndof,
+        solver,
+        iters,
+        residual,
+        time_ms: now_ms() - t0,
+        procedure,
+        frequencies: vec![],
+        buckles: vec![],
+        nsteps,
+    })
 }
 
 fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput> {

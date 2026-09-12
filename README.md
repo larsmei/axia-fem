@@ -9,7 +9,7 @@ Zwei Frontends, ein Solver:
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
 
-**1.3** — mehrere `*STEP` (Lasten kumulativ), `*CONTROLS, MAXITER=` / `RTOL=`, Material-Modul für Newton. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
+**1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP` (Lasten kumulativ), `*CONTROLS, MAXITER=` / `RTOL=`, Material-Modul für Newton. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
 
 ## CLI
 
@@ -45,6 +45,8 @@ Mitgelieferte Decks in [`examples/`](examples/):
 | `include_main.inp` | `*INCLUDE` (zieht `include_mat.inp`) |
 | `thermal_bar.inp` | eingespannter Stab, `*EXPANSION` / `*TEMPERATURE` |
 | `nlgeom_truss.inp` | T3D2 `*STEP, NLGEOM`, kleine Dehnung \(u=FL/EA\) |
+| `nlgeom_c3d8.inp` | C3D8 `*STEP, NLGEOM`, Patch \(u_x=0{,}01\) |
+| `nlgeom_stretch.inp` | C3D8 SVK, \(\lambda=1{,}2\), Cauchy \(\sigma_{xx}=26{,}4\) |
 | `plastic_bar.inp` | T3D2 `*PLASTIC` (isotrope Verfestigung), \(u\approx 3{,}095\) |
 | `heat_bar.inp` | stationäre Wärmeleitung T3D2, \(T(L/2)=50\) |
 | `dynamic_sdof.inp` | Newmark, SDOF \(u(T/2)=-u_0\) |
@@ -92,7 +94,9 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 - `*HEAT TRANSFER, STEADY STATE` — T3D2, B31, C3D8, C3D20, C3D10, C3D4, C3D6, C3D15, CPS4, CPS8, S4; `*CONDUCTIVITY`, `*DFLUX`/`*FILM`/`*CFLUX`, NT = DOF 11
 - `*DYNAMIC` — implizites Newmark (\(\beta=1/4,\gamma=1/2\)), `*DAMPING` (Rayleigh), `*AMPLITUDE`, `*INITIAL CONDITIONS`
 - `*EXPANSION` + `*TEMPERATURE` (isotrope Wärmedehnung, T3D2 und C3D8*)
-- `*STEP, NLGEOM` — geometrisch nichtlineare Statik, **T3D2** (korotational, Newton; `*CONTROLS, MAXITER=`, `RTOL=`)
+- `*STEP, NLGEOM` — geometrisch nichtlineare Statik
+  - **T3D2** korotational, Newton (`*CONTROLS, MAXITER=`, `RTOL=`)
+  - **Kontinuum** C3D8/C3D8I/C3D8R/C3D20/C3D20R/C3D4/C3D10/C3D6/C3D15: Total-Lagrange, St. Venant–Kirchhoff. Kleine Dehnung reproduziert den linearen Patch-Test. Lasten auf der Referenzkonfiguration (dead load).
 - Mehrere `*STEP` / `*END STEP` — Lasten und Lager kumulativ, letzter Schritt bestimmt die Ausgabe
 - `*PLASTIC` — J2 mit isotroper Verfestigung, **T3D2** (Kurve \(\sigma_y(\bar\varepsilon^p)\))
 - Sparse-Assembly (Triplet → CSR)
@@ -193,14 +197,16 @@ Gemischte Modelle (Kontinuum + Schale/Balken) verwenden 6 DOF pro Knoten. Unbenu
 
 `*TIE` (knotenweise, nächster Nachbar), `*RIGID BODY, REF NODE=`, `*COUPLING` + `*DISTRIBUTING`/`*KINEMATIC`, `*TRANSFORM, TYPE=R` (lokale DOFs, Ausgabe global).
 
-### Nichtlinear (1.0, T3D2)
+### Nichtlinear (1.0 T3D2, 1.4 Kontinuum)
 
 ```
 *STEP, NLGEOM
 *STATIC
 ```
 
-Korotationaler Fachwerkstab: Materialtangent \(E_t A/L_0\) plus geometrische Steifigkeit \(N/L\,(I-nn^T)\). Kleine Dehnung reproduziert \(u=FL/EA\).
+Korotationaler Fachwerkstab (T3D2): Materialtangent \(E_t A/L_0\) plus geometrische Steifigkeit \(N/L\,(I-nn^T)\). Kleine Dehnung reproduziert \(u=FL/EA\).
+
+Kontinuum (C3D*): Total-Lagrange, St. Venant–Kirchhoff \(S=\lambda\,\mathrm{tr}(E)\,I+2\mu E\). Kleine Dehnung → linearer Patch (\(u_x=0{,}01\), \(\sigma_{xx}=210\)). Cauchy-Ausgabe \(\sigma=J^{-1}FSF^T\). C3D8I ohne inkompatible Moden (wie C3D8). Gemischte Netze (Schale/Balken+Kontinuum) mit NLGEOM werden abgelehnt.
 
 ```
 *PLASTIC
@@ -208,7 +214,7 @@ Korotationaler Fachwerkstab: Materialtangent \(E_t A/L_0\) plus geometrische Ste
 420, 0.01
 ```
 
-CalculiX-Reihenfolge \(\sigma_y, \bar\varepsilon^p\). 1D-J2, \(\varepsilon=\sigma/E+\bar\varepsilon^p\). Kontinuum (C3D8 …) und gemischte Netze mit NLGEOM/`*PLASTIC` werden abgelehnt.
+CalculiX-Reihenfolge \(\sigma_y, \bar\varepsilon^p\). 1D-J2, \(\varepsilon=\sigma/E+\bar\varepsilon^p\). `*PLASTIC` ist weiterhin nur für T3D2.
 
 ### Wärmeleitung und Dynamik (1.1)
 
@@ -251,6 +257,8 @@ Newmark (mittlere Beschleunigung). Lumped mass wie `*FREQUENCY`. Lasten mit `*AM
 | M3D4-Membran | \(u_x=0{,}01\), \(\sigma_{xx}=210\) (\(\nu=0\)) |
 | T3D2 / `*EQUATION` | \(u = FL/EA\); zwei Stäbe in Serie \(u_{\mathrm{tip}}=0{,}5\) |
 | T3D2 NLGEOM | kleine Dehnung: \(u=0{,}5\) |
+| C3D8 NLGEOM Patch | \(u_x=0{,}01\), \(\sigma_{xx}=210\) |
+| C3D8 SVK \(\lambda=1{,}2\) | Cauchy \(\sigma_{xx}=26{,}4\) |
 | T3D2 `*PLASTIC` | \(\sigma=250\), \(u\approx 3{,}095\) (über elastisch \(1{,}19\)) |
 | Wärmeleitung T3D2 | \(T(0)=0\), \(T(L)=100\) → \(T(L/2)=50\) |
 | SDOF `*DYNAMIC` | \(k=100\), \(m=1\), \(u(T/2)=-u_0\) |

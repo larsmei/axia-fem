@@ -13,6 +13,7 @@ mod inp;
 mod linalg;
 mod material;
 mod model;
+mod nlgeom;
 mod quadratic;
 mod shell;
 
@@ -1362,39 +1363,40 @@ elastic plastic
     }
 
     #[test]
-    fn nlgeom_hex_is_rejected() {
+    fn nlgeom_mixed_mesh_is_rejected() {
         let inp = r#"
 *HEADING
-nlgeom hex
+nlgeom mixed
 *NODE
 1, 0, 0, 0
 2, 10, 0, 0
 3, 10, 10, 0
 4, 0, 10, 0
-5, 0, 0, 10
-6, 10, 0, 10
-7, 10, 10, 10
-8, 0, 10, 10
-*ELEMENT, TYPE=C3D8, ELSET=S
-1, 1, 2, 3, 4, 5, 6, 7, 8
+*ELEMENT, TYPE=S4, ELSET=S
+1, 1, 2, 3, 4
+*ELEMENT, TYPE=T3D2, ELSET=T
+2, 1, 2
 *MATERIAL, NAME=STEEL
 *ELASTIC
 210000, 0.3
-*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*SHELL SECTION, ELSET=S, MATERIAL=STEEL
+1.0
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+1
 *BOUNDARY
-1, 1, 3
+1, 1, 6
 *STEP, NLGEOM
 *STATIC
 *CLOAD
-2, 1, 1
+2, 3, 1
 *END STEP
 "#;
         let e = match solve_native(inp) {
-            Ok(_) => panic!("expected NLGEOM on C3D8 to fail"),
+            Ok(_) => panic!("expected mixed NLGEOM to fail"),
             Err(e) => e.to_string(),
         };
         assert!(
-            e.contains("T3D2") || e.contains("NLGEOM"),
+            e.contains("NLGEOM") || e.contains("T3D2") || e.contains("Kontinuum"),
             "unexpected error: {e}"
         );
     }
@@ -1903,5 +1905,123 @@ controls
         let out = solve_native(inp).unwrap();
         let u2 = out.u[out.model.node_index(2).unwrap()][0];
         assert!((u2 - 0.01).abs() < 1e-8, "ux={u2}");
+    }
+
+    #[test]
+    fn nlgeom_c3d8_small_strain_patch() {
+        let mut inp = cube_tension();
+        inp = inp.replace("*STEP\n*STATIC", "*STEP, NLGEOM\n*STATIC");
+        let out = solve_native(&inp).unwrap();
+        let mut ux_loaded = Vec::new();
+        for (i, &id) in out.model.node_ids.iter().enumerate() {
+            if id == 2 || id == 3 || id == 6 || id == 7 {
+                ux_loaded.push(out.u[i][0]);
+            }
+        }
+        let mean: f64 = ux_loaded.iter().sum::<f64>() / ux_loaded.len() as f64;
+        assert!(
+            (mean - 0.01).abs() < 5e-5,
+            "NLGEOM C3D8 ux={mean}, expected 0.01"
+        );
+        let mut sxx = 0.0;
+        for s in &out.stress {
+            sxx += s[0];
+        }
+        sxx /= out.stress.len() as f64;
+        assert!(
+            (sxx - 210.0).abs() < 0.5,
+            "NLGEOM C3D8 sxx={sxx}, expected 210"
+        );
+        assert!(out.iters >= 1);
+        assert!(out.residual < 1e-4, "residual={}", out.residual);
+    }
+
+    #[test]
+    fn nlgeom_c3d6_small_strain_patch() {
+        let inp = r#"
+*HEADING
+C3D6 NLGEOM patch uz=0.01
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 0, 10, 0
+4, 0, 0, 10
+5, 10, 0, 10
+6, 0, 10, 10
+*ELEMENT, TYPE=C3D6, ELSET=S
+1, 1, 2, 3, 4, 5, 6
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 3, 3
+2, 3, 3
+3, 3, 3
+1, 1, 2
+2, 2, 2
+*STEP, NLGEOM
+*STATIC
+*CLOAD
+4, 3, 3500
+5, 3, 3500
+6, 3, 3500
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let uz = out.u[out.model.node_index(4).unwrap()][2];
+        assert!((uz - 0.01).abs() < 2e-5, "C3D6 NLGEOM uz={uz}");
+    }
+
+    #[test]
+    fn nlgeom_c3d8_svk_stretch() {
+        // nu=0, prescribed λ=1.2. E_xx=0.5*(λ²-1)=0.22, S_xx=E E_xx=22,
+        // Cauchy σ_xx = λ S_xx = 26.4
+        let inp = r#"
+*HEADING
+C3D8 SVK stretch λ=1.2
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+5, 0, 0, 1
+6, 1, 0, 1
+7, 1, 1, 1
+8, 0, 1, 1
+*ELEMENT, TYPE=C3D8, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+100, 0.0
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 3
+4, 1, 1
+4, 3, 3
+5, 1, 2
+8, 1, 1
+2, 2, 3
+3, 3, 3
+6, 2, 2
+2, 1, 1, 0.2
+3, 1, 1, 0.2
+6, 1, 1, 0.2
+7, 1, 1, 0.2
+*STEP, NLGEOM
+*STATIC
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((u2 - 0.2).abs() < 1e-12, "prescribed ux={u2}");
+        let sxx = out.stress[out.model.node_index(7).unwrap()][0];
+        assert!(
+            (sxx - 26.4).abs() < 0.05,
+            "SVK Cauchy sxx={sxx}, expected 26.4"
+        );
+        let exx = out.strain[out.model.node_index(7).unwrap()][0];
+        assert!((exx - 0.22).abs() < 1e-6, "GL Exx={exx}, expected 0.22");
+        assert!(out.residual < 1e-8, "residual={}", out.residual);
     }
 }

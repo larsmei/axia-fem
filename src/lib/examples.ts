@@ -913,6 +913,90 @@ S
 `,
   },
   {
+    id: "nlgeom-c3d8",
+    name: "Hexaeder NLGEOM",
+    blurb: "C3D8 Total-Lagrange, ux = 0.01",
+    inp: `*HEADING
+C3D8 NLGEOM — kleine Dehnung, ux = FL/EA = 0.01
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+*ELEMENT, TYPE=C3D8, ELSET=SOLID
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=SOLID, MATERIAL=STEEL
+*NSET, NSET=FIXED
+1, 4, 5, 8
+*BOUNDARY
+FIXED, 1, 1
+1, 2, 3
+4, 3, 3
+*STEP, NLGEOM
+*STATIC
+*CLOAD
+2, 1, 5250
+3, 1, 5250
+6, 1, 5250
+7, 1, 5250
+*NODE FILE
+U, RF
+*EL FILE
+S
+*END STEP
+`,
+  },
+  {
+    id: "nlgeom-stretch",
+    name: "SVK-Zug λ=1.2",
+    blurb: "C3D8 finite Dehnung, σxx=26.4",
+    inp: `*HEADING
+C3D8 St. Venant–Kirchhoff, λ=1.2, nu=0 → Cauchy σxx=26.4
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+5, 0, 0, 1
+6, 1, 0, 1
+7, 1, 1, 1
+8, 0, 1, 1
+*ELEMENT, TYPE=C3D8, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+100, 0.0
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 3
+4, 1, 1
+4, 3, 3
+5, 1, 2
+8, 1, 1
+2, 2, 3
+3, 3, 3
+6, 2, 2
+2, 1, 1, 0.2
+3, 1, 1, 0.2
+6, 1, 1, 0.2
+7, 1, 1, 0.2
+*STEP, NLGEOM
+*STATIC
+*NODE FILE
+U, RF
+*EL FILE
+S
+*END STEP
+`,
+  },
+  {
     id: "plastic",
     name: "Zugstab plastisch",
     blurb: "T3D2 *PLASTIC, σ = 250, u ≈ 3.1",

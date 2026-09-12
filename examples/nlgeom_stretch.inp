@@ -1,0 +1,37 @@
+*HEADING
+C3D8 St. Venant–Kirchhoff, λ=1.2, nu=0 → Cauchy σxx=26.4
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+5, 0, 0, 1
+6, 1, 0, 1
+7, 1, 1, 1
+8, 0, 1, 1
+*ELEMENT, TYPE=C3D8, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+100, 0.0
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 3
+4, 1, 1
+4, 3, 3
+5, 1, 2
+8, 1, 1
+2, 2, 3
+3, 3, 3
+6, 2, 2
+2, 1, 1, 0.2
+3, 1, 1, 0.2
+6, 1, 1, 0.2
+7, 1, 1, 0.2
+*STEP, NLGEOM
+*STATIC
+*NODE FILE
+U, RF
+*EL FILE
+S
+*END STEP

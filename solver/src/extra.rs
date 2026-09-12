@@ -86,7 +86,7 @@ fn wedge_shape(xi: f64, eta: f64, zeta: f64) -> ([f64; 6], [[f64; 3]; 6]) {
     (n, dn)
 }
 
-fn wedge_dndx(xyz: &[[f64; 3]], xi: f64, eta: f64, zeta: f64) -> Result<([[f64; 3]; 6], f64, [f64; 6])> {
+pub(crate) fn wedge_dndx(xyz: &[[f64; 3]], xi: f64, eta: f64, zeta: f64) -> Result<([[f64; 3]; 6], f64, [f64; 6])> {
     let (n, dn) = wedge_shape(xi, eta, zeta);
     let mut j = [[0.0; 3]; 3];
     for a in 0..6 {
