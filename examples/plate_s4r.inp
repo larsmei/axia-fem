@@ -1,0 +1,42 @@
+*HEADING
+S4R simply-supported square plate a=100 t=1 q=0.01
+*NODE
+1, 0, 0, 0
+2, 50, 0, 0
+3, 100, 0, 0
+4, 0, 50, 0
+5, 50, 50, 0
+6, 100, 50, 0
+7, 0, 100, 0
+8, 50, 100, 0
+9, 100, 100, 0
+*ELEMENT, TYPE=S4R, ELSET=PLATE
+1, 1, 2, 5, 4
+2, 2, 3, 6, 5
+3, 4, 5, 8, 7
+4, 5, 6, 9, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SHELL SECTION, ELSET=PLATE, MATERIAL=STEEL
+1.0
+*BOUNDARY
+1, 3, 3
+2, 3, 3
+3, 3, 3
+4, 3, 3
+6, 3, 3
+7, 3, 3
+8, 3, 3
+9, 3, 3
+1, 1, 2
+3, 2, 2
+*STEP
+*STATIC
+*DLOAD
+EALL, P, -0.01
+*NODE FILE
+U
+*EL FILE
+S
+*END STEP

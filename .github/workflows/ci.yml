@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test solver
+        working-directory: solver
+        run: cargo test --features cli
+      - name: Build CLI
+        working-directory: solver
+        run: cargo build --release --bin axia --features cli
+      - name: Smoke examples
+        run: |
+          ./solver/target/release/axia --version
+          ./solver/target/release/axia examples/patch_c3d8 --json --no-frd --no-dat
+          ./solver/target/release/axia --check examples/cantilever_b32.inp
+          ./solver/target/release/axia --check examples/plate_s4r.inp

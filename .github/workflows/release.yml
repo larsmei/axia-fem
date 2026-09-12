@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to attach artifacts to (optional)"
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: axia
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin: axia
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            bin: axia
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: axia.exe
+            archive: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: axia
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            bin: axia
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        working-directory: solver
+        run: cargo build --release --bin axia --target ${{ matrix.target }} --features cli
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME:-${{ github.event.inputs.tag || github.sha }}}"
+          VER="${VER#v}"
+          STAGE="axia-${VER}-${{ matrix.target }}"
+          mkdir -p "dist/${STAGE}"
+          cp "solver/target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${STAGE}/"
+          cp README.md LICENSE "dist/${STAGE}/"
+          mkdir -p "dist/${STAGE}/examples"
+          cp examples/*.inp "dist/${STAGE}/examples/"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a -tzip "${STAGE}.zip" "${STAGE}" >/dev/null
+            echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "${STAGE}.tar.gz" "${STAGE}"
+            echo "ASSET=${STAGE}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axia-${{ matrix.target }}
+          path: dist/${{ env.ASSET }}
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ env.ASSET }}
+          generate_release_notes: true
+          draft: false

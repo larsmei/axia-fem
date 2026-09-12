@@ -11,10 +11,14 @@ mod quadratic;
 mod shell;
 
 use serde_json::{json, Value};
+
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
 use crate::error::Result;
-use crate::model::Model;
+
+pub use analysis::SolveOutput;
+pub use model::{ElemKind, Model};
 
 fn mesh_json(model: &Model) -> Value {
     let coords: Vec<f64> = model.coords.iter().flatten().copied().collect();
@@ -136,7 +140,7 @@ fn wrap_err(e: impl std::fmt::Display) -> String {
     .to_string()
 }
 
-#[wasm_bindgen]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn preview_inp(inp: &str) -> String {
     match preview_json(inp) {
         Ok(v) => v.to_string(),
@@ -144,7 +148,7 @@ pub fn preview_inp(inp: &str) -> String {
     }
 }
 
-#[wasm_bindgen]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn solve_inp(inp: &str) -> String {
     match solve_json(inp) {
         Ok(v) => v.to_string(),
@@ -152,7 +156,7 @@ pub fn solve_inp(inp: &str) -> String {
     }
 }
 
-/// Native helpers used by tests.
+/// Native helpers used by tests and the CLI.
 pub fn parse_model(inp: &str) -> Result<Model> {
     inp::parse(inp)
 }
@@ -166,7 +170,6 @@ pub fn solve_native(inp: &str) -> Result<analysis::SolveOutput> {
 mod tests {
     use super::*;
     use crate::elem::von_mises;
-
     fn cube_tension() -> String {
         r#"
 *HEADING

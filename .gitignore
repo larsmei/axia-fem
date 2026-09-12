@@ -12,6 +12,11 @@ dist/
 
 # rust / wasm
 solver/target/
+solver/.intentionally-empty-file.o
+
+# solver job output
+examples/*.frd
+examples/*.dat
 
 # env & logs
 .env

@@ -1,10 +1,57 @@
 # Axia
 
-Linear-statischer FEM-Solver im Browser. CalculiX-/Abaqus-kompatibles INP einlesen, rechnen, verformtes Netz und Spannungsfelder anzeigen, FRD/DAT exportieren.
+Linear-statischer FEM-Solver. CalculiX-/Abaqus-kompatibles INP einlesen, rechnen, FRD/DAT schreiben.
 
-Der Solver ist in Rust geschrieben, als WebAssembly gebaut und läuft vollständig clientseitig — ohne Server, ohne Datei-Upload nach außen.
+Zwei Frontends, ein Solver:
 
-**Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem)
+- **CLI** (`axia`) — natives Binary für Linux, Windows und macOS
+- **Browser** — Rust als WebAssembly, 3D-Viewer, komplett clientseitig
+
+**Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
+
+## CLI
+
+Wie CalculiX: Job-Name ohne Endung. `axia job` liest `job.inp` und schreibt `job.frd` plus `job.dat`.
+
+```bash
+axia --version
+axia --help
+
+axia examples/patch_c3d8          # → examples/patch_c3d8.frd / .dat
+axia examples/cantilever_b32.inp
+axia --check model.inp            # nur parsen
+axia --json job.inp               # Statistik als JSON
+cat deck.inp | axia - --stdout > out.frd
+```
+
+Mitgelieferte Decks in [`examples/`](examples/):
+
+| Datei | Inhalt |
+|---|---|
+| `patch_c3d8.inp` | Zug-Patch C3D8, \(u_x = 0{,}01\) |
+| `cantilever_b32.inp` | Timoshenko-Kragträger B32 |
+| `plate_s4r.inp` | gelenkig gelagerte S4R-Platte |
+
+### Binary bauen
+
+```bash
+cd solver
+cargo build --release --bin axia
+./target/release/axia --version
+```
+
+Cross-Compile (Linux-Host) und Packen:
+
+```bash
+# Targets + Linker (Debian/Ubuntu)
+sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-aarch64-linux-gnu musl-tools
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
+
+./solver/scripts/release.sh
+# → dist/axia-<ver>-<triple>.tar.gz  /  .zip
+```
+
+GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätzlich **macOS** (Intel + Apple Silicon) und **Windows MSVC**.
 
 ## Features
 
@@ -13,9 +60,8 @@ Der Solver ist in Rust geschrieben, als WebAssembly gebaut und läuft vollständ
 - Lasten und Lager: `*BOUNDARY` (DOF 1–6), `*CLOAD`, `*DLOAD` (`P`, `P1…P6`, `GRAV`, `PX`/`PY`/`PZ`)
 - Linear-statische Analyse, isotrope Elastizität
 - Sparse-Assembly (Triplet → CSR), Cholesky oder PCG
-- 3D-Viewer (Three.js): undeformiert / deformiert, von Mises, |u|, ux/uy/uz, Sij
 - FRD- und DAT-Export (cgx-kompatible Elementtypen)
-- Mitgelieferte Beispiele (Balken, Schale, quadratisches Kontinuum, Patch-Tests)
+- 3D-Viewer (Three.js): undeformiert / deformiert, von Mises, |u|, ux/uy/uz, Sij
 
 ## Elementbibliothek
 
@@ -91,9 +137,12 @@ Gemischte Modelle (Kontinuum + Schale/Balken) verwenden 6 DOF pro Knoten. Unbenu
 | Quadratplatte S4R | Kirchhoff \(\delta_{\max} \approx 0{,}00406\,qa^4/D \approx 0{,}211\) |
 | Kragträger CPS8 | Euler \(\delta \approx 1{,}905\), näher als lineare CPS4 |
 
-`cargo test` im Ordner `solver/` führt die nativen Patch- und Kragträger-Tests aus.
+```bash
+cd solver && cargo test
+./target/release/axia ../examples/patch_c3d8.inp --json
+```
 
-## Entwicklung
+## Web-App
 
 Voraussetzungen: Node.js 22+, npm, Rust mit Target `wasm32-unknown-unknown`, `wasm-bindgen-cli` 0.2.128.
 
@@ -105,14 +154,13 @@ npm run dev
 ```bash
 npm run build
 npm run typecheck
-cd solver && cargo test
 ```
 
-## WASM neu bauen
+### WASM neu bauen
 
 ```bash
 cd solver
-cargo build --release --target wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown --lib --no-default-features
 wasm-bindgen --target web --out-dir ../src/wasm \
   target/wasm32-unknown-unknown/release/axia_fem.wasm
 cp ../src/wasm/axia_fem_bg.wasm ../public/axia_fem_bg.wasm
