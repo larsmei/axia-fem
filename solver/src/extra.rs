@@ -687,3 +687,303 @@ pub fn hex8_thermal_force(xyz: &[[f64; 3]], e: f64, nu: f64, alpha: f64, dt: f64
 pub fn spring_nodal_stress(_xyz: &[[f64; 3]], _ue: &[f64], _k: f64) -> Vec<[f64; 6]> {
     vec![[0.0; 6]; 2]
 }
+
+// ---------------------------------------------------------------------------
+// C3D15 — 15-node quadratic wedge (pentahedron)
+// Nodes: 1-3 bottom corners, 4-6 top corners,
+// 7-9 bottom mids (1-2,2-3,3-1), 10-12 top mids, 13-15 vertical mids.
+// Parent: L1=ξ, L2=η, L3=1-ξ-η, ζ ∈ [-1, 1].
+// ---------------------------------------------------------------------------
+
+const G3: [f64; 3] = [-0.7745966692414834, 0.0, 0.7745966692414834];
+const W3: [f64; 3] = [0.5555555555555556, 0.8888888888888888, 0.5555555555555556];
+
+fn wedge15_shape(xi: f64, eta: f64, zeta: f64) -> ([f64; 15], [[f64; 3]; 15]) {
+    let l1 = xi;
+    let l2 = eta;
+    let l3 = 1.0 - xi - eta;
+    let zm = 1.0 - zeta;
+    let zp = 1.0 + zeta;
+    let mut n = [0.0; 15];
+    let mut dn = [[0.0; 3]; 15];
+
+    // corners bottom 1-3, top 4-6
+    n[0] = 0.5 * l1 * zm * (2.0 * l1 - 2.0 - zeta);
+    n[1] = 0.5 * l2 * zm * (2.0 * l2 - 2.0 - zeta);
+    n[2] = 0.5 * l3 * zm * (2.0 * l3 - 2.0 - zeta);
+    n[3] = 0.5 * l1 * zp * (2.0 * l1 - 2.0 + zeta);
+    n[4] = 0.5 * l2 * zp * (2.0 * l2 - 2.0 + zeta);
+    n[5] = 0.5 * l3 * zp * (2.0 * l3 - 2.0 + zeta);
+    // bottom mids 7-9, top mids 10-12
+    n[6] = 2.0 * l1 * l2 * zm;
+    n[7] = 2.0 * l2 * l3 * zm;
+    n[8] = 2.0 * l3 * l1 * zm;
+    n[9] = 2.0 * l1 * l2 * zp;
+    n[10] = 2.0 * l2 * l3 * zp;
+    n[11] = 2.0 * l3 * l1 * zp;
+    // vertical mids 13-15
+    n[12] = l1 * (1.0 - zeta * zeta);
+    n[13] = l2 * (1.0 - zeta * zeta);
+    n[14] = l3 * (1.0 - zeta * zeta);
+
+    let d1b = 0.5 * zm * (4.0 * l1 - 2.0 - zeta);
+    let d2b = 0.5 * zm * (4.0 * l2 - 2.0 - zeta);
+    let d3b = 0.5 * zm * (4.0 * l3 - 2.0 - zeta);
+    let d1t = 0.5 * zp * (4.0 * l1 - 2.0 + zeta);
+    let d2t = 0.5 * zp * (4.0 * l2 - 2.0 + zeta);
+    let d3t = 0.5 * zp * (4.0 * l3 - 2.0 + zeta);
+
+    // d/dξ, d/dη, d/dζ
+    dn[0] = [d1b, 0.0, -0.5 * l1 * (2.0 * l1 - 1.0 - 2.0 * zeta)];
+    dn[1] = [0.0, d2b, -0.5 * l2 * (2.0 * l2 - 1.0 - 2.0 * zeta)];
+    dn[2] = [-d3b, -d3b, -0.5 * l3 * (2.0 * l3 - 1.0 - 2.0 * zeta)];
+    dn[3] = [d1t, 0.0, 0.5 * l1 * (2.0 * l1 - 1.0 + 2.0 * zeta)];
+    dn[4] = [0.0, d2t, 0.5 * l2 * (2.0 * l2 - 1.0 + 2.0 * zeta)];
+    dn[5] = [-d3t, -d3t, 0.5 * l3 * (2.0 * l3 - 1.0 + 2.0 * zeta)];
+
+    dn[6] = [2.0 * l2 * zm, 2.0 * l1 * zm, -2.0 * l1 * l2];
+    dn[7] = [-2.0 * l2 * zm, 2.0 * (l3 - l2) * zm, -2.0 * l2 * l3];
+    dn[8] = [2.0 * (l3 - l1) * zm, -2.0 * l1 * zm, -2.0 * l3 * l1];
+    dn[9] = [2.0 * l2 * zp, 2.0 * l1 * zp, 2.0 * l1 * l2];
+    dn[10] = [-2.0 * l2 * zp, 2.0 * (l3 - l2) * zp, 2.0 * l2 * l3];
+    dn[11] = [2.0 * (l3 - l1) * zp, -2.0 * l1 * zp, 2.0 * l3 * l1];
+
+    let o = 1.0 - zeta * zeta;
+    dn[12] = [o, 0.0, -2.0 * zeta * l1];
+    dn[13] = [0.0, o, -2.0 * zeta * l2];
+    dn[14] = [-o, -o, -2.0 * zeta * l3];
+    (n, dn)
+}
+
+pub(crate) fn wedge15_dndx(
+    xyz: &[[f64; 3]],
+    xi: f64,
+    eta: f64,
+    zeta: f64,
+) -> Result<([[f64; 3]; 15], f64, [f64; 15])> {
+    let (n, dn) = wedge15_shape(xi, eta, zeta);
+    let mut j = [[0.0; 3]; 3];
+    for a in 0..15 {
+        for p in 0..3 {
+            for q in 0..3 {
+                j[q][p] += dn[a][p] * xyz[a][q];
+            }
+        }
+    }
+    let (inv, det) = invert3(j)?;
+    let mut dndx = [[0.0; 3]; 15];
+    for a in 0..15 {
+        for i in 0..3 {
+            dndx[a][i] = inv[0][i] * dn[a][0] + inv[1][i] * dn[a][1] + inv[2][i] * dn[a][2];
+        }
+    }
+    Ok((dndx, det, n))
+}
+
+fn wedge15_gauss() -> Vec<(f64, f64, f64, f64)> {
+    let tri = [
+        [1.0 / 6.0, 1.0 / 6.0],
+        [2.0 / 3.0, 1.0 / 6.0],
+        [1.0 / 6.0, 2.0 / 3.0],
+    ];
+    let wtri = 1.0 / 6.0;
+    let mut o = Vec::new();
+    for t in &tri {
+        for k in 0..3 {
+            o.push((t[0], t[1], G3[k], wtri * W3[k]));
+        }
+    }
+    o
+}
+
+pub fn wedge15_stiffness(xyz: &[[f64; 3]], e: f64, nu: f64) -> Result<(Vec<f64>, f64)> {
+    if xyz.len() < 15 {
+        return err("C3D15 braucht 15 Knoten.");
+    }
+    let d = d_iso_3d(e, nu)?;
+    let nd = 45usize;
+    let mut ke = vec![0.0; nd * nd];
+    let mut vol = 0.0;
+    for (xi, eta, zeta, w0) in wedge15_gauss() {
+        let (dndx, det, _) = wedge15_dndx(xyz, xi, eta, zeta)?;
+        if det <= 0.0 {
+            return err("C3D15: negative Jakobideterminante (Knotenreihenfolge).");
+        }
+        let w = det * w0;
+        let mut b = vec![0.0; 6 * nd];
+        fill_b3(&mut b, 15, &dndx);
+        gemm_bt_d_b(&mut ke, nd, &b, 6, &d, w);
+        vol += w;
+    }
+    Ok((ke, vol))
+}
+
+pub fn wedge15_nodal_stress(xyz: &[[f64; 3]], ue: &[f64], e: f64, nu: f64) -> Result<Vec<[f64; 6]>> {
+    let d = d_iso_3d(e, nu)?;
+    let nd = 45usize;
+    let corners = [
+        [1.0, 0.0, -1.0],
+        [0.0, 1.0, -1.0],
+        [0.0, 0.0, -1.0],
+        [1.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0],
+        [0.5, 0.5, -1.0],
+        [0.0, 0.5, -1.0],
+        [0.5, 0.0, -1.0],
+        [0.5, 0.5, 1.0],
+        [0.0, 0.5, 1.0],
+        [0.5, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0],
+    ];
+    let mut out = vec![[0.0; 6]; 15];
+    for a in 0..15 {
+        let (dndx, _, _) = wedge15_dndx(xyz, corners[a][0], corners[a][1], corners[a][2])?;
+        let mut b = vec![0.0; 6 * nd];
+        fill_b3(&mut b, 15, &dndx);
+        let s = sigma_from_b(&b, 6, nd, &d, ue);
+        out[a].copy_from_slice(&s);
+    }
+    Ok(out)
+}
+
+pub fn wedge15_body_force(xyz: &[[f64; 3]], bx: f64, by: f64, bz: f64) -> Result<Vec<f64>> {
+    let mut fe = vec![0.0; 45];
+    for (xi, eta, zeta, w0) in wedge15_gauss() {
+        let (_, det, n) = wedge15_dndx(xyz, xi, eta, zeta)?;
+        if det <= 0.0 {
+            continue;
+        }
+        let w = det * w0;
+        for a in 0..15 {
+            fe[3 * a] += n[a] * bx * w;
+            fe[3 * a + 1] += n[a] * by * w;
+            fe[3 * a + 2] += n[a] * bz * w;
+        }
+    }
+    Ok(fe)
+}
+
+pub fn wedge15_face_pressure(xyz: &[[f64; 3]], face: i32, p: f64) -> Result<Vec<f64>> {
+    let mut fe = vec![0.0; 45];
+    match face {
+        1 => tri6_face_load(&mut fe, xyz, [0, 1, 2, 6, 7, 8], p)?,
+        2 => tri6_face_load(&mut fe, xyz, [3, 5, 4, 11, 10, 9], p)?,
+        3 => quad8_face_load(&mut fe, xyz, [0, 1, 4, 3, 6, 13, 9, 12], p)?,
+        4 => quad8_face_load(&mut fe, xyz, [1, 2, 5, 4, 7, 14, 10, 13], p)?,
+        5 => quad8_face_load(&mut fe, xyz, [2, 0, 3, 5, 8, 12, 11, 14], p)?,
+        _ => return err(format!("Ungültige C3D15-Fläche P{face}")),
+    }
+    Ok(fe)
+}
+
+fn tri6_face_load(fe: &mut [f64], xyz: &[[f64; 3]], idx: [usize; 6], p: f64) -> Result<()> {
+    // 3-point triangle, parent (L1,L2), area 1/2
+    let gps = [
+        [1.0 / 6.0, 1.0 / 6.0],
+        [2.0 / 3.0, 1.0 / 6.0],
+        [1.0 / 6.0, 2.0 / 3.0],
+    ];
+    let w0 = 1.0 / 6.0;
+    for g in &gps {
+        let l1 = g[0];
+        let l2 = g[1];
+        let l3 = 1.0 - l1 - l2;
+        let nshp = [
+            l1 * (2.0 * l1 - 1.0),
+            l2 * (2.0 * l2 - 1.0),
+            l3 * (2.0 * l3 - 1.0),
+            4.0 * l1 * l2,
+            4.0 * l2 * l3,
+            4.0 * l3 * l1,
+        ];
+        let dn1 = [4.0 * l1 - 1.0, 0.0, -(4.0 * l3 - 1.0), 4.0 * l2, -4.0 * l2, 4.0 * (l3 - l1)];
+        let dn2 = [0.0, 4.0 * l2 - 1.0, -(4.0 * l3 - 1.0), 4.0 * l1, 4.0 * (l3 - l2), -4.0 * l1];
+        let mut rxi = [0.0; 3];
+        let mut reta = [0.0; 3];
+        for a in 0..6 {
+            let q = xyz[idx[a]];
+            for k in 0..3 {
+                rxi[k] += dn1[a] * q[k];
+                reta[k] += dn2[a] * q[k];
+            }
+        }
+        let nx = rxi[1] * reta[2] - rxi[2] * reta[1];
+        let ny = rxi[2] * reta[0] - rxi[0] * reta[2];
+        let nz = rxi[0] * reta[1] - rxi[1] * reta[0];
+        for a in 0..6 {
+            let q = idx[a];
+            fe[3 * q] += -p * nshp[a] * nx * w0;
+            fe[3 * q + 1] += -p * nshp[a] * ny * w0;
+            fe[3 * q + 2] += -p * nshp[a] * nz * w0;
+        }
+    }
+    Ok(())
+}
+
+fn quad8_face_load(fe: &mut [f64], xyz: &[[f64; 3]], idx: [usize; 8], p: f64) -> Result<()> {
+    for i in 0..3 {
+        for j in 0..3 {
+            let xi = G3[i];
+            let eta = G3[j];
+            let w = W3[i] * W3[j];
+            let (nshp, dn) = crate::quadratic::quad8_shape(xi, eta);
+            let mut rxi = [0.0; 3];
+            let mut reta = [0.0; 3];
+            for a in 0..8 {
+                let q = xyz[idx[a]];
+                for k in 0..3 {
+                    rxi[k] += dn[a][0] * q[k];
+                    reta[k] += dn[a][1] * q[k];
+                }
+            }
+            let nx = rxi[1] * reta[2] - rxi[2] * reta[1];
+            let ny = rxi[2] * reta[0] - rxi[0] * reta[2];
+            let nz = rxi[0] * reta[1] - rxi[1] * reta[0];
+            for a in 0..8 {
+                let q = idx[a];
+                fe[3 * q] += -p * nshp[a] * nx * w;
+                fe[3 * q + 1] += -p * nshp[a] * ny * w;
+                fe[3 * q + 2] += -p * nshp[a] * nz * w;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn wedge15_kg(xyz: &[[f64; 3]], stress: &[f64; 6]) -> Result<Vec<f64>> {
+    let nd = 45usize;
+    let mut kg = vec![0.0; nd * nd];
+    for (xi, eta, zeta, w0) in wedge15_gauss() {
+        let (dndx, det, _) = wedge15_dndx(xyz, xi, eta, zeta)?;
+        if det <= 0.0 {
+            continue;
+        }
+        crate::eigen::add_continuum_kg(&mut kg, 15, &dndx, stress, det * w0);
+    }
+    Ok(kg)
+}
+
+pub fn wedge6_kg(xyz: &[[f64; 3]], stress: &[f64; 6]) -> Result<Vec<f64>> {
+    let nd = 18usize;
+    let mut kg = vec![0.0; nd * nd];
+    let tri = [
+        [1.0 / 6.0, 1.0 / 6.0],
+        [2.0 / 3.0, 1.0 / 6.0],
+        [1.0 / 6.0, 2.0 / 3.0],
+    ];
+    let wtri = 1.0 / 6.0;
+    let zpts = [-G2, G2];
+    for t in &tri {
+        for &zeta in &zpts {
+            let (dndx, det, _) = wedge_dndx(xyz, t[0], t[1], zeta)?;
+            if det <= 0.0 {
+                continue;
+            }
+            crate::eigen::add_continuum_kg(&mut kg, 6, &dndx, stress, det * wtri);
+        }
+    }
+    Ok(kg)
+}

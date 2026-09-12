@@ -7,8 +7,8 @@ use crate::elem::{
 };
 use crate::error::{err, Result};
 
-const G3: [f64; 3] = [-0.7745966692414834, 0.0, 0.7745966692414834];
-const W3: [f64; 3] = [0.5555555555555556, 0.8888888888888888, 0.5555555555555556];
+pub(crate) const G3: [f64; 3] = [-0.7745966692414834, 0.0, 0.7745966692414834];
+pub(crate) const W3: [f64; 3] = [0.5555555555555556, 0.8888888888888888, 0.5555555555555556];
 
 const HEX20_XI: [[f64; 3]; 20] = [
     [-1.0, -1.0, -1.0],
@@ -72,7 +72,7 @@ fn hex20_shape(xi: f64, eta: f64, zeta: f64) -> ([f64; 20], [[f64; 3]; 20]) {
     (n, dn)
 }
 
-fn hex20_dndx(
+pub(crate) fn hex20_dndx(
     xyz: &[[f64; 3]],
     xi: f64,
     eta: f64,
@@ -97,7 +97,7 @@ fn hex20_dndx(
     Ok((dndx, det, n))
 }
 
-fn hex_gauss(reduced: bool) -> Vec<(f64, f64, f64, f64)> {
+pub(crate) fn hex_gauss(reduced: bool) -> Vec<(f64, f64, f64, f64)> {
     let mut o = Vec::new();
     if reduced {
         for &xi in &[-G2, G2] {
@@ -219,7 +219,7 @@ pub fn hex20_face_pressure(xyz: &[[f64; 3]], face: i32, p: f64) -> Result<Vec<f6
     Ok(fe)
 }
 
-const QUAD8_XI: [[f64; 2]; 8] = [
+pub(crate) const QUAD8_XI: [[f64; 2]; 8] = [
     [-1.0, -1.0],
     [1.0, -1.0],
     [1.0, 1.0],
@@ -258,7 +258,7 @@ pub(crate) fn quad8_shape(xi: f64, eta: f64) -> ([f64; 8], [[f64; 2]; 8]) {
     (n, dn)
 }
 
-fn quad8_dndx(xy: &[[f64; 2]], xi: f64, eta: f64) -> Result<([[f64; 2]; 8], f64, [f64; 8])> {
+pub(crate) fn quad8_dndx(xy: &[[f64; 2]], xi: f64, eta: f64) -> Result<([[f64; 2]; 8], f64, [f64; 8])> {
     let (n, dn) = quad8_shape(xi, eta);
     let mut j = [[0.0; 2]; 2];
     for a in 0..8 {
@@ -441,7 +441,7 @@ fn tet10_shape(r: f64, s: f64, t: f64) -> ([f64; 10], [[f64; 3]; 10]) {
     (n, dn)
 }
 
-fn tet10_dndx(xyz: &[[f64; 3]], r: f64, s: f64, t: f64) -> Result<([[f64; 3]; 10], f64, [f64; 10])> {
+pub(crate) fn tet10_dndx(xyz: &[[f64; 3]], r: f64, s: f64, t: f64) -> Result<([[f64; 3]; 10], f64, [f64; 10])> {
     let (n, dn) = tet10_shape(r, s, t);
     let mut j = [[0.0; 3]; 3];
     for a in 0..10 {

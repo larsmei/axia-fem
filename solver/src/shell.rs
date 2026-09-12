@@ -883,6 +883,251 @@ pub fn body_force(kind: ElemKind, xyz: &[[f64; 3]], bx: f64, by: f64, bz: f64, h
     Ok(fe)
 }
 
+/// Membrane elements M3D3/M3D4/M3D4R/M3D6/M3D8: plane-stress in the local tangent,
+/// 3 translational DOF, no bending.
+pub fn membrane_stiffness(
+    kind: ElemKind,
+    xyz: &[[f64; 3]],
+    e: f64,
+    nu: f64,
+    h: f64,
+) -> Result<(Vec<f64>, f64)> {
+    let nn = kind.nnodes();
+    if xyz.len() < nn {
+        return err("Membran: zu wenige Knoten.");
+    }
+    if h <= 0.0 {
+        return err("MEMBRANE SECTION: Dicke muss positiv sein.");
+    }
+    let (e1, e2, _e3) = local_frame(xyz, nn)?;
+    let xy = project_xy(xyz, e1, e2, nn);
+    let (ke2, area) = match kind {
+        ElemKind::Mem4 | ElemKind::Mem4R => {
+            let mut p = [[0.0; 2]; 4];
+            p.copy_from_slice(&xy[..4]);
+            mem_quad4(&p, e, nu, h, kind.reduced_int())?
+        }
+        ElemKind::Mem8 => {
+            let mut p = [[0.0; 2]; 8];
+            p.copy_from_slice(&xy[..8]);
+            crate::quadratic::quad8_stiffness(&p, e, nu, h, false, false)?
+        }
+        ElemKind::Mem3 => {
+            let mut p = [[0.0; 2]; 3];
+            p.copy_from_slice(&xy[..3]);
+            mem_tri3(&p, e, nu, h)?
+        }
+        ElemKind::Mem6 => {
+            let mut p = [[0.0; 2]; 6];
+            p.copy_from_slice(&xy[..6]);
+            crate::quadratic::tri6_stiffness(&p, e, nu, h, false)?
+        }
+        _ => return err("Kein Membranelement."),
+    };
+    let nd = 3 * nn;
+    let mut ke = vec![0.0; nd * nd];
+    let n2 = 2 * nn;
+    for a in 0..nn {
+        for b in 0..nn {
+            for i in 0..2 {
+                for j in 0..2 {
+                    let v = ke2[(2 * a + i) * n2 + (2 * b + j)];
+                    // T columns are e1, e2
+                    let ti = if i == 0 { e1 } else { e2 };
+                    let tj = if j == 0 { e1 } else { e2 };
+                    for p in 0..3 {
+                        for q in 0..3 {
+                            ke[(3 * a + p) * nd + (3 * b + q)] += ti[p] * v * tj[q];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((ke, area))
+}
+
+fn mem_quad4(xy: &[[f64; 2]; 4], e: f64, nu: f64, h: f64, reduced: bool) -> Result<(Vec<f64>, f64)> {
+    let d = d_plane_stress(e, nu)?;
+    let n = 8usize;
+    let mut ke = vec![0.0; n * n];
+    let mut area = 0.0;
+    let gps: Vec<(f64, f64, f64)> = if reduced {
+        vec![(0.0, 0.0, 4.0)]
+    } else {
+        let mut o = Vec::new();
+        for &xi in &[-G2, G2] {
+            for &eta in &[-G2, G2] {
+                o.push((xi, eta, 1.0));
+            }
+        }
+        o
+    };
+    for (xi, eta, w0) in gps {
+        let (nshp, dn) = quad4_shape(xi, eta);
+        let _ = nshp;
+        let (_, det, dndx) = jac_xy(&xy.to_vec(), &dn, 4)?;
+        if det <= 0.0 {
+            return err("M3D4: negative Jakobideterminante.");
+        }
+        let mut b = vec![0.0; 3 * n];
+        let mut d2 = [[0.0; 2]; 4];
+        for i in 0..4 {
+            d2[i] = dndx[i];
+        }
+        fill_b2(&mut b, 4, &d2);
+        gemm_bt_d_b(&mut ke, n, &b, 3, &d, h * w0 * det);
+        area += w0 * det;
+    }
+    Ok((ke, area))
+}
+
+fn mem_tri3(xy: &[[f64; 2]; 3], e: f64, nu: f64, h: f64) -> Result<(Vec<f64>, f64)> {
+    let x1 = xy[0][0];
+    let y1 = xy[0][1];
+    let x2 = xy[1][0];
+    let y2 = xy[1][1];
+    let x3 = xy[2][0];
+    let y3 = xy[2][1];
+    let two_a = x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2);
+    if two_a <= 0.0 {
+        return err("M3D3: nicht-positive Fläche.");
+    }
+    let a = 0.5 * two_a;
+    let mut dndx = [[0.0; 2]; 3];
+    dndx[0] = [(y2 - y3) / two_a, (x3 - x2) / two_a];
+    dndx[1] = [(y3 - y1) / two_a, (x1 - x3) / two_a];
+    dndx[2] = [(y1 - y2) / two_a, (x2 - x1) / two_a];
+    let d = d_plane_stress(e, nu)?;
+    let n = 6usize;
+    let mut ke = vec![0.0; n * n];
+    let mut b = vec![0.0; 3 * n];
+    fill_b2(&mut b, 3, &dndx);
+    gemm_bt_d_b(&mut ke, n, &b, 3, &d, h * a);
+    Ok((ke, a))
+}
+
+pub fn membrane_nodal_stress(
+    kind: ElemKind,
+    xyz: &[[f64; 3]],
+    ue: &[f64],
+    e: f64,
+    nu: f64,
+    h: f64,
+) -> Result<Vec<[f64; 6]>> {
+    let _ = h;
+    let nn = kind.nnodes();
+    let (e1, e2, _e3) = local_frame(xyz, nn)?;
+    let xy = project_xy(xyz, e1, e2, nn);
+    let mut u2 = vec![0.0; 2 * nn];
+    for a in 0..nn {
+        u2[2 * a] = ue[3 * a] * e1[0] + ue[3 * a + 1] * e1[1] + ue[3 * a + 2] * e1[2];
+        u2[2 * a + 1] = ue[3 * a] * e2[0] + ue[3 * a + 1] * e2[1] + ue[3 * a + 2] * e2[2];
+    }
+    let d = d_plane_stress(e, nu)?;
+    let n2 = 2 * nn;
+    let mut slocal = vec![[0.0; 3]; nn];
+    for a in 0..nn {
+        let (dndx, ok) = match kind {
+            ElemKind::Mem4 | ElemKind::Mem4R => {
+                let (nshp, dn) = quad4_shape(QUAD_XI[a.min(3)][0], QUAD_XI[a.min(3)][1]);
+                let _ = nshp;
+                let r = jac_xy(&xy, &dn, 4);
+                match r {
+                    Ok((_, det, dndx)) if det > 0.0 => (dndx, true),
+                    _ => (vec![[0.0; 2]; nn], false),
+                }
+            }
+            ElemKind::Mem8 => {
+                let (nshp, dn) = quad8_shape(
+                    crate::quadratic::QUAD8_XI[a.min(7)][0],
+                    crate::quadratic::QUAD8_XI[a.min(7)][1],
+                );
+                let _ = nshp;
+                match jac_xy(&xy, &dn, 8) {
+                    Ok((_, det, dndx)) if det > 0.0 => (dndx, true),
+                    _ => (vec![[0.0; 2]; nn], false),
+                }
+            }
+            ElemKind::Mem3 => {
+                let two_a = xy[0][0] * (xy[1][1] - xy[2][1])
+                    + xy[1][0] * (xy[2][1] - xy[0][1])
+                    + xy[2][0] * (xy[0][1] - xy[1][1]);
+                if two_a <= 0.0 {
+                    (vec![[0.0; 2]; 3], false)
+                } else {
+                    (
+                        vec![
+                            [(xy[1][1] - xy[2][1]) / two_a, (xy[2][0] - xy[1][0]) / two_a],
+                            [(xy[2][1] - xy[0][1]) / two_a, (xy[0][0] - xy[2][0]) / two_a],
+                            [(xy[0][1] - xy[1][1]) / two_a, (xy[1][0] - xy[0][0]) / two_a],
+                        ],
+                        true,
+                    )
+                }
+            }
+            ElemKind::Mem6 => {
+                let xi = if a < 3 {
+                    [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]][a]
+                } else {
+                    [[0.5, 0.5], [0.0, 0.5], [0.5, 0.0]][a - 3]
+                };
+                let (nshp, dn) = crate::quadratic::tri6_shape(xi[0], xi[1]);
+                let _ = nshp;
+                match jac_xy(&xy, &dn, 6) {
+                    Ok((_, det, dndx)) if det > 0.0 => (dndx, true),
+                    _ => (vec![[0.0; 2]; nn], false),
+                }
+            }
+            _ => (vec![[0.0; 2]; nn], false),
+        };
+        if !ok {
+            continue;
+        }
+        let mut b = vec![0.0; 3 * n2];
+        let mut d2 = vec![[0.0; 2]; nn];
+        for i in 0..nn {
+            d2[i] = dndx[i];
+        }
+        fill_b2(&mut b, nn, &d2);
+        let s = crate::elem::sigma_from_b(&b, 3, n2, &d, &u2);
+        slocal[a] = [s[0], s[1], s[2]];
+    }
+    let mut out = vec![[0.0; 6]; nn];
+    for a in 0..nn {
+        let s11 = slocal[a][0];
+        let s22 = slocal[a][1];
+        let s12 = slocal[a][2];
+        let t = |i: usize, j: usize| {
+            s11 * e1[i] * e1[j] + s22 * e2[i] * e2[j] + s12 * (e1[i] * e2[j] + e2[i] * e1[j])
+        };
+        out[a] = [t(0, 0), t(1, 1), t(2, 2), t(0, 1), t(1, 2), t(2, 0)];
+    }
+    Ok(out)
+}
+
+pub fn membrane_pressure(kind: ElemKind, xyz: &[[f64; 3]], p: f64) -> Result<Vec<f64>> {
+    let nn = kind.nnodes();
+    let mut fe6 = pressure_force(
+        match kind {
+            ElemKind::Mem4 | ElemKind::Mem4R => ElemKind::Shell4,
+            ElemKind::Mem8 => ElemKind::Shell8,
+            ElemKind::Mem3 => ElemKind::Shell3,
+            ElemKind::Mem6 => ElemKind::Shell6,
+            k => k,
+        },
+        xyz,
+        p,
+    )?;
+    let mut fe = vec![0.0; 3 * nn];
+    for a in 0..nn {
+        fe[3 * a] = fe6[6 * a];
+        fe[3 * a + 1] = fe6[6 * a + 1];
+        fe[3 * a + 2] = fe6[6 * a + 2];
+    }
+    Ok(fe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

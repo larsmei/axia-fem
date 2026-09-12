@@ -509,6 +509,36 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                         mean = *s;
                     }
                     crate::eigen::hex8_kg(&xyz, &mean)?
+                } else if matches!(el.kind, ElemKind::Hex20 | ElemKind::Hex20R) {
+                    let mut mean = [0.0; 6];
+                    if let Some((_, _, s)) = stress_gp.iter().find(|(id, _, _)| *id == el.id) {
+                        mean = *s;
+                    }
+                    crate::eigen::hex20_kg(&xyz, &mean, el.kind.reduced_int())?
+                } else if el.kind == ElemKind::Tet4 {
+                    let mut mean = [0.0; 6];
+                    if let Some((_, _, s)) = stress_gp.iter().find(|(id, _, _)| *id == el.id) {
+                        mean = *s;
+                    }
+                    crate::eigen::tet4_kg(&xyz, &mean)?
+                } else if el.kind == ElemKind::Tet10 {
+                    let mut mean = [0.0; 6];
+                    if let Some((_, _, s)) = stress_gp.iter().find(|(id, _, _)| *id == el.id) {
+                        mean = *s;
+                    }
+                    crate::eigen::tet10_kg(&xyz, &mean)?
+                } else if el.kind == ElemKind::Wedge6 {
+                    let mut mean = [0.0; 6];
+                    if let Some((_, _, s)) = stress_gp.iter().find(|(id, _, _)| *id == el.id) {
+                        mean = *s;
+                    }
+                    extra::wedge6_kg(&xyz, &mean)?
+                } else if el.kind == ElemKind::Wedge15 {
+                    let mut mean = [0.0; 6];
+                    if let Some((_, _, s)) = stress_gp.iter().find(|(id, _, _)| *id == el.id) {
+                        mean = *s;
+                    }
+                    extra::wedge15_kg(&xyz, &mean)?
                 } else {
                     continue;
                 };
@@ -601,6 +631,10 @@ fn apply_pressure(
             let fe = extra::wedge6_face_pressure(xyz, face, mag)?;
             scatter_fe(&fe, gdofs, 3, local_dim, f_full);
         }
+        ElemKind::Wedge15 => {
+            let fe = extra::wedge15_face_pressure(xyz, face, mag)?;
+            scatter_fe(&fe, gdofs, 3, local_dim, f_full);
+        }
         ElemKind::Hex20 | ElemKind::Hex20R => {
             let fe = quadratic::hex20_face_pressure(xyz, face, mag)?;
             scatter_fe(&fe, gdofs, 3, local_dim, f_full);
@@ -626,6 +660,14 @@ fn apply_pressure(
             }
             let fe = quadratic::quad8_edge_pressure(&p, face, mag, th)?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
+        }
+        ElemKind::Cax4 | ElemKind::Cax4R | ElemKind::Cax8 | ElemKind::Cax8R => {
+            let fe = crate::axisym::cax_edge_pressure(xyz, kind.nnodes(), face, mag)?;
+            scatter_fe(&fe, gdofs, 2, local_dim, f_full);
+        }
+        ElemKind::Mem3 | ElemKind::Mem4 | ElemKind::Mem4R | ElemKind::Mem6 | ElemKind::Mem8 => {
+            let fe = shell::membrane_pressure(kind, xyz, mag)?;
+            scatter_fe(&fe, gdofs, 3, local_dim, f_full);
         }
         _ => {}
     }
@@ -655,6 +697,10 @@ fn apply_body(
         }
         ElemKind::Wedge6 => {
             let fe = extra::wedge6_body_force(xyz, bx, by, bz)?;
+            scatter_fe(&fe, gdofs, 3, local_dim, f_full);
+        }
+        ElemKind::Wedge15 => {
+            let fe = extra::wedge15_body_force(xyz, bx, by, bz)?;
             scatter_fe(&fe, gdofs, 3, local_dim, f_full);
         }
         ElemKind::Truss2 | ElemKind::Truss3 => {
@@ -699,6 +745,10 @@ fn apply_body(
                 p[i] = [xyz[i][0], xyz[i][1]];
             }
             let fe = quadratic::tri6_body_force(&p, bx, by, th)?;
+            scatter_fe(&fe, gdofs, 2, local_dim, f_full);
+        }
+        ElemKind::Cax4 | ElemKind::Cax4R => {
+            let fe = crate::axisym::cax4_body_force(xyz, bx, by, kind.reduced_int())?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
         }
         _ => {}

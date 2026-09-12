@@ -374,7 +374,7 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
     for (const el of mesh.elements) {
       const loc = el.nodes.map((id) => idxOf.get(id)).filter((v): v is number => v !== undefined);
       const t = el.type;
-      if ((t === "C3D8" || t === "C3D8R") && loc.length >= 8) {
+      if ((t === "C3D8" || t === "C3D8R" || t === "C3D8I") && loc.length >= 8) {
         for (const f of HEX_FACES) {
           pushTri(loc[f[0]], loc[f[1]], loc[f[2]]);
           pushTri(loc[f[0]], loc[f[2]], loc[f[3]]);
@@ -390,7 +390,37 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
           addEdge(loc[f[1]], loc[f[2]]);
           addEdge(loc[f[2]], loc[f[0]]);
         }
-      } else if ((t === "CPS4" || t === "CPE4" || t === "S4" || t === "S4R") && loc.length >= 4) {
+      } else if ((t === "C3D6" || t === "C3D15") && loc.length >= 6) {
+        const bot = [loc[0], loc[1], loc[2]];
+        const top = [loc[3], loc[4], loc[5]];
+        pushTri(bot[0], bot[1], bot[2]);
+        pushTri(top[0], top[2], top[1]);
+        addEdge(bot[0], bot[1]);
+        addEdge(bot[1], bot[2]);
+        addEdge(bot[2], bot[0]);
+        addEdge(top[0], top[1]);
+        addEdge(top[1], top[2]);
+        addEdge(top[2], top[0]);
+        addEdge(bot[0], top[0]);
+        addEdge(bot[1], top[1]);
+        addEdge(bot[2], top[2]);
+        if (t === "C3D15" && loc.length >= 15) {
+          addEdge(bot[0], loc[6]);
+          addEdge(loc[6], bot[1]);
+          addEdge(top[0], loc[9]);
+          addEdge(loc[9], top[1]);
+        }
+      } else if (
+        (t === "CPS4" ||
+          t === "CPE4" ||
+          t === "S4" ||
+          t === "S4R" ||
+          t === "CAX4" ||
+          t === "CAX4R" ||
+          t === "M3D4" ||
+          t === "M3D4R") &&
+        loc.length >= 4
+      ) {
         pushTri(loc[0], loc[1], loc[2]);
         pushTri(loc[0], loc[2], loc[3]);
         addEdge(loc[0], loc[1]);
@@ -435,7 +465,15 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
           addEdge(m20, c0);
         }
       } else if (
-        (t === "CPS8" || t === "CPE8" || t === "CPS8R" || t === "CPE8R" || t === "S8" || t === "S8R") &&
+        (t === "CPS8" ||
+          t === "CPE8" ||
+          t === "CPS8R" ||
+          t === "CPE8R" ||
+          t === "S8" ||
+          t === "S8R" ||
+          t === "CAX8" ||
+          t === "CAX8R" ||
+          t === "M3D8") &&
         loc.length >= 8
       ) {
         const [c0, c1, c2, c3, m01, m12, m23, m30] = loc;

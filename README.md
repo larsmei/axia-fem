@@ -9,7 +9,7 @@ Zwei Frontends, ein Solver:
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
 
-**1.1** — linear-statisch, Eigenfrequenz, Beulen, Wärmeleitung (`*HEAT TRANSFER`), implizite Dynamik (`*DYNAMIC`); **NLGEOM** und **\*PLASTIC** (J2, 1D) für T3D2-Fachwerke.
+**1.2** — C3D15, Achsensymmetrie (CAX4/CAX8), Membran (M3D*), Wärme auf C3D20/C3D10/C3D4/C3D6, Beulen mit Kontinuum-\(K_g\). **1.1** brachte Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
 
 ## CLI
 
@@ -32,6 +32,9 @@ Mitgelieferte Decks in [`examples/`](examples/):
 |---|---|
 | `patch_c3d8.inp` | Zug-Patch C3D8, \(u_x = 0{,}01\) |
 | `patch_c3d6.inp` | Zug-Patch C3D6-Wedge |
+| `patch_c3d15.inp` | C3D15, confined \(\varepsilon_z=0{,}001\) |
+| `pipe_cax4.inp` | dickwandiges Rohr CAX4, Innendruck (Lamé) |
+| `membrane_m3d4.inp` | M3D4-Membran-Patch, \(u_x=0{,}01\) |
 | `cantilever_b32.inp` | Timoshenko-Kragträger B32 |
 | `plate_s4r.inp` | gelenkig gelagerte S4R-Platte |
 | `truss_t3d2.inp` | Fachwerkstab T3D2, \(u = FL/EA\) |
@@ -82,11 +85,11 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 ## Features
 
 - INP-Parser: `*NODE`, `*ELEMENT`, `*NSET`/`*ELSET` (+ `GENERATE`), `*MATERIAL`/`*ELASTIC`/`*DENSITY`, `*INCLUDE`, `*EQUATION`, `*SURFACE`
-- Schnitte: `*SOLID SECTION`, `*SHELL SECTION`, `*BEAM SECTION` (`RECT`, `CIRC`, `PIPE`, `GENERAL`), `*SPRING`
-- Lasten und Lager: `*BOUNDARY` (DOF 1–6), `*CLOAD`, `*DLOAD` (`P`, `P1…P6`, `GRAV`, `PX`/`PY`/`PZ`)
+- Schnitte: `*SOLID SECTION`, `*SHELL SECTION`, `*MEMBRANE SECTION`, `*BEAM SECTION` (`RECT`, `CIRC`, `PIPE`, `GENERAL`), `*SPRING`
+- Lasten und Lager: `*BOUNDARY` (DOF 1–6, NT=11), `*CLOAD`, `*DLOAD` (`P`, `P1…P6`, `GRAV`, `PX`/`PY`/`PZ`)
 - Linear-statische Analyse, isotrope Elastizität, MPC-Elimination (`*EQUATION`)
-- `*FREQUENCY` (lumped mass, inverse subspace) und `*BUCKLE` (geometrische Steifigkeit)
-- `*HEAT TRANSFER, STEADY STATE` — Wärmeleitung (T3D2, B31, C3D8, CPS4), `*CONDUCTIVITY`, `*DFLUX`/`*FILM`/`*CFLUX`, NT = DOF 11
+- `*FREQUENCY` (lumped mass, inverse subspace) und `*BUCKLE` (geometrische Steifigkeit für T3D2, B31/B32 **und** C3D8/20/10/4/6/15)
+- `*HEAT TRANSFER, STEADY STATE` — T3D2, B31, C3D8, C3D20, C3D10, C3D4, C3D6, C3D15, CPS4, CPS8, S4; `*CONDUCTIVITY`, `*DFLUX`/`*FILM`/`*CFLUX`, NT = DOF 11
 - `*DYNAMIC` — implizites Newmark (\(\beta=1/4,\gamma=1/2\)), `*DAMPING` (Rayleigh), `*AMPLITUDE`, `*INITIAL CONDITIONS`
 - `*EXPANSION` + `*TEMPERATURE` (isotrope Wärmedehnung, T3D2 und C3D8*)
 - `*STEP, NLGEOM` — geometrisch nichtlineare Statik, **T3D2** (korotational, Newton)
@@ -108,8 +111,11 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 | C3D8R | 8 | 3 | 1-Punkt + Hourglass-Stabilisierung |
 | C3D20 / C3D20R | 20 | 3 | quadratisches Serendipity-Hexaeder, 3×3×3 / 2×2×2 |
 | C3D6 | 6 | 3 | linearer Wedge/Pentaeder |
+| C3D15 | 15 | 3 | quadratischer Wedge, 3×3 Gauss (Dreieck × ζ) |
 | C3D4 | 4 | 3 | Tetraeder |
 | C3D10 | 10 | 3 | quadratisches Tetraeder, 4-Punkt |
+| CAX4 / CAX4R | 4 | 2 | Achsensymmetrie \(r,z\); Gewicht \(2\pi r\) |
+| CAX8 / CAX8R | 8 | 2 | quadratisch achsensymmetrisch |
 | CPS4 / CPE4 | 4 | 2 | Scheibe, Spannungs-/Dehnungszustand |
 | CPS8 / CPE8 / CPS8R | 8 | 2 | quadratische Scheibe, 3×3 / 2×2 |
 | CPS3 / CPE3 | 3 | 2 | Dreiecksscheibe |
@@ -127,6 +133,16 @@ Knotenreihenfolge der quadratischen Elemente wie Abaqus/CalculiX: **Ecken zuerst
 | S6 | 6 | quadratisches Dreieck |
 
 Dicke über `*SHELL SECTION`. Positive Drucklast `P` wirkt in Richtung der positiven Elementnormalen (rechte Hand, Knoten CCW).
+
+### Membran (3 translatorische DOF)
+
+| Typ | Knoten | Bemerkung |
+|---|---|---|
+| M3D4 / M3D4R | 4 | Plane-Stress in der Tangentialebene |
+| M3D8 | 8 | quadratisch |
+| M3D3 / M3D6 | 3 / 6 | Dreieck |
+
+Dicke über `*MEMBRANE SECTION`. Keine Biegesteifigkeit.
 
 ```
 *ELEMENT, TYPE=S4R, ELSET=PLATE
@@ -229,6 +245,9 @@ Newmark (mittlere Beschleunigung). Lumped mass wie `*FREQUENCY`. Lasten mit `*AM
 |---|---|
 | Zugstab C3D8 / C3D8I / C3D20 | Patch-Test: \(u_x = 0{,}01\), \(\sigma_{xx} = 210\) |
 | Wedge C3D6 | Patch-Test entlang der Prisma-Achse: \(u_z = 0{,}01\) |
+| C3D15 confined | \(\varepsilon_z=0{,}001\), \(\sigma_z \approx 282{,}7\) |
+| CAX4-Rohr | Lamé \(u_r(a) \approx 9{,}08\cdot 10^{-4}\) |
+| M3D4-Membran | \(u_x=0{,}01\), \(\sigma_{xx}=210\) (\(\nu=0\)) |
 | T3D2 / `*EQUATION` | \(u = FL/EA\); zwei Stäbe in Serie \(u_{\mathrm{tip}}=0{,}5\) |
 | T3D2 NLGEOM | kleine Dehnung: \(u=0{,}5\) |
 | T3D2 `*PLASTIC` | \(\sigma=250\), \(u\approx 3{,}095\) (über elastisch \(1{,}19\)) |

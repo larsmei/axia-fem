@@ -1,4 +1,5 @@
 mod analysis;
+mod axisym;
 mod beam;
 mod constraint;
 mod dat;
@@ -1550,5 +1551,287 @@ amp static
         let u2 = out.u[out.model.node_index(2).unwrap()][0];
         // STATIC uses amp(t=0)=0 → u=0
         assert!(u2.abs() < 1e-8, "static amp(0) ux={u2}");
+    }
+
+    #[test]
+    fn patch_test_c3d15() {
+        // confined uniaxial strain εz=0.001 → σz = E(1-ν)/((1+ν)(1-2ν))*εz
+        let inp = r#"
+*HEADING
+C3D15 confined patch
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 0, 10, 0
+4, 0, 0, 10
+5, 10, 0, 10
+6, 0, 10, 10
+7, 5, 0, 0
+8, 5, 5, 0
+9, 0, 5, 0
+10, 5, 0, 10
+11, 5, 5, 10
+12, 0, 5, 10
+13, 0, 0, 5
+14, 10, 0, 5
+15, 0, 10, 5
+*ELEMENT, TYPE=C3D15, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 2
+2, 1, 2
+3, 1, 2
+4, 1, 2
+5, 1, 2
+6, 1, 2
+7, 1, 2
+8, 1, 2
+9, 1, 2
+10, 1, 2
+11, 1, 2
+12, 1, 2
+13, 1, 2
+14, 1, 2
+15, 1, 2
+1, 3, 3, 0.0
+2, 3, 3, 0.0
+3, 3, 3, 0.0
+7, 3, 3, 0.0
+8, 3, 3, 0.0
+9, 3, 3, 0.0
+13, 3, 3, 0.005
+14, 3, 3, 0.005
+15, 3, 3, 0.005
+4, 3, 3, 0.01
+5, 3, 3, 0.01
+6, 3, 3, 0.01
+10, 3, 3, 0.01
+11, 3, 3, 0.01
+12, 3, 3, 0.01
+*STEP
+*STATIC
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let sz: f64 = out.stress.iter().map(|s| s[2]).sum::<f64>() / out.stress.len() as f64;
+        let expect = 210000.0 * 0.7 / (1.3 * 0.4) * 0.001;
+        assert!(
+            (sz - expect).abs() / expect < 0.05,
+            "C3D15 σz={sz}, expected {expect}"
+        );
+    }
+
+    #[test]
+    fn patch_test_cax4_lame() {
+        // infinite cylinder, internal pressure. 4 CAX4 through the wall.
+        let mut inp = String::from(
+            "*HEADING\nCAX4 Lame\n*NODE\n",
+        );
+        let a = 10.0;
+        let b = 20.0;
+        let nr = 4;
+        for i in 0..=nr {
+            let r = a + (b - a) * i as f64 / nr as f64;
+            let n0 = 1 + 2 * i;
+            let n1 = n0 + 1;
+            inp.push_str(&format!("{n0}, {r}, 0\n{n1}, {r}, 2\n"));
+        }
+        inp.push_str("*ELEMENT, TYPE=CAX4, ELSET=S\n");
+        for i in 0..nr {
+            let n0 = 1 + 2 * i;
+            let n1 = n0 + 2;
+            let n2 = n1 + 1;
+            let n3 = n0 + 1;
+            inp.push_str(&format!("{}, {}, {}, {}, {}\n", i + 1, n0, n1, n2, n3));
+        }
+        inp.push_str(
+            "*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+",
+        );
+        for i in 0..=nr {
+            let n0 = 1 + 2 * i;
+            let n1 = n0 + 1;
+            inp.push_str(&format!("{n0}, 2, 2\n{n1}, 2, 2\n"));
+        }
+        inp.push_str(
+            "*STEP
+*STATIC
+*DLOAD
+1, P4, 10
+*END STEP
+",
+        );
+        // face 4 of first element: nodes n3-n0 = inner edge (3-0 of elem 1 = 2,1) wait
+        // elem 1 nodes: n0=1 (r=a,z=0), n1=3 (r=a+dr,z=0), n2=4 (r=a+dr,z=2), n3=2 (r=a,z=2)
+        // edges: P1=1-2 (bottom), P2=2-3 (outer), P3=3-4 (top), P4=4-1 (inner) → P4 is inner. Good.
+        let out = solve_native(&inp).unwrap();
+        let ur = out.u[out.model.node_index(1).unwrap()][0];
+        let pin = 10.0;
+        let aa = a * a;
+        let bb = b * b;
+        let a_const = pin * aa / (bb - aa);
+        let b_const = pin * aa * bb / (bb - aa);
+        let s_th = a_const + b_const / aa;
+        let s_r = a_const - b_const / aa;
+        let s_z = 2.0 * 0.3 * a_const;
+        let eth = (s_th - 0.3 * s_r - 0.3 * s_z) / 210000.0;
+        let expect = a * eth;
+        assert!(
+            (ur - expect).abs() / expect.abs() < 0.12,
+            "CAX4 ur={ur}, Lame {expect}"
+        );
+    }
+
+    #[test]
+    fn patch_test_m3d4() {
+        let inp = r#"
+*HEADING
+M3D4 membrane patch
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+*ELEMENT, TYPE=M3D4, ELSET=M
+1, 1, 2, 3, 4
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.0
+*MEMBRANE SECTION, ELSET=M, MATERIAL=STEEL
+1.0
+*BOUNDARY
+1, 1, 1
+4, 1, 1
+1, 2, 2
+2, 2, 2
+1, 3, 3
+2, 3, 3
+3, 3, 3
+4, 3, 3
+2, 1, 1, 0.01
+3, 1, 1, 0.01
+*STEP
+*STATIC
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((u2 - 0.01).abs() < 1e-8, "M3D4 ux={u2}");
+        let sxx = out.stress[out.model.node_index(3).unwrap()][0];
+        assert!((sxx - 210.0).abs() < 1.0, "M3D4 sxx={sxx}");
+    }
+
+    #[test]
+    fn heat_c3d20_linear() {
+        let inp = r#"
+*HEADING
+heat hex20
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+9, 5, 0, 0
+10, 10, 5, 0
+11, 5, 10, 0
+12, 0, 5, 0
+13, 5, 0, 10
+14, 10, 5, 10
+15, 5, 10, 10
+16, 0, 5, 10
+17, 0, 0, 5
+18, 10, 0, 5
+19, 10, 10, 5
+20, 0, 10, 5
+*ELEMENT, TYPE=C3D20, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*CONDUCTIVITY
+25
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 11, 11, 0
+4, 11, 11, 0
+5, 11, 11, 0
+8, 11, 11, 0
+12, 11, 11, 0
+16, 11, 11, 0
+17, 11, 11, 0
+20, 11, 11, 0
+2, 11, 11, 100
+3, 11, 11, 100
+6, 11, 11, 100
+7, 11, 11, 100
+10, 11, 11, 100
+14, 11, 11, 100
+18, 11, 11, 100
+19, 11, 11, 100
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let t9 = out.u[out.model.node_index(9).unwrap()][0];
+        assert!((t9 - 50.0).abs() < 1e-4, "C3D20 mid-edge T={t9}");
+    }
+
+    #[test]
+    fn buckle_c3d8_column_positive() {
+        let inp = r#"
+*HEADING
+C3D8 column buckle
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 100
+6, 10, 0, 100
+7, 10, 10, 100
+8, 0, 10, 100
+*ELEMENT, TYPE=C3D8, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+3, 3, 3
+4, 1, 3
+2, 1, 1
+4, 2, 2
+*STEP
+*BUCKLE
+1
+*CLOAD
+5, 3, -250
+6, 3, -250
+7, 3, -250
+8, 3, -250
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        assert!(!out.buckles.is_empty(), "no buckle factors");
+        assert!(
+            out.buckles[0].is_finite() && out.buckles[0] > 0.0,
+            "lambda={}",
+            out.buckles[0]
+        );
     }
 }

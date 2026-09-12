@@ -297,6 +297,31 @@ pub fn truss_kg(xyz: &[[f64; 3]], n_axial: f64) -> Vec<f64> {
     kg
 }
 
+/// Continuum geometric stiffness increment at one Gauss point:
+/// Kg^{ab}_{ii} += (∇N_a · σ · ∇N_b) w  (same for each translation dir).
+pub fn add_continuum_kg(kg: &mut [f64], nnode: usize, dndx: &[[f64; 3]], stress: &[f64; 6], w: f64) {
+    let n = 3 * nnode;
+    let sxx = stress[0];
+    let syy = stress[1];
+    let szz = stress[2];
+    let sxy = stress[3];
+    let syz = stress[4];
+    let szx = stress[5];
+    for a in 0..nnode {
+        for b in 0..nnode {
+            let ga = dndx[a];
+            let gb = dndx[b];
+            let gtg = ga[0] * (sxx * gb[0] + sxy * gb[1] + szx * gb[2])
+                + ga[1] * (sxy * gb[0] + syy * gb[1] + syz * gb[2])
+                + ga[2] * (szx * gb[0] + syz * gb[1] + szz * gb[2]);
+            let v = gtg * w;
+            for dir in 0..3 {
+                kg[(3 * a + dir) * n + (3 * b + dir)] += v;
+            }
+        }
+    }
+}
+
 /// Hex8 geometric stiffness from constant stress (centroid).
 pub fn hex8_kg(xyz: &[[f64; 3]], stress: &[f64; 6]) -> Result<Vec<f64>> {
     use crate::elem::{hex8_dndx, G2};
@@ -307,12 +332,6 @@ pub fn hex8_kg(xyz: &[[f64; 3]], stress: &[f64; 6]) -> Result<Vec<f64>> {
     let n = 24usize;
     let mut kg = vec![0.0; n * n];
     let pts = [-G2, G2];
-    let sxx = stress[0];
-    let syy = stress[1];
-    let szz = stress[2];
-    let sxy = stress[3];
-    let syz = stress[4];
-    let szx = stress[5];
     for &xi in &pts {
         for &eta in &pts {
             for &zeta in &pts {
@@ -320,21 +339,68 @@ pub fn hex8_kg(xyz: &[[f64; 3]], stress: &[f64; 6]) -> Result<Vec<f64>> {
                 if det <= 0.0 {
                     continue;
                 }
-                for a in 0..8 {
-                    for b in 0..8 {
-                        let ga = dndx[a];
-                        let gb = dndx[b];
-                        let gtg = ga[0] * (sxx * gb[0] + sxy * gb[1] + szx * gb[2])
-                            + ga[1] * (sxy * gb[0] + syy * gb[1] + syz * gb[2])
-                            + ga[2] * (szx * gb[0] + syz * gb[1] + szz * gb[2]);
-                        let v = gtg * det;
-                        for dir in 0..3 {
-                            kg[(3 * a + dir) * n + (3 * b + dir)] += v;
-                        }
-                    }
-                }
+                add_continuum_kg(&mut kg, 8, &dndx, stress, det);
             }
         }
+    }
+    Ok(kg)
+}
+
+pub fn hex20_kg(xyz: &[[f64; 3]], stress: &[f64; 6], reduced: bool) -> Result<Vec<f64>> {
+    let n = 60usize;
+    let mut kg = vec![0.0; n * n];
+    for (xi, eta, zeta, w) in crate::quadratic::hex_gauss(reduced) {
+        let (dndx, det, _) = crate::quadratic::hex20_dndx(xyz, xi, eta, zeta)?;
+        if det <= 0.0 {
+            continue;
+        }
+        add_continuum_kg(&mut kg, 20, &dndx, stress, w * det);
+    }
+    Ok(kg)
+}
+
+pub fn tet4_kg(xyz: &[[f64; 3]], stress: &[f64; 6]) -> Result<Vec<f64>> {
+    let mut j = [[0.0; 3]; 3];
+    for p in 0..3 {
+        for q in 0..3 {
+            j[q][p] = xyz[p + 1][q] - xyz[0][q];
+        }
+    }
+    let (inv, det) = crate::elem::invert3(j)?;
+    if det <= 0.0 {
+        return err("C3D4 Kg: negative Jakobideterminante.");
+    }
+    let vol = det / 6.0;
+    let dn = [
+        [-1.0, -1.0, -1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+    let mut dndx = [[0.0; 3]; 4];
+    for a in 0..4 {
+        for i in 0..3 {
+            dndx[a][i] = inv[0][i] * dn[a][0] + inv[1][i] * dn[a][1] + inv[2][i] * dn[a][2];
+        }
+    }
+    let mut kg = vec![0.0; 12 * 12];
+    add_continuum_kg(&mut kg, 4, &dndx, stress, vol);
+    Ok(kg)
+}
+
+pub fn tet10_kg(xyz: &[[f64; 3]], stress: &[f64; 6]) -> Result<Vec<f64>> {
+    let n = 30usize;
+    let mut kg = vec![0.0; n * n];
+    let a = 0.5854101966249685;
+    let b = 0.1381966011250105;
+    let w = 1.0 / 24.0;
+    let pts = [[b, b, b], [a, b, b], [b, a, b], [b, b, a]];
+    for p in &pts {
+        let (dndx, det, _) = crate::quadratic::tet10_dndx(xyz, p[0], p[1], p[2])?;
+        if det <= 0.0 {
+            continue;
+        }
+        add_continuum_kg(&mut kg, 10, &dndx, stress, w * det);
     }
     Ok(kg)
 }

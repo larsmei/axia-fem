@@ -687,6 +687,160 @@ export const EXAMPLES: Example[] = [
     inp: tensionPatch.trimStart(),
   },
   {
+    id: "c3d15",
+    name: "Wedge C3D15",
+    blurb: "quadratischer Pentaeder, confined εz",
+    inp: `*HEADING
+C3D15 confined uniaxial strain
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 0, 10, 0
+4, 0, 0, 10
+5, 10, 0, 10
+6, 0, 10, 10
+7, 5, 0, 0
+8, 5, 5, 0
+9, 0, 5, 0
+10, 5, 0, 10
+11, 5, 5, 10
+12, 0, 5, 10
+13, 0, 0, 5
+14, 10, 0, 5
+15, 0, 10, 5
+*ELEMENT, TYPE=C3D15, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 2
+2, 1, 2
+3, 1, 2
+4, 1, 2
+5, 1, 2
+6, 1, 2
+7, 1, 2
+8, 1, 2
+9, 1, 2
+10, 1, 2
+11, 1, 2
+12, 1, 2
+13, 1, 2
+14, 1, 2
+15, 1, 2
+1, 3, 3, 0.0
+2, 3, 3, 0.0
+3, 3, 3, 0.0
+7, 3, 3, 0.0
+8, 3, 3, 0.0
+9, 3, 3, 0.0
+13, 3, 3, 0.005
+14, 3, 3, 0.005
+15, 3, 3, 0.005
+4, 3, 3, 0.01
+5, 3, 3, 0.01
+6, 3, 3, 0.01
+10, 3, 3, 0.01
+11, 3, 3, 0.01
+12, 3, 3, 0.01
+*STEP
+*STATIC
+*NODE FILE
+U
+*EL FILE
+S
+*END STEP
+`,
+  },
+  {
+    id: "cax4",
+    name: "Rohr CAX4",
+    blurb: "Achsensymmetrie, Innendruck, Lamé",
+    inp: `*HEADING
+CAX4 thick cylinder
+*NODE
+1, 10, 0
+2, 10, 2
+3, 12.5, 0
+4, 12.5, 2
+5, 15, 0
+6, 15, 2
+7, 17.5, 0
+8, 17.5, 2
+9, 20, 0
+10, 20, 2
+*ELEMENT, TYPE=CAX4, ELSET=S
+1, 1, 3, 4, 2
+2, 3, 5, 6, 4
+3, 5, 7, 8, 6
+4, 7, 9, 10, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 2, 2
+2, 2, 2
+3, 2, 2
+4, 2, 2
+5, 2, 2
+6, 2, 2
+7, 2, 2
+8, 2, 2
+9, 2, 2
+10, 2, 2
+*STEP
+*STATIC
+*DLOAD
+1, P4, 10
+*NODE FILE
+U
+*EL FILE
+S
+*END STEP
+`,
+  },
+  {
+    id: "m3d4",
+    name: "Membran M3D4",
+    blurb: "Plane-Stress in 3D, ux=0.01",
+    inp: `*HEADING
+M3D4 membrane patch
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+*ELEMENT, TYPE=M3D4, ELSET=M
+1, 1, 2, 3, 4
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.0
+*MEMBRANE SECTION, ELSET=M, MATERIAL=STEEL
+1.0
+*BOUNDARY
+1, 1, 1
+4, 1, 1
+1, 2, 2
+2, 2, 2
+1, 3, 3
+2, 3, 3
+3, 3, 3
+4, 3, 3
+2, 1, 1, 0.01
+3, 1, 1, 0.01
+*STEP
+*STATIC
+*NODE FILE
+U
+*EL FILE
+S
+*END STEP
+`,
+  },
+  {
     id: "bar",
     name: "Zugstab fein",
     blurb: "6×2×2 Hexaeder, σ = 210",

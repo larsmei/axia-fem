@@ -254,7 +254,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                 })?;
                 let kind = ElemKind::from_ccx(&typ).ok_or_else(|| {
                     crate::error::FemError(format!(
-                        "Nicht unterstützter Elementtyp {typ}. Unterstützt: C3D8/C3D8I/C3D8R, C3D20, C3D4, C3D10, C3D6, CPS*, CPE*, S3/S4/S6/S8, B31/B32, T3D2/T3D3, SPRINGA."
+                        "Nicht unterstützter Elementtyp {typ}."
                     ))
                 })?;
                 let elset = params
@@ -408,7 +408,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                     .unwrap_or_else(|| "MATERIAL-1".into());
                 model.materials.entry(name).or_default().density = rho;
             }
-            "*SOLID SECTION" | "*SHELL SECTION" => {
+            "*SOLID SECTION" | "*SHELL SECTION" | "*MEMBRANE SECTION" => {
                 let elset = params.get("ELSET").cloned().unwrap_or_else(|| "EALL".into());
                 if let Some(mat) = params.get("MATERIAL") {
                     model.elset_material.insert(elset.clone(), mat.clone());

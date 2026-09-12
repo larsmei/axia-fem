@@ -387,6 +387,15 @@ pub fn element_ke(
                 volume: vol,
             })
         }
+        ElemKind::Wedge15 => {
+            let (ke, vol) = extra::wedge15_stiffness(xyz, e, nu)?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 45],
+                ndof: 45,
+                volume: vol,
+            })
+        }
         ElemKind::Truss2 | ElemKind::Truss3 => {
             let (ke, vol) = extra::truss_stiffness(xyz, e, thickness.max(1e-30))?;
             let ndof = 3 * kind.nnodes();
@@ -525,6 +534,34 @@ pub fn element_ke(
                 volume: area * thickness,
             })
         }
+        ElemKind::Mem3 | ElemKind::Mem4 | ElemKind::Mem4R | ElemKind::Mem6 | ElemKind::Mem8 => {
+            let (ke, area) = shell::membrane_stiffness(kind, xyz, e, nu, thickness)?;
+            let ndof = 3 * kind.nnodes();
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; ndof],
+                ndof,
+                volume: area * thickness,
+            })
+        }
+        ElemKind::Cax4 | ElemKind::Cax4R => {
+            let (ke, vol) = crate::axisym::cax4_stiffness(xyz, e, nu, kind.reduced_int())?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 8],
+                ndof: 8,
+                volume: vol,
+            })
+        }
+        ElemKind::Cax8 | ElemKind::Cax8R => {
+            let (ke, vol) = crate::axisym::cax8_stiffness(xyz, e, nu, kind.reduced_int())?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 16],
+                ndof: 16,
+                volume: vol,
+            })
+        }
     }
 }
 
@@ -544,6 +581,7 @@ pub fn element_nodal_stress(
         ElemKind::Hex8I => extra::hex8i_nodal_stress(xyz, ue, e, nu),
         ElemKind::Hex8R => extra::hex8r_nodal_stress(xyz, ue, e, nu),
         ElemKind::Wedge6 => extra::wedge6_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Wedge15 => extra::wedge15_nodal_stress(xyz, ue, e, nu),
         ElemKind::Truss2 | ElemKind::Truss3 => extra::truss_nodal_stress(xyz, ue, e, thickness),
         ElemKind::SpringA => Ok(extra::spring_nodal_stress(xyz, ue, thickness)),
         ElemKind::Tet4 => tet4_nodal_stress(xyz, ue, e, nu),
@@ -573,6 +611,11 @@ pub fn element_nodal_stress(
         | ElemKind::Shell8
         | ElemKind::Shell8R
         | ElemKind::Shell6 => shell::nodal_stress(kind, xyz, ue, e, nu, thickness),
+        ElemKind::Mem3 | ElemKind::Mem4 | ElemKind::Mem4R | ElemKind::Mem6 | ElemKind::Mem8 => {
+            shell::membrane_nodal_stress(kind, xyz, ue, e, nu, thickness)
+        }
+        ElemKind::Cax4 | ElemKind::Cax4R => crate::axisym::cax4_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Cax8 | ElemKind::Cax8R => crate::axisym::cax8_nodal_stress(xyz, ue, e, nu),
     }
 }
 

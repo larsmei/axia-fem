@@ -10,6 +10,7 @@ pub enum ElemKind {
     Tet4,
     Tet10,
     Wedge6,
+    Wedge15,
     Quad4Ps,
     Quad4Pe,
     Quad8Ps,
@@ -20,6 +21,10 @@ pub enum ElemKind {
     Tri3Pe,
     Tri6Ps,
     Tri6Pe,
+    Cax4,
+    Cax4R,
+    Cax8,
+    Cax8R,
     Beam31,
     Beam32,
     Shell4,
@@ -28,6 +33,11 @@ pub enum ElemKind {
     Shell8,
     Shell8R,
     Shell6,
+    Mem3,
+    Mem4,
+    Mem4R,
+    Mem6,
+    Mem8,
     Truss2,
     Truss3,
     SpringA,
@@ -44,7 +54,32 @@ impl ElemKind {
             "C3D4" => Self::Tet4,
             "C3D10" | "C3D10M" => Self::Tet10,
             "C3D6" => Self::Wedge6,
+            "C3D15" => Self::Wedge15,
             "CPS4" | "CPS4R" => Self::Quad4Ps,
+            "CPE4" | "CPE4R" | "CPE4I" => Self::Quad4Pe,
+            "CPS8" => Self::Quad8Ps,
+            "CPE8" => Self::Quad8Pe,
+            "CPS8R" => Self::Quad8RPs,
+            "CPE8R" => Self::Quad8RPe,
+            "CPS3" => Self::Tri3Ps,
+            "CPE3" => Self::Tri3Pe,
+            "CPS6" => Self::Tri6Ps,
+            "CPE6" => Self::Tri6Pe,
+            "CAX4" => Self::Cax4,
+            "CAX4R" => Self::Cax4R,
+            "CAX8" => Self::Cax8,
+            "CAX8R" => Self::Cax8R,
+            "S4" => Self::Shell4,
+            "S4R" => Self::Shell4R,
+            "S3" | "S3R" | "STRI3" => Self::Shell3,
+            "S8" => Self::Shell8,
+            "S8R" => Self::Shell8R,
+            "S6" | "STRI65" => Self::Shell6,
+            "M3D3" => Self::Mem3,
+            "M3D4" => Self::Mem4,
+            "M3D4R" => Self::Mem4R,
+            "M3D6" => Self::Mem6,
+            "M3D8" | "M3D8R" => Self::Mem8,
             "CPE4" | "CPE4R" | "CPE4I" => Self::Quad4Pe,
             "CPS8" => Self::Quad8Ps,
             "CPE8" => Self::Quad8Pe,
@@ -76,10 +111,17 @@ impl ElemKind {
             Self::Tet4 => 4,
             Self::Tet10 => 10,
             Self::Wedge6 => 6,
-            Self::Quad4Ps | Self::Quad4Pe => 4,
-            Self::Quad8Ps | Self::Quad8Pe | Self::Quad8RPs | Self::Quad8RPe => 8,
-            Self::Tri3Ps | Self::Tri3Pe => 3,
-            Self::Tri6Ps | Self::Tri6Pe | Self::Shell6 => 6,
+            Self::Wedge15 => 15,
+            Self::Quad4Ps | Self::Quad4Pe | Self::Cax4 | Self::Cax4R | Self::Mem4 | Self::Mem4R => 4,
+            Self::Quad8Ps
+            | Self::Quad8Pe
+            | Self::Quad8RPs
+            | Self::Quad8RPe
+            | Self::Cax8
+            | Self::Cax8R
+            | Self::Mem8 => 8,
+            Self::Tri3Ps | Self::Tri3Pe | Self::Mem3 => 3,
+            Self::Tri6Ps | Self::Tri6Pe | Self::Shell6 | Self::Mem6 => 6,
             Self::Beam31 => 2,
             Self::Beam32 => 3,
             Self::Shell4 | Self::Shell4R => 4,
@@ -100,6 +142,7 @@ impl ElemKind {
             | Self::Tet4
             | Self::Tet10
             | Self::Wedge6
+            | Self::Wedge15
             | Self::Beam31
             | Self::Beam32
             | Self::Truss2
@@ -110,7 +153,12 @@ impl ElemKind {
             | Self::Shell3
             | Self::Shell8
             | Self::Shell8R
-            | Self::Shell6 => 3,
+            | Self::Shell6
+            | Self::Mem3
+            | Self::Mem4
+            | Self::Mem4R
+            | Self::Mem6
+            | Self::Mem8 => 3,
             _ => 2,
         }
     }
@@ -146,6 +194,32 @@ impl ElemKind {
         )
     }
 
+    pub fn is_membrane(self) -> bool {
+        matches!(
+            self,
+            Self::Mem3 | Self::Mem4 | Self::Mem4R | Self::Mem6 | Self::Mem8
+        )
+    }
+
+    pub fn is_axisym(self) -> bool {
+        matches!(self, Self::Cax4 | Self::Cax4R | Self::Cax8 | Self::Cax8R)
+    }
+
+    pub fn is_continuum3d(self) -> bool {
+        matches!(
+            self,
+            Self::Hex8
+                | Self::Hex8I
+                | Self::Hex8R
+                | Self::Hex20
+                | Self::Hex20R
+                | Self::Tet4
+                | Self::Tet10
+                | Self::Wedge6
+                | Self::Wedge15
+        )
+    }
+
     pub fn is_truss(self) -> bool {
         matches!(self, Self::Truss2 | Self::Truss3)
     }
@@ -170,13 +244,26 @@ impl ElemKind {
                 | Self::Shell8
                 | Self::Shell8R
                 | Self::Shell6
+                | Self::Wedge15
+                | Self::Cax8
+                | Self::Cax8R
+                | Self::Mem6
+                | Self::Mem8
         )
     }
 
     pub fn reduced_int(self) -> bool {
         matches!(
             self,
-            Self::Hex20R | Self::Hex8R | Self::Quad8RPs | Self::Quad8RPe | Self::Shell4R | Self::Shell8R
+            Self::Hex20R
+                | Self::Hex8R
+                | Self::Quad8RPs
+                | Self::Quad8RPe
+                | Self::Shell4R
+                | Self::Shell8R
+                | Self::Cax4R
+                | Self::Cax8R
+                | Self::Mem4R
         )
     }
 
@@ -197,7 +284,35 @@ impl ElemKind {
             Self::Tet4 => "C3D4",
             Self::Tet10 => "C3D10",
             Self::Wedge6 => "C3D6",
+            Self::Wedge15 => "C3D15",
             Self::Quad4Ps => "CPS4",
+            Self::Quad4Pe => "CPE4",
+            Self::Quad8Ps => "CPS8",
+            Self::Quad8Pe => "CPE8",
+            Self::Quad8RPs => "CPS8R",
+            Self::Quad8RPe => "CPE8R",
+            Self::Tri3Ps => "CPS3",
+            Self::Tri3Pe => "CPE3",
+            Self::Tri6Ps => "CPS6",
+            Self::Tri6Pe => "CPE6",
+            Self::Cax4 => "CAX4",
+            Self::Cax4R => "CAX4R",
+            Self::Cax8 => "CAX8",
+            Self::Cax8R => "CAX8R",
+            Self::Beam31 => "B31",
+            Self::Beam32 => "B32",
+            Self::Shell4 => "S4",
+            Self::Shell4R => "S4R",
+            Self::Shell3 => "S3",
+            Self::Shell8 => "S8",
+            Self::Shell8R => "S8R",
+            Self::Shell6 => "S6",
+            Self::Mem3 => "M3D3",
+            Self::Mem4 => "M3D4",
+            Self::Mem4R => "M3D4R",
+            Self::Mem6 => "M3D6",
+            Self::Mem8 => "M3D8",
+            Self::Truss2 => "T3D2",
             Self::Quad4Pe => "CPE4",
             Self::Quad8Ps => "CPS8",
             Self::Quad8Pe => "CPE8",
@@ -226,7 +341,29 @@ impl ElemKind {
         match self {
             Self::Hex8 | Self::Hex8I | Self::Hex8R => 1,
             Self::Wedge6 => 2,
+            Self::Wedge15 => 5,
             Self::Hex20 | Self::Hex20R => 4,
+            Self::Tet4 => 3,
+            Self::Tet10 => 6,
+            Self::Tri3Ps | Self::Tri3Pe | Self::Shell3 | Self::Mem3 => 7,
+            Self::Tri6Ps | Self::Tri6Pe | Self::Shell6 | Self::Mem6 => 8,
+            Self::Quad4Ps
+            | Self::Quad4Pe
+            | Self::Shell4
+            | Self::Shell4R
+            | Self::Cax4
+            | Self::Cax4R
+            | Self::Mem4
+            | Self::Mem4R => 9,
+            Self::Quad8Ps
+            | Self::Quad8Pe
+            | Self::Quad8RPs
+            | Self::Quad8RPe
+            | Self::Shell8
+            | Self::Shell8R
+            | Self::Cax8
+            | Self::Cax8R
+            | Self::Mem8 => 10,
             Self::Tet4 => 3,
             Self::Tet10 => 6,
             Self::Tri3Ps | Self::Tri3Pe | Self::Shell3 => 7,

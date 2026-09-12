@@ -31,7 +31,7 @@ pub fn write_frd(
     o.push_str("    1UTIME              18:00:00\n");
     o.push_str("    1UHOST              axia\n");
     o.push_str("    1UPGM               Axia FEM\n");
-    o.push_str("    1UVERSION           1.1\n");
+    o.push_str("    1UVERSION           1.2\n");
     o.push_str("    1UCODE              CalculiX-compatible Axia FEM\n");
 
     let nn = model.node_ids.len() as i32;
