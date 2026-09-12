@@ -252,15 +252,21 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     let mpcs = constraint::build_all_mpcs(&model, ndn)?;
     let map = DofMap::build(ndof, &prescribed, &mpcs)?;
     let nfree = map.n_ind;
-    let (ff_trips, rhs) = map.reduce(&trips, &f_full);
+    let mut solver = "prescribed".to_string();
+    let mut iters = 0usize;
+    let mut residual = 0.0;
+    let mut u_full = if nfree == 0 {
+        map.u0.clone()
+    } else {
+        let (ff_trips, rhs) = map.reduce(&trips, &f_full);
+        let solved = solve_kff(nfree, ff_trips, &rhs)?;
+        solver = solved.name;
+        iters = solved.iters;
+        residual = solved.residual;
+        map.reconstruct(&solved.x)
+    };
 
-    let solved = solve_kff(nfree, ff_trips, &rhs)?;
-    let solver = solved.name;
-    let iters = solved.iters;
-    let residual = solved.residual;
-    let u_full = map.reconstruct(&solved.x);
-
-    // Reactions: R = K u - F_applied (nonzero on supports)
+    // Reactions in the (possibly local) analysis DOFs, then rotate to global.
     let mut ku = vec![0.0; ndof];
     for (i, j, v) in &trips {
         ku[*i] += *v * u_full[*j];
@@ -269,6 +275,8 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     for d in 0..ndof {
         rf_full[d] = ku[d] - f_full[d];
     }
+    constraint::dofs_to_global(&mut u_full, ndn, &model.node_ids, &model.node_transform);
+    constraint::dofs_to_global(&mut rf_full, ndn, &model.node_ids, &model.node_transform);
 
     let mut u = vec![[0.0; 3]; nnode];
     let mut ur = vec![[0.0; 3]; nnode];

@@ -34,6 +34,7 @@ Mitgelieferte Decks in [`examples/`](examples/):
 | `plate_s4r.inp` | gelenkig gelagerte S4R-Platte |
 | `truss_t3d2.inp` | Fachwerkstab T3D2, \(u = FL/EA\) |
 | `equation_bars.inp` | zwei Stäbe gekoppelt mit `*EQUATION` |
+| `tie_bars.inp` | dasselbe mit `*TIE` |
 | `include_main.inp` | `*INCLUDE` (zieht `include_mat.inp`) |
 
 ### Binary bauen
@@ -157,6 +158,8 @@ Gemischte Modelle (Kontinuum + Schale/Balken) verwenden 6 DOF pro Knoten. Unbenu
 | SPRINGA | 2 | axiale Feder, Steifigkeit über `*SPRING, ELSET=` |
 
 `*EQUATION` koppelt DOFs (Slave-Elimination). `*INCLUDE, INPUT=datei.inp` zieht relative Dateien (CLI, nicht WASM).
+
+`*TIE` (knotenweise, nächster Nachbar), `*RIGID BODY, REF NODE=`, `*COUPLING` + `*DISTRIBUTING`/`*KINEMATIC`, `*TRANSFORM, TYPE=R` (lokale DOFs, Ausgabe global).
 
 ## Beispiele und Checks
 

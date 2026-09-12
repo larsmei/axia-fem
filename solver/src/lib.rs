@@ -998,4 +998,156 @@ spring
         let u2 = out.u[out.model.node_index(2).unwrap()][0];
         assert!((u2 - 0.5).abs() < 1e-6);
     }
+
+    #[test]
+    fn tie_two_truss_nodes() {
+        let inp = r#"
+*HEADING
+tie
+*NODE
+1, 0, 0, 0
+2, 500, 0, 0
+3, 500, 0, 0
+4, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+2, 3, 4
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*SURFACE, NAME=SL, TYPE=NODE
+2
+*SURFACE, NAME=MA, TYPE=NODE
+3
+*TIE
+SL, MA
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+3, 2, 3
+4, 2, 3
+*STEP
+*STATIC
+*CLOAD
+4, 1, 21000
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        let u4 = out.u[out.model.node_index(4).unwrap()][0];
+        assert!((u2 - 0.25).abs() < 1e-5, "tie u2={u2}");
+        assert!((u4 - 0.5).abs() < 1e-5, "tie u4={u4}");
+    }
+
+    #[test]
+    fn rigid_body_fixed_ref() {
+        let inp = r#"
+*HEADING
+rigid
+*NODE
+1, 0, 0, 0
+2, 100, 0, 0
+3, 0, 100, 0
+*NSET, NSET=SLAVES
+2, 3
+*RIGID BODY, NSET=SLAVES, REF NODE=1
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 2, 3
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+10
+*BOUNDARY
+1, 1, 6
+*STEP
+*STATIC
+*CLOAD
+2, 2, 50
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()];
+        let u3 = out.u[out.model.node_index(3).unwrap()];
+        assert!(u2.iter().all(|v| v.abs() < 1e-10), "u2={u2:?}");
+        assert!(u3.iter().all(|v| v.abs() < 1e-10), "u3={u3:?}");
+        assert_eq!(out.model.ndof_node(), 6);
+    }
+
+    #[test]
+    fn transform_local_spc() {
+        // Local x = global y. Fix local-x (global y) at node 1, load local-x at node 2.
+        let inp = r#"
+*HEADING
+transform
+*NODE
+1, 0, 0, 0
+2, 0, 1000, 0
+*NSET, NSET=ALLN
+1, 2
+*TRANSFORM, NSET=ALLN, TYPE=R
+0, 1, 0, -1, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 21000
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        // local x = global y, bar along global y → axial in local x
+        let u2 = out.u[out.model.node_index(2).unwrap()];
+        assert!(
+            (u2[1] - 0.5).abs() < 1e-5,
+            "transform uy (global)={:?} expected 0.5",
+            u2
+        );
+    }
+
+    #[test]
+    fn distributing_coupling_translates() {
+        let inp = r#"
+*HEADING
+rbe3
+*NODE
+1, 0, 0, 0
+2, 100, 0, 0
+3, 0, 0, 0
+*SURFACE, NAME=S, TYPE=NODE
+1, 2
+*COUPLING, REF NODE=3, SURFACE=S
+*DISTRIBUTING
+1, 3
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+*STEP
+*STATIC
+*CLOAD
+3, 1, 21000
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        // ref u = average of 1 and 2; load on ref goes to surface (RBE3)
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        let u3 = out.u[out.model.node_index(3).unwrap()][0];
+        assert!(u2 > 0.0, "u2={u2}");
+        assert!((u3 - 0.5 * u2).abs() < 1e-6, "u3={u3} should be avg of 0 and u2={u2}");
+    }
 }

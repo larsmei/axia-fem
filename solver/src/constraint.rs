@@ -111,8 +111,8 @@ impl DofMap {
                 n_ind += 1;
             }
         }
-        if n_ind == 0 {
-            return err("Alle Freiheitsgrade sind gelagert oder MPC-Slave — nichts zu lösen.");
+        if n_ind == 0 && slave_of.is_empty() && prescribed.is_empty() {
+            return err("Modell ohne freie Freiheitsgrade.");
         }
 
         let mut t_row = vec![Vec::new(); ndof];
@@ -566,6 +566,36 @@ pub fn transform_ke(
                 s += t[k * nd + i] * tmp[k * nd + j];
             }
             ke[i * nd + j] = s;
+        }
+    }
+}
+
+pub fn dofs_to_global(
+    u: &mut [f64],
+    ndn: usize,
+    node_ids: &[i32],
+    transforms: &HashMap<i32, [[f64; 3]; 3]>,
+) {
+    if transforms.is_empty() {
+        return;
+    }
+    for (ni, id) in node_ids.iter().enumerate() {
+        let Some(r) = transforms.get(id) else {
+            continue;
+        };
+        let base = ndn * ni;
+        if base + 2 >= u.len() {
+            continue;
+        }
+        let ul = [u[base], u[base + 1], u[base + 2]];
+        for p in 0..3 {
+            u[base + p] = r[p][0] * ul[0] + r[p][1] * ul[1] + r[p][2] * ul[2];
+        }
+        if ndn >= 6 && base + 5 < u.len() {
+            let rl = [u[base + 3], u[base + 4], u[base + 5]];
+            for p in 0..3 {
+                u[base + 3 + p] = r[p][0] * rl[0] + r[p][1] * rl[1] + r[p][2] * rl[2];
+            }
         }
     }
 }
