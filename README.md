@@ -79,6 +79,7 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 - Lasten und Lager: `*BOUNDARY` (DOF 1–6), `*CLOAD`, `*DLOAD` (`P`, `P1…P6`, `GRAV`, `PX`/`PY`/`PZ`)
 - Linear-statische Analyse, isotrope Elastizität, MPC-Elimination (`*EQUATION`)
 - `*FREQUENCY` (lumped mass, inverse subspace) und `*BUCKLE` (geometrische Steifigkeit)
+- `*EXPANSION` + `*TEMPERATURE` (isotrope Wärmedehnung, T3D2 und C3D8*)
 - Sparse-Assembly (Triplet → CSR)
 - Native Sparse-Solver: **PARDISO** (Intel MKL oder Panua, dynamisch geladen) mit **rivrs-sparse** als Fallback; WASM: dichte Cholesky / PCG
 - Der jeweils verwendete Solver wird beim Aufruf ausgegeben (`axia: sparse solver: …`) und steht in der Statistik

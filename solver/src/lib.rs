@@ -1219,4 +1219,40 @@ freq
             "λ={lam}, Euler cantilever={expect}"
         );
     }
+
+    #[test]
+    fn thermal_t3d2_reaction() {
+        let inp = r#"
+*HEADING
+thermal bar
+*NODE
+1, 0, 0, 0
+2, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*EXPANSION
+1e-5
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+2, 1, 3
+*TEMPERATURE
+1, 100
+2, 100
+*STEP
+*STATIC
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let r1 = out.rf[out.model.node_index(1).unwrap()][0];
+        // N = EA α ΔT = 210000*200*1e-5*100 = 42000, compression → node1 reaction +42000 (against expansion)
+        assert!(
+            (r1 - 42000.0).abs() / 42000.0 < 0.02,
+            "R1x={r1}, expected 42000"
+        );
+    }
 }

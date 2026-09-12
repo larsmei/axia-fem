@@ -256,6 +256,25 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                 _ => {}
             }
         }
+        if mat.alpha.abs() > 0.0 {
+            let mut tsum = 0.0;
+            for &id in &el.nodes {
+                tsum += model.temperature_at(id);
+            }
+            let dt_th = tsum / nn as f64 - mat.tref;
+            if dt_th.abs() > 0.0 {
+                if el.kind.is_truss() {
+                    let fe = extra::truss_thermal_force(&xyz, mat.e, th, mat.alpha, dt_th);
+                    scatter_fe(&fe, &gdofs, 3, local_dim, &mut f_full);
+                } else if matches!(
+                    el.kind,
+                    ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R
+                ) {
+                    let fe = extra::hex8_thermal_force(&xyz, mat.e, mat.nu, mat.alpha, dt_th)?;
+                    scatter_fe(&fe, &gdofs, 3, local_dim, &mut f_full);
+                }
+            }
+        }
     }
 
     let mpcs = constraint::build_all_mpcs(&model, ndn)?;

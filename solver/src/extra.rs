@@ -625,6 +625,65 @@ pub fn spring_stiffness(xyz: &[[f64; 3]], k: f64) -> Result<(Vec<f64>, f64)> {
     Ok((ke, len))
 }
 
+pub fn truss_thermal_force(xyz: &[[f64; 3]], e: f64, area: f64, alpha: f64, dt: f64) -> Vec<f64> {
+    let nn = xyz.len();
+    let i1 = if nn == 2 { 1 } else { nn - 1 };
+    let mut d = [
+        xyz[i1][0] - xyz[0][0],
+        xyz[i1][1] - xyz[0][1],
+        xyz[i1][2] - xyz[0][2],
+    ];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-18);
+    d[0] /= len;
+    d[1] /= len;
+    d[2] /= len;
+    let n = e * area * alpha * dt;
+    let mut fe = vec![0.0; 3 * nn];
+    for k in 0..3 {
+        fe[k] -= n * d[k];
+        fe[3 * i1 + k] += n * d[k];
+    }
+    fe
+}
+
+pub fn hex8_thermal_force(xyz: &[[f64; 3]], e: f64, nu: f64, alpha: f64, dt: f64) -> Result<Vec<f64>> {
+    let p = hex_as_8(xyz);
+    let dmat = d_iso_3d(e, nu)?;
+    let mut eps = [0.0; 6];
+    eps[0] = alpha * dt;
+    eps[1] = alpha * dt;
+    eps[2] = alpha * dt;
+    let mut sig = [0.0; 6];
+    for i in 0..6 {
+        for j in 0..6 {
+            sig[i] += dmat[i * 6 + j] * eps[j];
+        }
+    }
+    let n = 24usize;
+    let mut fe = vec![0.0; n];
+    let pts = [-G2, G2];
+    for &xi in &pts {
+        for &eta in &pts {
+            for &zeta in &pts {
+                let (dndx, det, _) = hex8_dndx(&p, xi, eta, zeta)?;
+                if det <= 0.0 {
+                    continue;
+                }
+                let mut b = vec![0.0; 6 * n];
+                fill_b3(&mut b, 8, &dndx);
+                for j in 0..n {
+                    let mut s = 0.0;
+                    for i in 0..6 {
+                        s += b[i * n + j] * sig[i];
+                    }
+                    fe[j] += s * det;
+                }
+            }
+        }
+    }
+    Ok(fe)
+}
+
 pub fn spring_nodal_stress(_xyz: &[[f64; 3]], _ue: &[f64], _k: f64) -> Vec<[f64; 6]> {
     vec![[0.0; 6]; 2]
 }
