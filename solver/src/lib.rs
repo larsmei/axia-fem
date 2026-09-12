@@ -14,6 +14,7 @@ mod linalg;
 mod material;
 mod model;
 mod nlgeom;
+mod plastic;
 mod quadratic;
 mod shell;
 
@@ -141,6 +142,7 @@ fn solve_json(inp: &str) -> Result<Value> {
         "uMax": umax,
         "vmMin": vmin,
         "vmMax": vmax,
+        "peeqMax": out.peeq.iter().copied().fold(0.0_f64, f64::max),
         "nbc": out.model.bcs.len(),
         "ncload": out.model.cloads.len(),
     });
@@ -2023,5 +2025,120 @@ C3D8 SVK stretch λ=1.2
         let exx = out.strain[out.model.node_index(7).unwrap()][0];
         assert!((exx - 0.22).abs() < 1e-6, "GL Exx={exx}, expected 0.22");
         assert!(out.residual < 1e-8, "residual={}", out.residual);
+    }
+
+    #[test]
+    fn plastic_c3d8_hardening() {
+        let inp = r#"
+*HEADING
+C3D8 J2 uniaxial, σ=250, ux≈0.03095
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+*ELEMENT, TYPE=C3D8, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*PLASTIC
+210, 0.0
+420, 0.01
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*NSET, NSET=FIXED
+1, 4, 5, 8
+*BOUNDARY
+FIXED, 1, 1
+1, 2, 3
+4, 3, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 6250
+3, 1, 6250
+6, 1, 6250
+7, 1, 6250
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let mut ux = 0.0;
+        let mut n = 0.0;
+        for (i, &id) in out.model.node_ids.iter().enumerate() {
+            if id == 2 || id == 3 || id == 6 || id == 7 {
+                ux += out.u[i][0];
+                n += 1.0;
+            }
+        }
+        ux /= n;
+        // ε = σ/E + peeq = 250/210000 + (250-210)/21000 = 0.00309524, L=10 → u=0.03095
+        assert!(
+            (ux - 0.03095).abs() / 0.03095 < 0.08,
+            "C3D8 plastic ux={ux}, expected ~0.03095"
+        );
+        assert!(ux > 0.015, "should exceed elastic u=0.0119, got {ux}");
+        let sxx = out.stress.iter().map(|s| s[0]).sum::<f64>() / out.stress.len() as f64;
+        assert!((sxx - 250.0).abs() < 8.0, "sxx={sxx}");
+        let pe = out.peeq.iter().copied().fold(0.0_f64, f64::max);
+        assert!(pe > 0.001, "peeq={pe}");
+        assert!(out.frd.contains("PEEQ"));
+    }
+
+    #[test]
+    fn plastic_c3d8_below_yield() {
+        let inp = r#"
+*HEADING
+C3D8 below yield
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+*ELEMENT, TYPE=C3D8, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*PLASTIC
+210, 0.0
+420, 0.01
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*NSET, NSET=FIXED
+1, 4, 5, 8
+*BOUNDARY
+FIXED, 1, 1
+1, 2, 3
+4, 3, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 5000
+3, 1, 5000
+6, 1, 5000
+7, 1, 5000
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let mut ux = 0.0;
+        let mut n = 0.0;
+        for (i, &id) in out.model.node_ids.iter().enumerate() {
+            if id == 2 || id == 3 || id == 6 || id == 7 {
+                ux += out.u[i][0];
+                n += 1.0;
+            }
+        }
+        ux /= n;
+        // σ=200, u=FL/EA=0.0095238
+        assert!((ux - 0.0095238).abs() < 2e-5, "elastic C3D8 ux={ux}");
+        let pe = out.peeq.iter().copied().fold(0.0_f64, f64::max);
+        assert!(pe < 1e-10, "peeq should be 0, got {pe}");
     }
 }

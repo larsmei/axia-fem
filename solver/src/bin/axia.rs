@@ -314,6 +314,8 @@ fn stats_json(out: &SolveOutput) -> String {
         "uMax": umax,
         "vmMin": vmin,
         "vmMax": vmax,
+        "peeqMax": out.peeq.iter().copied().fold(0.0_f64, f64::max),
+        "nsteps": out.nsteps,
         "nbc": out.model.bcs.len(),
         "ncload": out.model.cloads.len(),
         "ndload": out.model.dloads.len(),

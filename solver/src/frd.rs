@@ -18,6 +18,7 @@ pub fn write_frd(
     stress: &[[f64; 6]],
     rf: &[[f64; 3]],
     strain: &[[f64; 6]],
+    peeq: &[f64],
 ) -> String {
     let mut o = String::with_capacity(1 << 16);
     let heading = if model.heading.is_empty() {
@@ -31,7 +32,7 @@ pub fn write_frd(
     o.push_str("    1UTIME              18:00:00\n");
     o.push_str("    1UHOST              axia\n");
     o.push_str("    1UPGM               Axia FEM\n");
-    o.push_str("    1UVERSION           1.3\n");
+    o.push_str("    1UVERSION           1.5\n");
     o.push_str("    1UCODE              CalculiX-compatible Axia FEM\n");
 
     let nn = model.node_ids.len() as i32;
@@ -175,6 +176,19 @@ pub fn write_frd(
                 .iter()
                 .map(|v| vec![v[0], v[1], v[2], v[3], v[4], v[5]])
                 .collect::<Vec<_>>(),
+        );
+    }
+    if !heat && peeq.len() == model.node_ids.len() && peeq.iter().any(|v| *v > 0.0) {
+        write_result_block(
+            &mut o,
+            108,
+            nn,
+            "PEEQ",
+            1,
+            &[("PEEQ", 1, 1, 0)],
+            false,
+            &model.node_ids,
+            &peeq.iter().map(|v| vec![*v]).collect::<Vec<_>>(),
         );
     }
     o.push_str(" 9999\n");

@@ -9,7 +9,7 @@ Zwei Frontends, ein Solver:
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
 
-**1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP` (Lasten kumulativ), `*CONTROLS, MAXITER=` / `RTOL=`, Material-Modul für Newton. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
+**1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
 
 ## CLI
 
@@ -48,6 +48,7 @@ Mitgelieferte Decks in [`examples/`](examples/):
 | `nlgeom_c3d8.inp` | C3D8 `*STEP, NLGEOM`, Patch \(u_x=0{,}01\) |
 | `nlgeom_stretch.inp` | C3D8 SVK, \(\lambda=1{,}2\), Cauchy \(\sigma_{xx}=26{,}4\) |
 | `plastic_bar.inp` | T3D2 `*PLASTIC` (isotrope Verfestigung), \(u\approx 3{,}095\) |
+| `plastic_c3d8.inp` | C3D8 J2, \(\sigma=250\), \(u_x\approx 0{,}03095\) |
 | `heat_bar.inp` | stationäre Wärmeleitung T3D2, \(T(L/2)=50\) |
 | `dynamic_sdof.inp` | Newmark, SDOF \(u(T/2)=-u_0\) |
 
@@ -98,7 +99,10 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
   - **T3D2** korotational, Newton (`*CONTROLS, MAXITER=`, `RTOL=`)
   - **Kontinuum** C3D8/C3D8I/C3D8R/C3D20/C3D20R/C3D4/C3D10/C3D6/C3D15: Total-Lagrange, St. Venant–Kirchhoff. Kleine Dehnung reproduziert den linearen Patch-Test. Lasten auf der Referenzkonfiguration (dead load).
 - Mehrere `*STEP` / `*END STEP` — Lasten und Lager kumulativ, letzter Schritt bestimmt die Ausgabe
-- `*PLASTIC` — J2 mit isotroper Verfestigung, **T3D2** (Kurve \(\sigma_y(\bar\varepsilon^p)\))
+- `*PLASTIC` — J2 mit isotroper Verfestigung (Kurve \(\sigma_y(\bar\varepsilon^p)\))
+  - **T3D2** 1D-Return-Map
+  - **Kontinuum** C3D8/C3D8I/C3D8R/C3D20/C3D20R/C3D4/C3D10/C3D6/C3D15: kleine Dehnung, Radial-Return, konsistente Tangente, FRD-Block `PEEQ`
+  - Kombination `NLGEOM` + `*PLASTIC` auf Kontinuum noch nicht; ein `*STEP` pro plastischer Rechnung
 - Sparse-Assembly (Triplet → CSR)
 - Native Sparse-Solver: **PARDISO** (Intel MKL oder Panua, dynamisch geladen) mit **rivrs-sparse** als Fallback; WASM: dichte Cholesky / PCG
 - Der jeweils verwendete Solver wird beim Aufruf ausgegeben (`axia: sparse solver: …`) und steht in der Statistik
@@ -197,7 +201,7 @@ Gemischte Modelle (Kontinuum + Schale/Balken) verwenden 6 DOF pro Knoten. Unbenu
 
 `*TIE` (knotenweise, nächster Nachbar), `*RIGID BODY, REF NODE=`, `*COUPLING` + `*DISTRIBUTING`/`*KINEMATIC`, `*TRANSFORM, TYPE=R` (lokale DOFs, Ausgabe global).
 
-### Nichtlinear (1.0 T3D2, 1.4 Kontinuum)
+### Nichtlinear (1.0 T3D2, 1.4 NLGEOM, 1.5 J2)
 
 ```
 *STEP, NLGEOM
@@ -214,7 +218,7 @@ Kontinuum (C3D*): Total-Lagrange, St. Venant–Kirchhoff \(S=\lambda\,\mathrm{tr
 420, 0.01
 ```
 
-CalculiX-Reihenfolge \(\sigma_y, \bar\varepsilon^p\). 1D-J2, \(\varepsilon=\sigma/E+\bar\varepsilon^p\). `*PLASTIC` ist weiterhin nur für T3D2.
+CalculiX-Reihenfolge \(\sigma_y, \bar\varepsilon^p\). T3D2: 1D-J2. Kontinuum: Radial-Return, \(q=\sqrt{3J_2}\), isotrope Verfestigung, konsistente Tangente. Uniaxial C3D8 mit \(\sigma=250\), \(H=21000\) liefert \(u_x\approx 0{,}03095\). FRD-Block `PEEQ`. `NLGEOM`+`*PLASTIC` auf C3D* noch nicht kombiniert.
 
 ### Wärmeleitung und Dynamik (1.1)
 
@@ -260,6 +264,7 @@ Newmark (mittlere Beschleunigung). Lumped mass wie `*FREQUENCY`. Lasten mit `*AM
 | C3D8 NLGEOM Patch | \(u_x=0{,}01\), \(\sigma_{xx}=210\) |
 | C3D8 SVK \(\lambda=1{,}2\) | Cauchy \(\sigma_{xx}=26{,}4\) |
 | T3D2 `*PLASTIC` | \(\sigma=250\), \(u\approx 3{,}095\) (über elastisch \(1{,}19\)) |
+| C3D8 `*PLASTIC` | \(\sigma=250\), \(u_x\approx 0{,}03095\) |
 | Wärmeleitung T3D2 | \(T(0)=0\), \(T(L)=100\) → \(T(L/2)=50\) |
 | SDOF `*DYNAMIC` | \(k=100\), \(m=1\), \(u(T/2)=-u_0\) |
 | Kragträger B32 | Timoshenko \(\delta = PL^3/3EI + PL/kAG \approx 0{,}1906\) |

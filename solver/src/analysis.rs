@@ -15,6 +15,7 @@ use crate::linalg::solve_kff;
 use crate::material::truss_1d_stress;
 use crate::model::{Dload, ElemKind, FluxKind, InitKind, Model, Procedure};
 use crate::nlgeom;
+use crate::plastic;
 use crate::quadratic;
 use crate::shell;
 
@@ -40,6 +41,7 @@ pub struct SolveOutput {
     pub frequencies: Vec<f64>,
     pub buckles: Vec<f64>,
     pub nsteps: usize,
+    pub peeq: Vec<f64>,
 }
 
 fn elem_xyz(model: &Model, nodes: &[i32]) -> Result<Vec<[f64; 3]>> {
@@ -102,8 +104,11 @@ fn solve_one(model: Model, t0: f64) -> Result<SolveOutput> {
         if nlgeom && continuum_only && !model.has_plastic() {
             return solve_continuum_newton(model, t0);
         }
+        if continuum_only && model.has_plastic() && !nlgeom {
+            return solve_continuum_plastic(model, t0);
+        }
         return err(
-            "NLGEOM ist für T3D2 und Kontinuum (C3D*) implementiert; *PLASTIC nur für T3D2.",
+            "NLGEOM ist für T3D2 und Kontinuum (C3D*) implementiert; *PLASTIC für T3D2 und C3D* (ohne NLGEOM).",
         );
     }
     solve_linear(model, t0)
@@ -613,7 +618,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         }
     }
 
-    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain);
+    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &[]);
     let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
     let dt = now_ms() - t0;
     let procedure = model.procedure.name().to_string();
@@ -641,6 +646,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         frequencies,
         buckles,
         nsteps,
+        peeq: Vec::new(),
     })
 }
 
@@ -1144,7 +1150,7 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
     let strain = vec![[0.0; 6]; nnode];
     let vm = vec![0.0; nnode];
     let stress_gp = Vec::new();
-    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain);
+    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &[]);
     let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
     let procedure = model.procedure.name().to_string();
     let nsteps = model.steps.len().max(1);
@@ -1170,6 +1176,7 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
         frequencies: Vec::new(),
         buckles: Vec::new(),
         nsteps,
+        peeq: Vec::new(),
     })
 }
 
@@ -1247,6 +1254,192 @@ fn assemble_fext(model: &Model, ndn: usize, ndof: usize) -> Result<Vec<f64>> {
         }
     }
     Ok(f)
+}
+
+fn solve_continuum_plastic(model: Model, t0: f64) -> Result<SolveOutput> {
+    let ndn = 3;
+    let nnode = model.node_ids.len();
+    let ndof = ndn * nnode;
+    let mut prescribed: HashMap<usize, f64> = HashMap::new();
+    for bc in &model.bcs {
+        if bc.dof >= ndn {
+            continue;
+        }
+        let ni = model.node_index(bc.node)?;
+        prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
+    }
+    let f_ext = assemble_fext(&model, ndn, ndof)?;
+    let mpcs = constraint::build_all_mpcs(&model, ndn)?;
+    let map = DofMap::build(ndof, &prescribed, &mpcs)?;
+    let nfree = map.n_ind;
+    if nfree == 0 {
+        return err("*PLASTIC Kontinuum: keine freien DOF.");
+    }
+    let mut hist: Vec<Vec<plastic::GpHist>> = model
+        .elements
+        .iter()
+        .map(|el| vec![plastic::GpHist::default(); plastic::n_gauss(el.kind).max(1)])
+        .collect();
+    let mut u_full = map.u0.clone();
+    let mut solver = String::new();
+    let mut residual = 0.0;
+    let mut iters = 0usize;
+    let mut last_stress: Vec<[f64; 6]> = vec![[0.0; 6]; model.elements.len()];
+    let mut last_strain: Vec<[f64; 6]> = vec![[0.0; 6]; model.elements.len()];
+    let mut last_peeq: Vec<f64> = vec![0.0; model.elements.len()];
+    let mut last_fint = vec![0.0; ndof];
+    for it in 0..model.max_newton.max(1) {
+        iters = it + 1;
+        let mut trips: Vec<(usize, usize, f64)> = Vec::new();
+        let mut f_int = vec![0.0; ndof];
+        for (ei, el) in model.elements.iter().enumerate() {
+            let xyz0 = elem_xyz(&model, &el.nodes)?;
+            let nn = el.kind.nnodes();
+            let mut ue = vec![0.0; 3 * nn];
+            let mut gdofs = Vec::with_capacity(3 * nn);
+            for a in 0..nn {
+                let ni = model.node_index(el.nodes[a])?;
+                for d in 0..3 {
+                    let g = dof_of(ndn, ni, d);
+                    gdofs.push(g);
+                    ue[3 * a + d] = u_full[g];
+                }
+            }
+            let mat = model.material_for(el)?;
+            let curve = model.plastic_for(el).unwrap_or(&[]);
+            let pl = plastic::continuum_plastic(
+                el.kind,
+                &xyz0,
+                &ue,
+                mat.e,
+                mat.nu,
+                curve,
+                &hist[ei],
+            )?;
+            last_stress[ei] = pl.stress;
+            last_strain[ei] = pl.strain;
+            last_peeq[ei] = pl.peeq;
+            let nd = gdofs.len();
+            for i in 0..nd {
+                f_int[gdofs[i]] += pl.fe[i];
+                for j in 0..nd {
+                    let v = pl.ke[i * nd + j];
+                    if v.abs() > 0.0 {
+                        trips.push((gdofs[i], gdofs[j], v));
+                    }
+                }
+            }
+        }
+        last_fint.clone_from(&f_int);
+        let mut r = vec![0.0; ndof];
+        for i in 0..ndof {
+            r[i] = f_ext[i] - f_int[i];
+        }
+        let (ff, rhs) = map.reduce_inc(&trips, &r);
+        residual = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let fref = f_ext.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if residual < model.newton_tol * (1.0 + fref) {
+            break;
+        }
+        if it + 1 == model.max_newton.max(1) {
+            return err(format!(
+                "Newton (*PLASTIC) konvergierte nicht (r={residual:.3e} nach {iters} Iterationen)."
+            ));
+        }
+        let solved = solve_kff(nfree, ff, &rhs)?;
+        solver = solved.name;
+        let mut du_full = vec![0.0; ndof];
+        for i in 0..ndof {
+            for &(j, c) in &map.t_row[i] {
+                du_full[i] += c * solved.x[j];
+            }
+        }
+        for i in 0..ndof {
+            u_full[i] += du_full[i];
+        }
+        let dun = solved.x.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if dun < 1e-14 {
+            break;
+        }
+    }
+    if solver.is_empty() {
+        solver = "Newton (equilibrium)".into();
+    } else {
+        solver = format!("Newton-J2 ({solver}, {iters} iters)");
+    }
+
+    let mut u = vec![[0.0; 3]; nnode];
+    let ur = vec![[0.0; 3]; nnode];
+    let mut rf = vec![[0.0; 3]; nnode];
+    let rm = vec![[0.0; 3]; nnode];
+    for ni in 0..nnode {
+        for d in 0..3 {
+            u[ni][d] = u_full[dof_of(ndn, ni, d)];
+            rf[ni][d] = last_fint[dof_of(ndn, ni, d)] - f_ext[dof_of(ndn, ni, d)];
+        }
+    }
+    let mut accs = vec![[0.0; 6]; nnode];
+    let mut gacc = vec![[0.0; 6]; nnode];
+    let mut pacc = vec![0.0; nnode];
+    let mut cnt = vec![0.0; nnode];
+    let mut stress_gp = Vec::new();
+    for (ei, el) in model.elements.iter().enumerate() {
+        let s = last_stress[ei];
+        let g = last_strain[ei];
+        let p = last_peeq[ei];
+        for &id in &el.nodes {
+            let ni = model.node_index(id)?;
+            for c in 0..6 {
+                accs[ni][c] += s[c];
+                gacc[ni][c] += g[c];
+            }
+            pacc[ni] += p;
+            cnt[ni] += 1.0;
+        }
+        stress_gp.push((el.id, 1usize, s));
+    }
+    let mut stress = vec![[0.0; 6]; nnode];
+    let mut strain = vec![[0.0; 6]; nnode];
+    let mut vm = vec![0.0; nnode];
+    let mut peeq = vec![0.0; nnode];
+    for i in 0..nnode {
+        if cnt[i] > 0.0 {
+            for c in 0..6 {
+                stress[i][c] = accs[i][c] / cnt[i];
+                strain[i][c] = gacc[i][c] / cnt[i];
+            }
+            peeq[i] = pacc[i] / cnt[i];
+        }
+        vm[i] = von_mises(&stress[i]);
+    }
+    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &peeq);
+    let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
+    let procedure = model.procedure.name().to_string();
+    let nsteps = model.steps.len().max(1);
+    Ok(SolveOutput {
+        model,
+        u,
+        ur,
+        rf,
+        rm,
+        stress,
+        strain,
+        von_mises: vm,
+        stress_gp,
+        frd: frd_s,
+        dat: dat_s,
+        nfree,
+        ndof,
+        solver,
+        iters,
+        residual,
+        time_ms: now_ms() - t0,
+        procedure,
+        frequencies: vec![],
+        buckles: vec![],
+        nsteps,
+        peeq,
+    })
 }
 
 fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
@@ -1384,7 +1577,7 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
         }
         vm[i] = von_mises(&stress[i]);
     }
-    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain);
+    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &[]);
     let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
     let procedure = model.procedure.name().to_string();
     let nsteps = model.steps.len().max(1);
@@ -1410,6 +1603,7 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
         frequencies: vec![],
         buckles: vec![],
         nsteps,
+        peeq: Vec::new(),
     })
 }
 
@@ -1671,7 +1865,7 @@ fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput
         }
         stress_gp.push((el.id, 1usize, s));
     }
-    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain);
+    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &[]);
     let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
     let procedure = model.procedure.name().to_string();
     let nsteps = model.steps.len().max(1);
@@ -1697,5 +1891,6 @@ fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput
         frequencies: vec![],
         buckles: vec![],
         nsteps,
+        peeq: Vec::new(),
     })
 }
