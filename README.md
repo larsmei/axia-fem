@@ -9,7 +9,7 @@ Zwei Frontends, ein Solver:
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
 
-**1.2** — C3D15, Achsensymmetrie (CAX4/CAX8), Membran (M3D*), Wärme auf C3D20/C3D10/C3D4/C3D6, Beulen mit Kontinuum-\(K_g\). **1.1** brachte Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
+**1.3** — mehrere `*STEP` (Lasten kumulativ), `*CONTROLS, MAXITER=` / `RTOL=`, Material-Modul für Newton. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
 
 ## CLI
 
@@ -92,7 +92,8 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 - `*HEAT TRANSFER, STEADY STATE` — T3D2, B31, C3D8, C3D20, C3D10, C3D4, C3D6, C3D15, CPS4, CPS8, S4; `*CONDUCTIVITY`, `*DFLUX`/`*FILM`/`*CFLUX`, NT = DOF 11
 - `*DYNAMIC` — implizites Newmark (\(\beta=1/4,\gamma=1/2\)), `*DAMPING` (Rayleigh), `*AMPLITUDE`, `*INITIAL CONDITIONS`
 - `*EXPANSION` + `*TEMPERATURE` (isotrope Wärmedehnung, T3D2 und C3D8*)
-- `*STEP, NLGEOM` — geometrisch nichtlineare Statik, **T3D2** (korotational, Newton)
+- `*STEP, NLGEOM` — geometrisch nichtlineare Statik, **T3D2** (korotational, Newton; `*CONTROLS, MAXITER=`, `RTOL=`)
+- Mehrere `*STEP` / `*END STEP` — Lasten und Lager kumulativ, letzter Schritt bestimmt die Ausgabe
 - `*PLASTIC` — J2 mit isotroper Verfestigung, **T3D2** (Kurve \(\sigma_y(\bar\varepsilon^p)\))
 - Sparse-Assembly (Triplet → CSR)
 - Native Sparse-Solver: **PARDISO** (Intel MKL oder Panua, dynamisch geladen) mit **rivrs-sparse** als Fallback; WASM: dichte Cholesky / PCG

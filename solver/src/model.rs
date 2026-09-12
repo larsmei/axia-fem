@@ -675,6 +675,14 @@ pub enum Procedure {
     Dynamic { dt: f64, period: f64 },
 }
 
+#[derive(Clone, Debug)]
+pub struct AnalysisStep {
+    pub procedure: Procedure,
+    pub n_cload: usize,
+    pub n_dload: usize,
+    pub n_bc: usize,
+}
+
 impl Default for Procedure {
     fn default() -> Self {
         Self::Static {
@@ -733,6 +741,9 @@ pub struct Model {
     pub damp_alpha: f64,
     pub damp_beta: f64,
     pub procedure: Procedure,
+    pub steps: Vec<AnalysisStep>,
+    pub max_newton: usize,
+    pub newton_tol: f64,
     pub dim: usize,
     pub output_u: bool,
     pub output_s: bool,
@@ -778,6 +789,9 @@ impl Model {
             damp_alpha: 0.0,
             damp_beta: 0.0,
             procedure: Procedure::default(),
+            steps: Vec::new(),
+            max_newton: 25,
+            newton_tol: 1e-8,
             dim: 3,
             output_u: true,
             output_s: true,

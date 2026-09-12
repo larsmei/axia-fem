@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{err, Result};
 use crate::model::{
-    Amplitude, BeamSection, Boundary, Cflux, Cload, Coupling, Dflux, Dload, ElemKind, Element,
-    Equation, Film, FluxKind, InitCond, InitKind, Material, Model, RigidBody, Surface, ThermalBc,
-    Tie, Transform,
+    Amplitude, AnalysisStep, BeamSection, Boundary, Cflux, Cload, Coupling, Dflux, Dload, ElemKind,
+    Element, Equation, Film, FluxKind, InitCond, InitKind, Material, Model, RigidBody, Surface,
+    ThermalBc, Tie, Transform,
 };
 
 fn strip_comment(line: &str) -> &str {
@@ -185,6 +185,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
     let mut current_material: Option<String> = None;
     let mut current_coupling: Option<usize> = None;
     let mut saw_step = false;
+    let mut step_open = false;
 
     while i < n {
         let raw = strip_comment(lines[i]);
@@ -647,7 +648,11 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                 }
             }
             "*STEP" => {
+                if step_open {
+                    push_step(&mut model);
+                }
                 saw_step = true;
+                step_open = true;
                 if params.contains_key("NLGEOM") {
                     model.procedure = crate::model::Procedure::Static {
                         nlgeom: true,
@@ -1265,8 +1270,38 @@ fn parse_expanded(inp: &str) -> Result<Model> {
             "*INCLUDE" => {
                 i += 1;
             }
-            "*PREPRINT" | "*END STEP" | "*END STEP " => {
+            "*PREPRINT" => {
                 i += 1;
+            }
+            "*END STEP" | "*END STEP " => {
+                if step_open {
+                    push_step(&mut model);
+                }
+                step_open = false;
+                i += 1;
+            }
+            "*CONTROLS" => {
+                if let Some(m) = params.get("MAXITER") {
+                    if let Ok(v) = parse_i32(m) {
+                        model.max_newton = v.max(1) as usize;
+                    }
+                }
+                if let Some(t) = params.get("RTOL").or_else(|| params.get("FINT")) {
+                    if let Ok(v) = parse_f64(t) {
+                        if v > 0.0 {
+                            model.newton_tol = v;
+                        }
+                    }
+                }
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if model.max_newton == 25 && !toks.is_empty() {
+                    if let Ok(v) = parse_i32(&toks[0]) {
+                        if v > 0 {
+                            model.max_newton = v as usize;
+                        }
+                    }
+                }
             }
             other => {
                 if other.starts_with('*') {
@@ -1307,10 +1342,25 @@ fn parse_expanded(inp: &str) -> Result<Model> {
     if !saw_step {
         model.warn("Kein *STEP — linear-statischer Schritt angenommen.");
     }
+    if step_open || model.steps.is_empty() {
+        push_step(&mut model);
+    }
+    if let Some(last) = model.steps.last() {
+        model.procedure = last.procedure.clone();
+    }
 
     model.compact();
     expand_deferred(&mut model)?;
     Ok(model)
+}
+
+fn push_step(model: &mut Model) {
+    model.steps.push(AnalysisStep {
+        procedure: model.procedure.clone(),
+        n_cload: model.cloads.len(),
+        n_dload: model.dloads.len(),
+        n_bc: model.bcs.len(),
+    });
 }
 
 fn parse_beam_section(sectyp: &str, toks: &[String]) -> Result<BeamSection> {

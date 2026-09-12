@@ -11,6 +11,7 @@ mod frd;
 mod heat;
 mod inp;
 mod linalg;
+mod material;
 mod model;
 mod quadratic;
 mod shell;
@@ -134,6 +135,7 @@ fn solve_json(inp: &str) -> Result<Value> {
         "procedure": out.procedure,
         "frequencies": out.frequencies,
         "buckles": out.buckles,
+        "nsteps": out.nsteps,
         "timeMs": out.time_ms,
         "uMax": umax,
         "vmMin": vmin,
@@ -1833,5 +1835,73 @@ C3D8 column buckle
             "lambda={}",
             out.buckles[0]
         );
+    }
+
+    #[test]
+    fn two_static_steps_accumulate_cload() {
+        let inp = r#"
+*HEADING
+two steps
+*NODE
+1, 0, 0, 0
+2, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 10500
+*END STEP
+*STEP
+*STATIC
+*CLOAD
+2, 1, 10500
+*END STEP
+"#;
+        let model = parse_model(inp).unwrap();
+        assert_eq!(model.steps.len(), 2, "steps={}", model.steps.len());
+        let out = solve_native(inp).unwrap();
+        assert_eq!(out.nsteps, 2);
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((u2 - 0.5).abs() < 1e-6, "two-step ux={u2}");
+    }
+
+    #[test]
+    fn controls_sets_maxiter() {
+        let inp = r#"
+*HEADING
+controls
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+100, 0
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+1
+*BOUNDARY
+1, 1, 3
+*CONTROLS, MAXITER=7, RTOL=1e-10
+*STEP
+*STATIC
+*CLOAD
+2, 1, 1
+*END STEP
+"#;
+        let model = parse_model(inp).unwrap();
+        assert_eq!(model.max_newton, 7);
+        assert!((model.newton_tol - 1e-10).abs() < 1e-20);
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((u2 - 0.01).abs() < 1e-8, "ux={u2}");
     }
 }
