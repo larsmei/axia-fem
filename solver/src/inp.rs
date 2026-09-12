@@ -1,0 +1,676 @@
+use std::collections::HashMap;
+
+use crate::error::{err, Result};
+use crate::model::{Boundary, Cload, Dload, ElemKind, Element, Material, Model};
+
+fn strip_comment(line: &str) -> &str {
+    let t = line.trim();
+    if t.starts_with("**") {
+        return "";
+    }
+    line
+}
+
+fn parse_keyword(line: &str) -> (String, HashMap<String, String>) {
+    let t = line.trim().trim_start_matches('\u{feff}');
+    let upper = t.to_ascii_uppercase();
+    let mut parts = upper.split(',');
+    let kw = parts.next().unwrap_or("").trim().to_string();
+    let mut params = HashMap::new();
+    for p in parts {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = p.split_once('=') {
+            params.insert(k.trim().to_string(), v.trim().to_string());
+        } else {
+            params.insert(p.to_string(), String::new());
+        }
+    }
+    (kw, params)
+}
+
+fn tokenize_data(line: &str) -> Vec<String> {
+    line.split(|c: char| c == ',' || c.is_whitespace())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn parse_f64(s: &str) -> Result<f64> {
+    let t = s.trim().trim_end_matches('.');
+    t.parse::<f64>()
+        .or_else(|_| s.trim().parse::<f64>())
+        .map_err(|_| crate::error::FemError(format!("Keine Zahl: {s}")))
+}
+
+fn parse_i32(s: &str) -> Result<i32> {
+    let t = s.trim();
+    if let Ok(v) = t.parse::<i32>() {
+        return Ok(v);
+    }
+    let f = parse_f64(t)?;
+    Ok(f.round() as i32)
+}
+
+fn is_keyword_line(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('*') && !t.starts_with("**")
+}
+
+/// Collect data tokens from lines starting at `i` until the next keyword.
+/// Returns (tokens, index of next keyword or end).
+fn collect_tokens(lines: &[&str], mut i: usize) -> (Vec<String>, usize) {
+    let mut tokens = Vec::new();
+    while i < lines.len() {
+        let raw = strip_comment(lines[i]);
+        if raw.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        if is_keyword_line(raw) {
+            break;
+        }
+        tokens.extend(tokenize_data(raw));
+        i += 1;
+    }
+    (tokens, i)
+}
+
+fn next_nonempty(lines: &[&str], mut i: usize) -> usize {
+    while i < lines.len() {
+        let raw = strip_comment(lines[i]);
+        if !raw.trim().is_empty() {
+            return i;
+        }
+        i += 1;
+    }
+    i
+}
+
+pub fn parse(inp: &str) -> Result<Model> {
+    let mut model = Model::new();
+    let owned: Vec<String> = inp.lines().map(|l| l.to_string()).collect();
+    let lines: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    let n = lines.len();
+    let mut i = 0;
+    let mut current_material: Option<String> = None;
+    let mut saw_step = false;
+
+    while i < n {
+        let raw = strip_comment(lines[i]);
+        if raw.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        if !is_keyword_line(raw) {
+            i += 1;
+            continue;
+        }
+        let (kw, params) = parse_keyword(raw);
+        match kw.as_str() {
+            "*HEADING" => {
+                i += 1;
+                i = next_nonempty(&lines, i);
+                if i < n && !is_keyword_line(lines[i]) {
+                    model.heading = lines[i].trim().to_string();
+                    i += 1;
+                }
+            }
+            "*NODE" => {
+                let nset = params.get("NSET").cloned();
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if toks.is_empty() {
+                    continue;
+                }
+                let stride = if toks.len() % 4 == 0 {
+                    4
+                } else if toks.len() % 3 == 0 {
+                    3
+                } else if toks.len() >= 4 {
+                    4
+                } else {
+                    3
+                };
+                let mut k = 0;
+                let mut added = Vec::new();
+                while k + stride - 1 < toks.len() {
+                    let id = parse_i32(&toks[k])?;
+                    let x = parse_f64(&toks[k + 1])?;
+                    let y = parse_f64(&toks[k + 2])?;
+                    let z = if stride == 4 {
+                        parse_f64(&toks[k + 3])?
+                    } else {
+                        0.0
+                    };
+                    k += stride;
+                    model.node_ids.push(id);
+                    model.coords.push([x, y, z]);
+                    added.push(id);
+                }
+                if k != toks.len() {
+                    model.warn(format!(
+                        "*NODE: {} Zahlen übrig, ignoriert.",
+                        toks.len() - k
+                    ));
+                }
+                if let Some(ns) = nset {
+                    model.nsets.entry(ns).or_default().extend(added);
+                }
+            }
+            "*ELEMENT" => {
+                let typ = params.get("TYPE").cloned().ok_or_else(|| {
+                    crate::error::FemError("*ELEMENT ohne TYPE=".into())
+                })?;
+                let kind = ElemKind::from_ccx(&typ).ok_or_else(|| {
+                    crate::error::FemError(format!(
+                        "Nicht unterstützter Elementtyp {typ}. Unterstützt: C3D8, C3D4, CPS4, CPE4, CPS3, CPE3."
+                    ))
+                })?;
+                let elset = params
+                    .get("ELSET")
+                    .cloned()
+                    .unwrap_or_else(|| "EALL".into());
+                let nn = kind.nnodes();
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut k = 0;
+                let mut added = Vec::new();
+                while k + nn < toks.len() {
+                    let id = parse_i32(&toks[k])?;
+                    k += 1;
+                    let mut nodes = Vec::with_capacity(nn);
+                    for _ in 0..nn {
+                        nodes.push(parse_i32(&toks[k])?);
+                        k += 1;
+                    }
+                    model.elements.push(Element {
+                        id,
+                        kind,
+                        nodes,
+                        elset: elset.clone(),
+                    });
+                    added.push(id);
+                }
+                if k != toks.len() {
+                    model.warn(format!(
+                        "ELEMENT {typ}: {} Zahlen übrig, ignoriert.",
+                        toks.len() - k
+                    ));
+                }
+                model.elsets.entry(elset).or_default().extend(added);
+            }
+            "*NSET" => {
+                let name = params.get("NSET").cloned().ok_or_else(|| {
+                    crate::error::FemError("*NSET ohne NSET=".into())
+                })?;
+                let generate = params.contains_key("GENERATE");
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut ids = Vec::new();
+                if generate {
+                    let mut k = 0;
+                    while k + 1 < toks.len() {
+                        let a = parse_i32(&toks[k])?;
+                        let b = parse_i32(&toks[k + 1])?;
+                        let step = if k + 2 < toks.len() {
+                            let s = parse_i32(&toks[k + 2]).unwrap_or(1);
+                            k += 3;
+                            if s == 0 { 1 } else { s }
+                        } else {
+                            k += 2;
+                            1
+                        };
+                        let mut v = a;
+                        if step > 0 {
+                            while v <= b {
+                                ids.push(v);
+                                v += step;
+                            }
+                        } else {
+                            while v >= b {
+                                ids.push(v);
+                                v += step;
+                            }
+                        }
+                    }
+                } else {
+                    for t in &toks {
+                        ids.push(parse_i32(t)?);
+                    }
+                }
+                model.nsets.entry(name).or_default().extend(ids);
+            }
+            "*ELSET" => {
+                let name = params.get("ELSET").cloned().ok_or_else(|| {
+                    crate::error::FemError("*ELSET ohne ELSET=".into())
+                })?;
+                let generate = params.contains_key("GENERATE");
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut ids = Vec::new();
+                if generate {
+                    let mut k = 0;
+                    while k + 1 < toks.len() {
+                        let a = parse_i32(&toks[k])?;
+                        let b = parse_i32(&toks[k + 1])?;
+                        let step = if k + 2 < toks.len() {
+                            let s = parse_i32(&toks[k + 2]).unwrap_or(1);
+                            k += 3;
+                            if s == 0 { 1 } else { s }
+                        } else {
+                            k += 2;
+                            1
+                        };
+                        let mut v = a;
+                        if step > 0 {
+                            while v <= b {
+                                ids.push(v);
+                                v += step;
+                            }
+                        } else {
+                            while v >= b {
+                                ids.push(v);
+                                v += step;
+                            }
+                        }
+                    }
+                } else {
+                    for t in &toks {
+                        ids.push(parse_i32(t)?);
+                    }
+                }
+                model.elsets.entry(name).or_default().extend(ids);
+            }
+            "*MATERIAL" => {
+                let name = params
+                    .get("NAME")
+                    .cloned()
+                    .unwrap_or_else(|| "MATERIAL-1".into());
+                model.materials.entry(name.clone()).or_default();
+                current_material = Some(name);
+                i += 1;
+            }
+            "*ELASTIC" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if toks.len() < 2 {
+                    return err("*ELASTIC benötigt E und nu");
+                }
+                let e = parse_f64(&toks[0])?;
+                let nu = parse_f64(&toks[1])?;
+                let name = current_material
+                    .clone()
+                    .unwrap_or_else(|| "MATERIAL-1".into());
+                let m = model.materials.entry(name).or_default();
+                m.e = e;
+                m.nu = nu;
+            }
+            "*DENSITY" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if toks.is_empty() {
+                    return err("*DENSITY ohne Wert");
+                }
+                let rho = parse_f64(&toks[0])?;
+                let name = current_material
+                    .clone()
+                    .unwrap_or_else(|| "MATERIAL-1".into());
+                model.materials.entry(name).or_default().density = rho;
+            }
+            "*SOLID SECTION" | "*SHELL SECTION" => {
+                let elset = params.get("ELSET").cloned().unwrap_or_else(|| "EALL".into());
+                if let Some(mat) = params.get("MATERIAL") {
+                    model.elset_material.insert(elset.clone(), mat.clone());
+                }
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let t = if !toks.is_empty() {
+                    parse_f64(&toks[0]).unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                model.elset_thickness.insert(elset, t);
+            }
+            "*BOUNDARY" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut k = 0;
+                while k < toks.len() {
+                    let name = toks[k].to_ascii_uppercase();
+                    k += 1;
+                    if k >= toks.len() {
+                        break;
+                    }
+                    let d1 = parse_i32(&toks[k])? as usize;
+                    k += 1;
+                    let d2 = if k < toks.len() && parse_i32(&toks[k]).is_ok() {
+                        let v = parse_i32(&toks[k])? as usize;
+                        k += 1;
+                        v
+                    } else {
+                        d1
+                    };
+                    let val = if k < toks.len() {
+                        // Could be next set name or a value. If it parses as float and
+                        // the token isn't an integer set name used later... values are
+                        // typically 0 or a float. If the next-next looks like a dof, this
+                        // is a new card.
+                        // Cards: name, d1, [d2, [val]]
+                        // Heuristic: if token has a dot/e or is 0, treat as value; if
+                        // remaining tokens after taking it wouldn't form a new card, take it.
+                        let peek = &toks[k];
+                        if peek.contains('.') || peek.contains('e') || peek.contains('E') {
+                            let v = parse_f64(peek)?;
+                            k += 1;
+                            v
+                        } else if parse_i32(peek).is_ok() && k + 1 < toks.len() {
+                            // Could be value 0 or start of next (node id).
+                            // If following token is a dof 1-6, this is a new card.
+                            let maybe_dof = parse_i32(&toks[k + 1]).ok();
+                            if maybe_dof == Some(1)
+                                || maybe_dof == Some(2)
+                                || maybe_dof == Some(3)
+                                || maybe_dof == Some(4)
+                                || maybe_dof == Some(5)
+                                || maybe_dof == Some(6)
+                            {
+                                0.0
+                            } else {
+                                let v = parse_f64(peek).unwrap_or(0.0);
+                                k += 1;
+                                v
+                            }
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    let nodes = if let Ok(id) = parse_i32(&name) {
+                        vec![id]
+                    } else {
+                        // nsets not yet complete — store as synthetic later
+                        model
+                            .nsets
+                            .get(&name)
+                            .cloned()
+                            .unwrap_or_else(|| vec![])
+                            .into_iter()
+                            .chain(if name.chars().all(|c| c.is_ascii_digit() || c == '-') {
+                                vec![]
+                            } else {
+                                // defer: keep a placeholder by recording the name in a special
+                                // node id list via a side channel — we re-expand after compact.
+                                Vec::new()
+                            })
+                            .collect()
+                    };
+                    // Store deferred BCs as node=-999999 and stash name in a warning-free list.
+                    // We'll expand after all sets exist: keep raw cards.
+                    if nodes.is_empty() && parse_i32(&name).is_err() {
+                        // record as deferred using a sentinel with name in heading? Use a
+                        // dedicated deferred buffer.
+                        // We'll push a Boundary per node after a second pass.
+                        // Encode the set name by pushing a fake node and keeping a parallel list.
+                    }
+                    let first = d1.max(1);
+                    let last = d2.max(first);
+                    if parse_i32(&name).is_ok() {
+                        let id = parse_i32(&name)?;
+                        for d in first..=last {
+                            if d >= 1 && d <= 3 {
+                                model.bcs.push(Boundary {
+                                    node: id,
+                                    dof: d - 1,
+                                    value: val,
+                                });
+                            }
+                        }
+                    } else {
+                        // stash in nsets later — put the name as a comment card via a
+                        // dedicated vec. We'll use a hack: node = i32::MIN, value unused,
+                        // and keep names in warnings? Better add deferred field.
+                        // Use elset_material-like: push to a temp via nsets if exists, else
+                        // store in materials? Let's add deferred via a string in model.warnings
+                        // prefix "BCSET|"
+                        for d in first..=last {
+                            if d >= 1 && d <= 3 {
+                                model.warnings.push(format!(
+                                    "__BC__|{name}|{}|{}|{val}",
+                                    d - 1,
+                                    d - 1
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            "*CLOAD" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut k = 0;
+                while k + 2 < toks.len() {
+                    let name = toks[k].to_ascii_uppercase();
+                    let dof = parse_i32(&toks[k + 1])? as usize;
+                    let mag = parse_f64(&toks[k + 2])?;
+                    k += 3;
+                    if dof < 1 || dof > 3 {
+                        model.warn(format!("CLOAD Freiheitsgrad {dof} ignoriert"));
+                        continue;
+                    }
+                    if let Ok(id) = parse_i32(&name) {
+                        model.cloads.push(Cload {
+                            node: id,
+                            dof: dof - 1,
+                            mag,
+                        });
+                    } else {
+                        model.warnings.push(format!("__CL__|{name}|{}|{mag}", dof - 1));
+                    }
+                }
+            }
+            "*DLOAD" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut k = 0;
+                while k + 1 < toks.len() {
+                    let name = toks[k].to_ascii_uppercase();
+                    let typ = toks[k + 1].to_ascii_uppercase();
+                    k += 2;
+                    if typ == "GRAV" {
+                        if k + 3 >= toks.len() {
+                            return err("*DLOAD GRAV benötigt Betrag und Richtung");
+                        }
+                        let mag = parse_f64(&toks[k])?;
+                        let dx = parse_f64(&toks[k + 1])?;
+                        let dy = parse_f64(&toks[k + 2])?;
+                        let dz = parse_f64(&toks[k + 3])?;
+                        k += 4;
+                        model.dloads.push(Dload::Grav {
+                            mag,
+                            dir: [dx, dy, dz],
+                        });
+                    } else if typ.starts_with('P') {
+                        if k >= toks.len() {
+                            return err("*DLOAD P ohne Betrag");
+                        }
+                        let mag = parse_f64(&toks[k])?;
+                        k += 1;
+                        let face = if typ == "P" {
+                            0
+                        } else {
+                            typ.trim_start_matches('P').parse::<i32>().unwrap_or(0)
+                        };
+                        if let Ok(id) = parse_i32(&name) {
+                            model.dloads.push(Dload::Pressure {
+                                elem: id,
+                                face,
+                                mag,
+                            });
+                        } else {
+                            model.warnings.push(format!("__DL__|{name}|{face}|{mag}"));
+                        }
+                    } else {
+                        model.warn(format!("DLOAD-Typ {typ} nicht unterstützt"));
+                        // skip one magnitude if present
+                        if k < toks.len() && parse_f64(&toks[k]).is_ok() {
+                            k += 1;
+                        }
+                    }
+                }
+            }
+            "*STEP" => {
+                saw_step = true;
+                if params.contains_key("NLGEOM") {
+                    model.warn("NLGEOM wird ignoriert — nur linear-statisch.");
+                }
+                i += 1;
+            }
+            "*STATIC" => {
+                let (_toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+            }
+            "*END STEP" => {
+                i += 1;
+            }
+            "*NODE FILE" | "*NODE OUTPUT" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                model.output_u = false;
+                model.output_rf = false;
+                for t in toks {
+                    match t.to_ascii_uppercase().as_str() {
+                        "U" => model.output_u = true,
+                        "RF" => model.output_rf = true,
+                        _ => {}
+                    }
+                }
+                if !model.output_u && !model.output_rf {
+                    model.output_u = true;
+                }
+            }
+            "*EL FILE" | "*ELEMENT OUTPUT" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                model.output_s = false;
+                model.output_e = false;
+                for t in toks {
+                    match t.to_ascii_uppercase().as_str() {
+                        "S" => model.output_s = true,
+                        "E" => model.output_e = true,
+                        _ => {}
+                    }
+                }
+                if !model.output_s && !model.output_e {
+                    model.output_s = true;
+                }
+            }
+            "*NODE PRINT" | "*EL PRINT" => {
+                let (_toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+            }
+            "*INCLUDE" => {
+                model.warn("*INCLUDE wird nicht unterstützt.");
+                i += 1;
+            }
+            "*PREPRINT" | "*END STEP " => {
+                i += 1;
+            }
+            other => {
+                if other.starts_with('*') {
+                    match other {
+                        "*FREQUENCY" | "*DYNAMIC" | "*BUCKLE" | "*HEAT TRANSFER"
+                        | "*COUPLED TEMPERATURE-DISPLACEMENT" | "*VISCO" | "*CREEP" => {
+                            return err(format!(
+                                "{other} nicht unterstützt. Axia rechnet linear-statisch (*STATIC)."
+                            ));
+                        }
+                        "*PLASTIC" | "*CONTACT" | "*TIE" | "*EQUATION" | "*TRANSFORM"
+                        | "*AMPLITUDE" | "*INITIAL CONDITIONS" | "*TEMPERATURE" | "*ORIENTATION" => {
+                            model.warn(format!("{other} wird ignoriert."));
+                            let (_toks, ni) = collect_tokens(&lines, i + 1);
+                            i = ni;
+                        }
+                        _ => {
+                            model.warn(format!("Unbekanntes Schlüsselwort {other} — ignoriert."));
+                            let (_toks, ni) = collect_tokens(&lines, i + 1);
+                            i = ni;
+                        }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    if model.node_ids.is_empty() {
+        return err("Keine Knoten (*NODE) im Eingabedeck.");
+    }
+    if model.elements.is_empty() {
+        return err("Keine Elemente (*ELEMENT) im Eingabedeck.");
+    }
+    if model.materials.is_empty() {
+        model.warn("Kein *MATERIAL — E=210000, nu=0.3 angenommen.");
+        model.materials.insert("STEEL".into(), Material::default());
+    }
+    if !saw_step {
+        model.warn("Kein *STEP — linear-statischer Schritt angenommen.");
+    }
+
+    model.compact();
+    expand_deferred(&mut model)?;
+    Ok(model)
+}
+
+fn expand_deferred(model: &mut Model) -> Result<()> {
+    let mut keep_warn = Vec::new();
+    let warnings = std::mem::take(&mut model.warnings);
+    for w in warnings {
+        if let Some(rest) = w.strip_prefix("__BC__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 4 {
+                let name = p[0];
+                let dof: usize = p[1].parse().unwrap_or(0);
+                let val: f64 = p[3].parse().unwrap_or(0.0);
+                let nodes = model.expand_nset(name)?;
+                for node in nodes {
+                    model.bcs.push(Boundary {
+                        node,
+                        dof,
+                        value: val,
+                    });
+                }
+            }
+        } else if let Some(rest) = w.strip_prefix("__CL__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 3 {
+                let name = p[0];
+                let dof: usize = p[1].parse().unwrap_or(0);
+                let mag: f64 = p[2].parse().unwrap_or(0.0);
+                let nodes = model.expand_nset(name)?;
+                for node in nodes {
+                    model.cloads.push(Cload { node, dof, mag });
+                }
+            }
+        } else if let Some(rest) = w.strip_prefix("__DL__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 3 {
+                let name = p[0];
+                let face: i32 = p[1].parse().unwrap_or(0);
+                let mag: f64 = p[2].parse().unwrap_or(0.0);
+                let elems = model.expand_elset(name)?;
+                for elem in elems {
+                    model.dloads.push(Dload::Pressure { elem, face, mag });
+                }
+            }
+        } else {
+            keep_warn.push(w);
+        }
+    }
+    model.warnings = keep_warn;
+    Ok(())
+}

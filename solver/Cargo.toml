@@ -1,0 +1,19 @@
+[package]
+name = "axia-fem"
+version = "0.1.0"
+edition = "2021"
+description = "Linear static FEM solver with CalculiX INP/FRD compatibility"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "=0.2.128"
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
