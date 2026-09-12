@@ -7,6 +7,7 @@ mod error;
 mod eigen;
 mod extra;
 mod frd;
+mod heat;
 mod inp;
 mod linalg;
 mod model;
@@ -60,7 +61,8 @@ fn mesh_json(model: &Model) -> Value {
                 "E": m.e,
                 "nu": m.nu,
                 "density": m.density,
-        "alpha": m.alpha,
+                "alpha": m.alpha,
+                "conductivity": m.conductivity,
             })
         })
         .collect();
@@ -1392,5 +1394,161 @@ nlgeom hex
             e.contains("T3D2") || e.contains("NLGEOM"),
             "unexpected error: {e}"
         );
+    }
+
+    #[test]
+    fn heat_t3d2_linear() {
+        let inp = r#"
+*HEADING
+heat bar
+*NODE
+1, 0, 0, 0
+2, 500, 0, 0
+3, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+2, 2, 3
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*CONDUCTIVITY
+50
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+1
+*BOUNDARY
+1, 11, 11, 0
+3, 11, 11, 100
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*NODE FILE
+NT
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        assert!(out.procedure.contains("HEAT"));
+        let t2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((t2 - 50.0).abs() < 1e-6, "T2={t2}, expected 50");
+        assert!(out.frd.contains("NDTEMP") || out.frd.contains("NT"));
+        assert!(out.dat.contains("temperatures"));
+    }
+
+    #[test]
+    fn heat_c3d8_patch() {
+        let inp = r#"
+*HEADING
+heat hex
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+*ELEMENT, TYPE=C3D8, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*CONDUCTIVITY
+25
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*NSET, NSET=COLD
+1, 4, 5, 8
+*NSET, NSET=HOT
+2, 3, 6, 7
+*BOUNDARY
+COLD, 11, 11, 0
+HOT, 11, 11, 100
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        for (i, &id) in out.model.node_ids.iter().enumerate() {
+            let x = out.model.coords[i][0];
+            let t = out.u[i][0];
+            let expect = 10.0 * x;
+            assert!(
+                (t - expect).abs() < 1e-6,
+                "node {id} T={t}, expected {expect}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_sdof_half_period() {
+        // k = EA/L = 100, m_lumped free = ρAL/2 = 1 → ω = 10 rad/s
+        // u(0)=0.01, v(0)=0 → u(π/10) = -0.01
+        let inp = r#"
+*HEADING
+sdof
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+100, 0.0
+*DENSITY
+2.0
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+1.0
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*INITIAL CONDITIONS, TYPE=DISPLACEMENT
+2, 1, 0.01
+*STEP
+*DYNAMIC
+0.005, 0.3141592653589793
+*NODE FILE
+U
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        assert!(out.procedure.contains("DYNAMIC"));
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!(
+            (u2 + 0.01).abs() < 5e-4,
+            "u2={u2}, expected -0.01 at T/2"
+        );
+        assert!(out.solver.contains("Newmark"), "solver={}", out.solver);
+    }
+
+    #[test]
+    fn amplitude_ramps_static_end() {
+        // At t=0 amplitude is unused in STATIC; load is the CLOAD magnitude.
+        let inp = r#"
+*HEADING
+amp static
+*NODE
+1, 0, 0, 0
+2, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+200
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*AMPLITUDE, NAME=RAMP
+0, 0
+1, 1
+*STEP
+*STATIC
+*CLOAD, AMPLITUDE=RAMP
+2, 1, 21000
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        // STATIC uses amp(t=0)=0 → u=0
+        assert!(u2.abs() < 1e-8, "static amp(0) ux={u2}");
     }
 }

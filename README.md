@@ -9,7 +9,7 @@ Zwei Frontends, ein Solver:
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
 
-**1.0** — linear-statisch, Eigenfrequenz, Beulen, Wärmedehnung; **NLGEOM** und **\*PLASTIC** (J2, 1D) für T3D2-Fachwerke.
+**1.1** — linear-statisch, Eigenfrequenz, Beulen, Wärmeleitung (`*HEAT TRANSFER`), implizite Dynamik (`*DYNAMIC`); **NLGEOM** und **\*PLASTIC** (J2, 1D) für T3D2-Fachwerke.
 
 ## CLI
 
@@ -43,6 +43,8 @@ Mitgelieferte Decks in [`examples/`](examples/):
 | `thermal_bar.inp` | eingespannter Stab, `*EXPANSION` / `*TEMPERATURE` |
 | `nlgeom_truss.inp` | T3D2 `*STEP, NLGEOM`, kleine Dehnung \(u=FL/EA\) |
 | `plastic_bar.inp` | T3D2 `*PLASTIC` (isotrope Verfestigung), \(u\approx 3{,}095\) |
+| `heat_bar.inp` | stationäre Wärmeleitung T3D2, \(T(L/2)=50\) |
+| `dynamic_sdof.inp` | Newmark, SDOF \(u(T/2)=-u_0\) |
 
 ### Binary bauen
 
@@ -84,6 +86,8 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 - Lasten und Lager: `*BOUNDARY` (DOF 1–6), `*CLOAD`, `*DLOAD` (`P`, `P1…P6`, `GRAV`, `PX`/`PY`/`PZ`)
 - Linear-statische Analyse, isotrope Elastizität, MPC-Elimination (`*EQUATION`)
 - `*FREQUENCY` (lumped mass, inverse subspace) und `*BUCKLE` (geometrische Steifigkeit)
+- `*HEAT TRANSFER, STEADY STATE` — Wärmeleitung (T3D2, B31, C3D8, CPS4), `*CONDUCTIVITY`, `*DFLUX`/`*FILM`/`*CFLUX`, NT = DOF 11
+- `*DYNAMIC` — implizites Newmark (\(\beta=1/4,\gamma=1/2\)), `*DAMPING` (Rayleigh), `*AMPLITUDE`, `*INITIAL CONDITIONS`
 - `*EXPANSION` + `*TEMPERATURE` (isotrope Wärmedehnung, T3D2 und C3D8*)
 - `*STEP, NLGEOM` — geometrisch nichtlineare Statik, **T3D2** (korotational, Newton)
 - `*PLASTIC` — J2 mit isotroper Verfestigung, **T3D2** (Kurve \(\sigma_y(\bar\varepsilon^p)\))
@@ -189,6 +193,36 @@ Korotationaler Fachwerkstab: Materialtangent \(E_t A/L_0\) plus geometrische Ste
 
 CalculiX-Reihenfolge \(\sigma_y, \bar\varepsilon^p\). 1D-J2, \(\varepsilon=\sigma/E+\bar\varepsilon^p\). Kontinuum (C3D8 …) und gemischte Netze mit NLGEOM/`*PLASTIC` werden abgelehnt.
 
+### Wärmeleitung und Dynamik (1.1)
+
+```
+*CONDUCTIVITY
+50
+*BOUNDARY
+1, 11, 11, 0
+3, 11, 11, 100
+*STEP
+*HEAT TRANSFER, STEADY STATE
+```
+
+Stationäre Leitung \(K T = F\). NT ist DOF 11. `*DFLUX` (`BF`, `S1`…`S6`), `*FILM` (`F1`…`F6`), `*CFLUX`. Elemente: T3D2, B31, C3D8, CPS4. FRD-Block `NDTEMP`.
+
+```
+*INITIAL CONDITIONS, TYPE=DISPLACEMENT
+2, 1, 0.01
+*AMPLITUDE, NAME=RAMP
+0, 0
+1, 1
+*DAMPING, ALPHA=0, BETA=0
+*STEP
+*DYNAMIC
+0.005, 0.314159265
+*CLOAD, AMPLITUDE=RAMP
+2, 1, 10
+```
+
+Newmark (mittlere Beschleunigung). Lumped mass wie `*FREQUENCY`. Lasten mit `*AMPLITUDE` zeitabhängig. Ausgabe: letzter Zeitschritt.
+
 ## Beispiele und Checks
 
 | Beispiel | Erwartung |
@@ -198,6 +232,8 @@ CalculiX-Reihenfolge \(\sigma_y, \bar\varepsilon^p\). 1D-J2, \(\varepsilon=\sigm
 | T3D2 / `*EQUATION` | \(u = FL/EA\); zwei Stäbe in Serie \(u_{\mathrm{tip}}=0{,}5\) |
 | T3D2 NLGEOM | kleine Dehnung: \(u=0{,}5\) |
 | T3D2 `*PLASTIC` | \(\sigma=250\), \(u\approx 3{,}095\) (über elastisch \(1{,}19\)) |
+| Wärmeleitung T3D2 | \(T(0)=0\), \(T(L)=100\) → \(T(L/2)=50\) |
+| SDOF `*DYNAMIC` | \(k=100\), \(m=1\), \(u(T/2)=-u_0\) |
 | Kragträger B32 | Timoshenko \(\delta = PL^3/3EI + PL/kAG \approx 0{,}1906\) |
 | Kragplatte S4R | Euler \(\delta \approx 1{,}905\) (8×2, \(\nu=0\): \(\lvert u\rvert_{\max} \approx 1{,}83\)) |
 | Quadratplatte S4R | Kirchhoff \(\delta_{\max} \approx 0{,}00406\,qa^4/D \approx 0{,}211\) |

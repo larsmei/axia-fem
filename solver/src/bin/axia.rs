@@ -268,6 +268,15 @@ fn print_solve_summary(out: &SolveOutput) {
         let s: Vec<String> = out.buckles.iter().map(|f| format!("{f:.6}")).collect();
         eprintln!("  buckle λ   {}", s.join(", "));
     }
+    if out.procedure.contains("HEAT") {
+        let mut tmax = f64::MIN;
+        let mut tmin = f64::MAX;
+        for p in &out.u {
+            tmax = tmax.max(p[0]);
+            tmin = tmin.min(p[0]);
+        }
+        eprintln!("  NT         {tmin:.6} … {tmax:.6}");
+    }
     eprintln!(
         "  dofs       {}  ({} free)",
         out.ndof, out.nfree

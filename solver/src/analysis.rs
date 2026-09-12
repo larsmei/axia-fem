@@ -10,8 +10,9 @@ use crate::elem::{
 use crate::error::{err, Result};
 use crate::extra;
 use crate::frd;
+use crate::heat;
 use crate::linalg::solve_kff;
-use crate::model::{Dload, ElemKind, Model, Procedure};
+use crate::model::{Dload, ElemKind, FluxKind, InitKind, Model, Procedure};
 use crate::quadratic;
 use crate::shell;
 
@@ -53,6 +54,9 @@ fn dof_of(ndn: usize, node_index: usize, dir: usize) -> usize {
 
 pub fn solve(model: Model) -> Result<SolveOutput> {
     let t0 = now_ms();
+    if matches!(model.procedure, Procedure::HeatTransfer { .. }) {
+        return solve_heat(model, t0);
+    }
     let nlgeom = matches!(
         model.procedure,
         Procedure::Static { nlgeom: true, .. }
@@ -123,13 +127,6 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
 
     let mut f_full = vec![0.0; ndof];
     let mut m_full = vec![0.0; ndof];
-    for c in &model.cloads {
-        if c.dof >= ndn {
-            continue;
-        }
-        let ni = model.node_index(c.node)?;
-        f_full[dof_of(ndn, ni, c.dof)] += c.mag;
-    }
 
     let mut trips: Vec<(usize, usize, f64)> = Vec::new();
     for el in &model.elements {
@@ -291,6 +288,18 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         }
     }
 
+    add_cloads(&model, ndn, 0.0, &mut f_full)?;
+    let f_dload = {
+        let mut f = f_full.clone();
+        // strip t=0 cloads so Dynamic can re-apply with amplitude(t)
+        let mut clo = vec![0.0; ndof];
+        add_cloads(&model, ndn, 0.0, &mut clo)?;
+        for i in 0..ndof {
+            f[i] -= clo[i];
+        }
+        f
+    };
+
     let mpcs = constraint::build_all_mpcs(&model, ndn)?;
     let map = DofMap::build(ndof, &prescribed, &mpcs)?;
     let nfree = map.n_ind;
@@ -330,6 +339,23 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         residual = 0.0;
         let mode0 = ev.vectors.first().cloned().unwrap_or_else(|| vec![0.0; nfree]);
         map.reconstruct(&mode0)
+    } else if let Procedure::Dynamic { dt, period } = model.procedure {
+        let (u_dyn, name, it, res) = newmark(
+            &model,
+            ndn,
+            ndof,
+            nfree,
+            &map,
+            &trips,
+            &m_full,
+            &f_dload,
+            dt,
+            period,
+        )?;
+        solver = name;
+        iters = it;
+        residual = res;
+        u_dyn
     } else {
         let (ff_trips, rhs) = map.reduce(&trips, &f_full);
         let solved = solve_kff(nfree, ff_trips, &rhs)?;
@@ -687,6 +713,375 @@ fn scatter_fe(fe: &[f64], gdofs: &[usize], fe_dim: usize, local_dim: usize, f_fu
             f_full[gdofs[a * local_dim + d]] += fe[a * fe_dim + d];
         }
     }
+}
+
+fn add_cloads(model: &Model, ndn: usize, t: f64, f: &mut [f64]) -> Result<()> {
+    for c in &model.cloads {
+        if c.dof >= ndn {
+            continue;
+        }
+        let ni = model.node_index(c.node)?;
+        let s = model.amp_value(&c.amplitude, t);
+        f[dof_of(ndn, ni, c.dof)] += c.mag * s;
+    }
+    Ok(())
+}
+
+fn newmark(
+    model: &Model,
+    ndn: usize,
+    ndof: usize,
+    nfree: usize,
+    map: &DofMap,
+    trips: &[(usize, usize, f64)],
+    m_full: &[f64],
+    f_dload: &[f64],
+    dt_in: f64,
+    period: f64,
+) -> Result<(Vec<f64>, String, usize, f64)> {
+    if nfree == 0 {
+        return Ok((map.u0.clone(), "prescribed".into(), 0, 0.0));
+    }
+    let mut m_ind = vec![0.0; nfree];
+    for d in 0..ndof {
+        for &(a, ta) in &map.t_row[d] {
+            m_ind[a] += ta * ta * m_full[d];
+        }
+    }
+    if m_ind.iter().all(|v| *v <= 0.0) {
+        return err("*DYNAMIC: *DENSITY fehlt oder Masse ist null.");
+    }
+    let nsteps = ((period / dt_in).round() as usize).clamp(1, 20_000);
+    let dt = period / nsteps as f64;
+    let beta = 0.25_f64;
+    let gamma = 0.5_f64;
+    let a0 = 1.0 / (beta * dt * dt);
+    let a1 = gamma / (beta * dt);
+    let a2 = 1.0 / (beta * dt);
+    let a3 = 1.0 / (2.0 * beta) - 1.0;
+    let a4 = gamma / beta - 1.0;
+    let a5 = dt * (gamma / (2.0 * beta) - 1.0);
+    let alpha_r = model.damp_alpha;
+    let beta_r = model.damp_beta;
+
+    let k_scale = 1.0 + a1 * beta_r;
+    let m_scale = a0 + a1 * alpha_r;
+    let mut keff_trips: Vec<(usize, usize, f64)> = trips
+        .iter()
+        .map(|&(i, j, v)| (i, j, v * k_scale))
+        .collect();
+    for d in 0..ndof {
+        if m_full[d].abs() > 0.0 {
+            keff_trips.push((d, d, m_full[d] * m_scale));
+        }
+    }
+
+    let mut u_full = map.u0.clone();
+    for ic in &model.init {
+        if ic.kind != InitKind::Displacement || ic.dof >= ndn {
+            continue;
+        }
+        if let Ok(ni) = model.node_index(ic.node) {
+            let d = dof_of(ndn, ni, ic.dof);
+            if d < ndof && map.ind_of[d] >= 0 {
+                u_full[d] = ic.value;
+            }
+        }
+    }
+    let mut v_full = vec![0.0; ndof];
+    for ic in &model.init {
+        if ic.kind != InitKind::Velocity || ic.dof >= ndn {
+            continue;
+        }
+        if let Ok(ni) = model.node_index(ic.node) {
+            let d = dof_of(ndn, ni, ic.dof);
+            if d < ndof {
+                v_full[d] = ic.value;
+            }
+        }
+    }
+
+    let mut f0 = f_dload.to_vec();
+    add_cloads(model, ndn, 0.0, &mut f0)?;
+    let mut ku = vec![0.0; ndof];
+    let mut kv = vec![0.0; ndof];
+    for &(i, j, v) in trips {
+        ku[i] += v * u_full[j];
+        kv[i] += v * v_full[j];
+    }
+    let mut a_full = vec![0.0; ndof];
+    for i in 0..ndof {
+        if map.ind_of[i] < 0 {
+            v_full[i] = 0.0;
+            continue;
+        }
+        let rhs = f0[i] - ku[i] - alpha_r * m_full[i] * v_full[i] - beta_r * kv[i];
+        if m_full[i].abs() > 1e-30 {
+            a_full[i] = rhs / m_full[i];
+        }
+    }
+
+    let mut solver_name = String::new();
+    let mut residual = 0.0;
+    for step in 1..=nsteps {
+        let t = step as f64 * dt;
+        let mut f_t = f_dload.to_vec();
+        add_cloads(model, ndn, t, &mut f_t)?;
+        let mut reff = f_t;
+        for i in 0..ndof {
+            reff[i] += m_full[i] * (a0 * u_full[i] + a2 * v_full[i] + a3 * a_full[i]);
+        }
+        let mut pred = vec![0.0; ndof];
+        for i in 0..ndof {
+            pred[i] = a1 * u_full[i] + a4 * v_full[i] + a5 * a_full[i];
+        }
+        for i in 0..ndof {
+            reff[i] += alpha_r * m_full[i] * pred[i];
+        }
+        let mut kpred = vec![0.0; ndof];
+        for &(i, j, v) in trips {
+            kpred[i] += v * pred[j];
+        }
+        for i in 0..ndof {
+            reff[i] += beta_r * kpred[i];
+        }
+        let (ff, rhs) = map.reduce(&keff_trips, &reff);
+        let solved = solve_kff(nfree, ff, &rhs)?;
+        solver_name = solved.name;
+        residual = solved.residual;
+        let u_new = map.reconstruct(&solved.x);
+        let mut a_new = vec![0.0; ndof];
+        let mut v_new = vec![0.0; ndof];
+        for i in 0..ndof {
+            if map.ind_of[i] < 0 {
+                continue;
+            }
+            a_new[i] = a0 * (u_new[i] - u_full[i]) - a2 * v_full[i] - a3 * a_full[i];
+            v_new[i] = v_full[i] + dt * ((1.0 - gamma) * a_full[i] + gamma * a_new[i]);
+        }
+        u_full = u_new;
+        v_full = v_new;
+        a_full = a_new;
+    }
+    Ok((
+        u_full,
+        format!("Newmark ({solver_name}, {nsteps} steps)"),
+        nsteps,
+        residual,
+    ))
+}
+
+fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
+    let nnode = model.node_ids.len();
+    let ndof = nnode;
+    let mut prescribed: HashMap<usize, f64> = HashMap::new();
+    for bc in &model.thermal_bcs {
+        let ni = model.node_index(bc.node)?;
+        prescribed.insert(ni, bc.value);
+    }
+    for ic in &model.init {
+        if ic.kind == InitKind::Temperature {
+            let ni = model.node_index(ic.node)?;
+            prescribed.entry(ni).or_insert(ic.value);
+        }
+    }
+    if prescribed.is_empty() && model.films.is_empty() {
+        return err("*HEAT TRANSFER: keine Temperatur-Randbedingung (DOF 11) und kein *FILM.");
+    }
+
+    let mut trips: Vec<(usize, usize, f64)> = Vec::new();
+    let mut f = vec![0.0; ndof];
+    let mut c_diag = vec![0.0; ndof];
+    for el in &model.elements {
+        let xyz = elem_xyz(&model, &el.nodes)?;
+        let mat = model.material_for(el)?;
+        let kth = mat.conductivity;
+        if kth <= 0.0 {
+            return err(format!(
+                "*HEAT TRANSFER: *CONDUCTIVITY fehlt für Element {} (ELSET={}).",
+                el.id, el.elset
+            ));
+        }
+        let area = if el.kind.is_beam() {
+            model.beam_section_for(el)?.area
+        } else {
+            model.thickness_for(el)
+        };
+        let (ke, vol) = heat::element_conductivity(el.kind, &xyz, kth, area)?;
+        let nn = el.kind.nnodes();
+        let mut gdofs = Vec::with_capacity(nn);
+        for &id in &el.nodes {
+            gdofs.push(model.node_index(id)?);
+        }
+        for i in 0..nn {
+            for j in 0..nn {
+                let v = ke[i * nn + j];
+                if v.abs() > 0.0 {
+                    trips.push((gdofs[i], gdofs[j], v));
+                }
+            }
+        }
+        if mat.density.abs() > 0.0 && mat.specific_heat.abs() > 0.0 && vol.abs() > 0.0 {
+            let ci = mat.density * mat.specific_heat * vol / nn as f64;
+            for &g in &gdofs {
+                c_diag[g] += ci;
+            }
+        }
+        for df in &model.dfluxes {
+            if df.elem != el.id {
+                continue;
+            }
+            match df.kind {
+                FluxKind::Body => {
+                    let fe = heat::element_body_heat(el.kind, &xyz, df.mag, area)?;
+                    for a in 0..nn.min(fe.len()) {
+                        f[gdofs[a]] += fe[a];
+                    }
+                }
+                FluxKind::Face(face) if face >= 1 => {
+                    if matches!(
+                        el.kind,
+                        ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R
+                    ) {
+                        let (_ke_f, fe) = heat::hex8_face_heat(&xyz, face, df.mag, 0.0, 0.0)?;
+                        for a in 0..8 {
+                            f[gdofs[a]] += fe[a];
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for fm in &model.films {
+            if fm.elem != el.id {
+                continue;
+            }
+            if matches!(
+                el.kind,
+                ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R
+            ) && fm.face >= 1
+            {
+                let (ke_f, fe) = heat::hex8_face_heat(&xyz, fm.face, 0.0, fm.h, fm.t_inf)?;
+                for a in 0..8 {
+                    f[gdofs[a]] += fe[a];
+                    for b in 0..8 {
+                        let v = ke_f[a * 8 + b];
+                        if v.abs() > 0.0 {
+                            trips.push((gdofs[a], gdofs[b], v));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for cf in &model.cfluxes {
+        let ni = model.node_index(cf.node)?;
+        f[ni] += cf.mag;
+    }
+
+    let (steady, dt, period) = match model.procedure {
+        Procedure::HeatTransfer {
+            steady,
+            dt,
+            period,
+        } => (steady, dt, period),
+        _ => (true, 0.0, 0.0),
+    };
+
+    let mpcs: Vec<crate::constraint::Mpc> = Vec::new();
+    let map = DofMap::build(ndof, &prescribed, &mpcs)?;
+    let nfree = map.n_ind;
+    let mut t_full = map.u0.clone();
+    for ic in &model.init {
+        if ic.kind == InitKind::Temperature {
+            if let Ok(ni) = model.node_index(ic.node) {
+                if map.ind_of[ni] >= 0 {
+                    t_full[ni] = ic.value;
+                }
+            }
+        }
+    }
+    let mut solver = "prescribed".to_string();
+    let mut residual = 0.0;
+    let mut iters = 1usize;
+    if nfree > 0 {
+        if !steady && dt > 0.0 && period > 0.0 && c_diag.iter().any(|v| *v > 0.0) {
+            let nsteps = ((period / dt).round() as usize).clamp(1, 20_000);
+            let h = period / nsteps as f64;
+            let mut kdt = trips.clone();
+            for i in 0..ndof {
+                if c_diag[i].abs() > 0.0 {
+                    kdt.push((i, i, c_diag[i] / h));
+                }
+            }
+            for _ in 0..nsteps {
+                let mut rhs_full = f.clone();
+                for i in 0..ndof {
+                    rhs_full[i] += c_diag[i] / h * t_full[i];
+                }
+                let (ff, rhs) = map.reduce(&kdt, &rhs_full);
+                let solved = solve_kff(nfree, ff, &rhs)?;
+                solver = solved.name;
+                residual = solved.residual;
+                t_full = map.reconstruct(&solved.x);
+            }
+            solver = format!("backward-Euler ({solver}, {nsteps} steps)");
+            iters = nsteps;
+        } else {
+            let (ff, rhs) = map.reduce(&trips, &f);
+            let solved = solve_kff(nfree, ff, &rhs)?;
+            solver = solved.name;
+            residual = solved.residual;
+            t_full = map.reconstruct(&solved.x);
+        }
+    }
+
+    let mut kt = vec![0.0; ndof];
+    for &(i, j, v) in &trips {
+        kt[i] += v * t_full[j];
+    }
+    let mut rf_full = vec![0.0; ndof];
+    for i in 0..ndof {
+        rf_full[i] = kt[i] - f[i];
+    }
+
+    let mut u = vec![[0.0; 3]; nnode];
+    let mut rf = vec![[0.0; 3]; nnode];
+    for i in 0..nnode {
+        u[i][0] = t_full[i];
+        rf[i][0] = rf_full[i];
+    }
+    let ur = vec![[0.0; 3]; nnode];
+    let rm = vec![[0.0; 3]; nnode];
+    let stress = vec![[0.0; 6]; nnode];
+    let strain = vec![[0.0; 6]; nnode];
+    let vm = vec![0.0; nnode];
+    let stress_gp = Vec::new();
+    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain);
+    let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
+    let procedure = model.procedure.name().to_string();
+    Ok(SolveOutput {
+        model,
+        u,
+        ur,
+        rf,
+        rm,
+        stress,
+        strain,
+        von_mises: vm,
+        stress_gp,
+        frd: frd_s,
+        dat: dat_s,
+        nfree,
+        ndof,
+        solver,
+        iters,
+        residual,
+        time_ms: now_ms() - t0,
+        procedure,
+        frequencies: Vec::new(),
+        buckles: Vec::new(),
+    })
 }
 
 #[cfg(target_arch = "wasm32")]

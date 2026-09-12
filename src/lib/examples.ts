@@ -791,6 +791,67 @@ S
 *END STEP
 `,
   },
+  {
+    id: "heat",
+    name: "Wärmeleitung T3D2",
+    blurb: "*HEAT TRANSFER, T(L/2)=50",
+    inp: `*HEADING
+1D conduction, T(0)=0, T(L)=100 → Tmid=50
+*NODE
+1, 0, 0, 0
+2, 500, 0, 0
+3, 1000, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+2, 2, 3
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*CONDUCTIVITY
+50
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+1
+*BOUNDARY
+1, 11, 11, 0
+3, 11, 11, 100
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*NODE FILE
+NT
+*END STEP
+`,
+  },
+  {
+    id: "dynamic",
+    name: "SDOF Newmark",
+    blurb: "*DYNAMIC, freie Schwingung u(T/2)=−u0",
+    inp: `*HEADING
+T3D2 SDOF, ω=10 rad/s, u(0)=0.01 → u(π/10)=-0.01
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1, 1, 2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+100, 0.0
+*DENSITY
+2.0
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+1.0
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*INITIAL CONDITIONS, TYPE=DISPLACEMENT
+2, 1, 0.01
+*STEP
+*DYNAMIC
+0.005, 0.3141592653589793
+*NODE FILE
+U
+*END STEP
+`,
+  },
 ];
 
 export const DEFAULT_EXAMPLE = EXAMPLES[0];

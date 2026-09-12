@@ -1,4 +1,4 @@
-use crate::model::Model;
+use crate::model::{Model, Procedure};
 
 fn e12(v: f64) -> String {
     // Fortran-like 12.5E, always 12 chars. Rust's {:12.5E} is close.
@@ -31,8 +31,8 @@ pub fn write_frd(
     o.push_str("    1UTIME              18:00:00\n");
     o.push_str("    1UHOST              axia\n");
     o.push_str("    1UPGM               Axia FEM\n");
-    o.push_str("    1UVERSION           1.0\n");
-    o.push_str("    1UCODE              CalculiX-compatible linear static\n");
+    o.push_str("    1UVERSION           1.1\n");
+    o.push_str("    1UCODE              CalculiX-compatible Axia FEM\n");
 
     let nn = model.node_ids.len() as i32;
     o.push_str(&format!("    2C{nn:>18}{:>38}\n", 1));
@@ -66,7 +66,34 @@ pub fn write_frd(
 
     o.push_str("    1PSTEP                          1           1           1\n");
 
-    if model.output_u {
+    let heat = matches!(model.procedure, Procedure::HeatTransfer { .. });
+    if heat || model.output_nt {
+        write_result_block(
+            &mut o,
+            201,
+            nn,
+            "NDTEMP",
+            1,
+            &[("NT", 1, 1, 0)],
+            false,
+            &model.node_ids,
+            &u.iter().map(|v| vec![v[0]]).collect::<Vec<_>>(),
+        );
+        if model.output_rf {
+            write_result_block(
+                &mut o,
+                202,
+                nn,
+                "RFL",
+                1,
+                &[("RFL", 1, 1, 0)],
+                false,
+                &model.node_ids,
+                &rf.iter().map(|v| vec![v[0]]).collect::<Vec<_>>(),
+            );
+        }
+    }
+    if !heat && model.output_u {
         write_result_block(
             &mut o,
             101,
@@ -84,7 +111,7 @@ pub fn write_frd(
             &u.iter().map(|v| vec![v[0], v[1], v[2]]).collect::<Vec<_>>(),
         );
     }
-    if model.output_rf {
+    if !heat && model.output_rf {
         write_result_block(
             &mut o,
             102,
@@ -104,7 +131,7 @@ pub fn write_frd(
                 .collect::<Vec<_>>(),
         );
     }
-    if model.output_s {
+    if !heat && model.output_s {
         write_result_block(
             &mut o,
             103,
@@ -127,7 +154,7 @@ pub fn write_frd(
                 .collect::<Vec<_>>(),
         );
     }
-    if model.output_e {
+    if !heat && model.output_e {
         write_result_block(
             &mut o,
             104,

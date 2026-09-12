@@ -24,7 +24,11 @@ fn residual(csr: &Csr, x: &[f64], b: &[f64]) -> f64 {
 }
 
 fn announce(name: &str) {
-    eprintln!("axia: sparse solver: {name}");
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::Relaxed) {
+        eprintln!("axia: sparse solver: {name}");
+    }
 }
 
 /// 1-based CSR of the upper triangle (incl. diagonal), columns sorted per row.

@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{err, Result};
 use crate::model::{
-    BeamSection, Boundary, Cload, Coupling, Dload, ElemKind, Element, Equation, Material, Model,
-    RigidBody, Surface, Tie, Transform,
+    Amplitude, BeamSection, Boundary, Cflux, Cload, Coupling, Dflux, Dload, ElemKind, Element,
+    Equation, Film, FluxKind, InitCond, InitKind, Material, Model, RigidBody, Surface, ThermalBc,
+    Tie, Transform,
 };
 
 fn strip_comment(line: &str) -> &str {
@@ -457,22 +458,20 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                     } else {
                         d1
                     };
+                    let first = d1.max(1);
+                    let last = d2.max(first);
+                    let thermal = first == 11 || last == 11;
                     let val = if k < toks.len() {
-                        // Could be next set name or a value. If it parses as float and
-                        // the token isn't an integer set name used later... values are
-                        // typically 0 or a float. If the next-next looks like a dof, this
-                        // is a new card.
-                        // Cards: name, d1, [d2, [val]]
-                        // Heuristic: if token has a dot/e or is 0, treat as value; if
-                        // remaining tokens after taking it wouldn't form a new card, take it.
                         let peek = &toks[k];
-                        if peek.contains('.') || peek.contains('e') || peek.contains('E') {
+                        if thermal && parse_f64(peek).is_ok() {
+                            let v = parse_f64(peek).unwrap_or(0.0);
+                            k += 1;
+                            v
+                        } else if peek.contains('.') || peek.contains('e') || peek.contains('E') {
                             let v = parse_f64(peek)?;
                             k += 1;
                             v
                         } else if parse_i32(peek).is_ok() && k + 1 < toks.len() {
-                            // Could be value 0 or start of next (node id).
-                            // If following token is a dof 1-6, this is a new card.
                             let maybe_dof = parse_i32(&toks[k + 1]).ok();
                             if maybe_dof == Some(1)
                                 || maybe_dof == Some(2)
@@ -480,6 +479,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                                 || maybe_dof == Some(4)
                                 || maybe_dof == Some(5)
                                 || maybe_dof == Some(6)
+                                || maybe_dof == Some(11)
                             {
                                 0.0
                             } else {
@@ -487,6 +487,10 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                                 k += 1;
                                 v
                             }
+                        } else if parse_f64(peek).is_ok() {
+                            let v = parse_f64(peek).unwrap_or(0.0);
+                            k += 1;
+                            v
                         } else {
                             0.0
                         }
@@ -506,22 +510,12 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                             .chain(if name.chars().all(|c| c.is_ascii_digit() || c == '-') {
                                 vec![]
                             } else {
-                                // defer: keep a placeholder by recording the name in a special
-                                // node id list via a side channel — we re-expand after compact.
                                 Vec::new()
                             })
                             .collect()
                     };
-                    // Store deferred BCs as node=-999999 and stash name in a warning-free list.
-                    // We'll expand after all sets exist: keep raw cards.
                     if nodes.is_empty() && parse_i32(&name).is_err() {
-                        // record as deferred using a sentinel with name in heading? Use a
-                        // dedicated deferred buffer.
-                        // We'll push a Boundary per node after a second pass.
-                        // Encode the set name by pushing a fake node and keeping a parallel list.
                     }
-                    let first = d1.max(1);
-                    let last = d2.max(first);
                     if parse_i32(&name).is_ok() {
                         let id = parse_i32(&name)?;
                         for d in first..=last {
@@ -531,6 +525,8 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                                     dof: d - 1,
                                     value: val,
                                 });
+                            } else if d == 11 {
+                                model.thermal_bcs.push(ThermalBc { node: id, value: val });
                             }
                         }
                     } else {
@@ -541,12 +537,19 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                                     d - 1,
                                     d - 1
                                 ));
+                            } else if d == 11 {
+                                model.warnings.push(format!("__TB__|{name}|{val}"));
                             }
                         }
                     }
                 }
             }
             "*CLOAD" => {
+                let amp_name = params
+                    .get("AMPLITUDE")
+                    .cloned()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
                 let (toks, ni) = collect_tokens(&lines, i + 1);
                 i = ni;
                 let mut k = 0;
@@ -564,9 +567,13 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                             node: id,
                             dof: dof - 1,
                             mag,
+                            amplitude: amp_name.clone(),
                         });
                     } else {
-                        model.warnings.push(format!("__CL__|{name}|{}|{mag}", dof - 1));
+                        model.warnings.push(format!(
+                            "__CL__|{name}|{}|{mag}|{amp_name}",
+                            dof - 1
+                        ));
                     }
                 }
             }
@@ -685,6 +692,273 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                     1
                 };
                 model.procedure = crate::model::Procedure::Buckle { nmodes: n };
+            }
+            "*HEAT TRANSFER" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let steady = params.contains_key("STEADY STATE")
+                    || params.contains_key("STEADYSTATE");
+                let dt = if !toks.is_empty() {
+                    parse_f64(&toks[0]).unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let period = if toks.len() >= 2 {
+                    parse_f64(&toks[1]).unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                model.procedure = crate::model::Procedure::HeatTransfer {
+                    steady: steady || dt <= 0.0 || period <= 0.0,
+                    dt: dt.max(0.0),
+                    period: period.max(0.0),
+                };
+                model.output_nt = true;
+            }
+            "*DYNAMIC" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if toks.len() < 2 {
+                    return err("*DYNAMIC erwartet Inkrement und Periodendauer.");
+                }
+                let dt = parse_f64(&toks[0])?;
+                let period = parse_f64(&toks[1])?;
+                if dt <= 0.0 || period <= 0.0 {
+                    return err("*DYNAMIC: Inkrement und Periodendauer müssen positiv sein.");
+                }
+                model.procedure = crate::model::Procedure::Dynamic { dt, period };
+            }
+            "*DAMPING" => {
+                if let Some(a) = params.get("ALPHA").or_else(|| params.get("ALPHA")) {
+                    if let Ok(v) = parse_f64(a) {
+                        model.damp_alpha = v;
+                    }
+                }
+                if let Some(b) = params.get("BETA") {
+                    if let Ok(v) = parse_f64(b) {
+                        model.damp_beta = v;
+                    }
+                }
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if model.damp_alpha == 0.0 && !toks.is_empty() {
+                    model.damp_alpha = parse_f64(&toks[0]).unwrap_or(0.0);
+                }
+                if model.damp_beta == 0.0 && toks.len() >= 2 {
+                    model.damp_beta = parse_f64(&toks[1]).unwrap_or(0.0);
+                }
+            }
+            "*CONDUCTIVITY" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if toks.is_empty() {
+                    return err("*CONDUCTIVITY ohne Wert");
+                }
+                let k = parse_f64(&toks[0])?;
+                let name = current_material
+                    .clone()
+                    .unwrap_or_else(|| "MATERIAL-1".into());
+                model.materials.entry(name).or_default().conductivity = k;
+            }
+            "*SPECIFIC HEAT" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                if toks.is_empty() {
+                    return err("*SPECIFIC HEAT ohne Wert");
+                }
+                let cp = parse_f64(&toks[0])?;
+                let name = current_material
+                    .clone()
+                    .unwrap_or_else(|| "MATERIAL-1".into());
+                model.materials.entry(name).or_default().specific_heat = cp;
+            }
+            "*CFLUX" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut k = 0;
+                while k + 1 < toks.len() {
+                    let name = toks[k].to_ascii_uppercase();
+                    k += 1;
+                    // optional dof 11
+                    if k < toks.len() {
+                        if let Ok(d) = parse_i32(&toks[k]) {
+                            if d == 11 || d == 0 {
+                                k += 1;
+                            }
+                        }
+                    }
+                    if k >= toks.len() {
+                        break;
+                    }
+                    let mag = parse_f64(&toks[k])?;
+                    k += 1;
+                    if let Ok(id) = parse_i32(&name) {
+                        model.cfluxes.push(Cflux { node: id, mag });
+                    } else {
+                        model.warnings.push(format!("__CF__|{name}|{mag}"));
+                    }
+                }
+            }
+            "*DFLUX" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut k = 0;
+                while k + 1 < toks.len() {
+                    let name = toks[k].to_ascii_uppercase();
+                    let typ = toks[k + 1].to_ascii_uppercase();
+                    k += 2;
+                    if k >= toks.len() {
+                        return err("*DFLUX ohne Betrag");
+                    }
+                    let mag = parse_f64(&toks[k])?;
+                    k += 1;
+                    let kind = if typ == "BF" || typ == "BFNU" {
+                        FluxKind::Body
+                    } else if typ == "S" {
+                        FluxKind::Face(0)
+                    } else if typ.starts_with('S') {
+                        let f = typ.trim_start_matches('S').parse::<i32>().unwrap_or(1);
+                        FluxKind::Face(f)
+                    } else {
+                        model.warn(format!("DFLUX-Typ {typ} nicht unterstützt"));
+                        continue;
+                    };
+                    if let Ok(id) = parse_i32(&name) {
+                        model.dfluxes.push(Dflux {
+                            elem: id,
+                            kind,
+                            mag,
+                        });
+                    } else {
+                        let tag = match kind {
+                            FluxKind::Body => 0,
+                            FluxKind::Face(f) => f,
+                        };
+                        model
+                            .warnings
+                            .push(format!("__DF__|{name}|{tag}|{mag}"));
+                    }
+                }
+            }
+            "*FILM" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut k = 0;
+                while k + 2 < toks.len() {
+                    let name = toks[k].to_ascii_uppercase();
+                    let typ = toks[k + 1].to_ascii_uppercase();
+                    k += 2;
+                    if k + 1 >= toks.len() {
+                        return err("*FILM erwartet T∞ und h");
+                    }
+                    let tinf = parse_f64(&toks[k])?;
+                    let h = parse_f64(&toks[k + 1])?;
+                    k += 2;
+                    let face = if typ == "F" {
+                        0
+                    } else if typ.starts_with('F') {
+                        typ.trim_start_matches('F').parse::<i32>().unwrap_or(1)
+                    } else {
+                        1
+                    };
+                    if let Ok(id) = parse_i32(&name) {
+                        model.films.push(Film {
+                            elem: id,
+                            face,
+                            t_inf: tinf,
+                            h,
+                        });
+                    } else {
+                        model
+                            .warnings
+                            .push(format!("__FM__|{name}|{face}|{tinf}|{h}"));
+                    }
+                }
+            }
+            "*AMPLITUDE" => {
+                let name = params
+                    .get("NAME")
+                    .cloned()
+                    .unwrap_or_else(|| format!("A{}", model.amplitudes.len() + 1))
+                    .to_ascii_uppercase();
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut pts = Vec::new();
+                let mut k = 0;
+                while k + 1 < toks.len() {
+                    let t = parse_f64(&toks[k])?;
+                    let v = parse_f64(&toks[k + 1])?;
+                    k += 2;
+                    pts.push((t, v));
+                }
+                model.amplitudes.push(Amplitude { name, points: pts });
+            }
+            "*INITIAL CONDITIONS" => {
+                let ty = params
+                    .get("TYPE")
+                    .cloned()
+                    .unwrap_or_else(|| "TEMPERATURE".into());
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let kind = match ty.as_str() {
+                    "VELOCITY" => InitKind::Velocity,
+                    "DISPLACEMENT" => InitKind::Displacement,
+                    _ => InitKind::Temperature,
+                };
+                let mut k = 0;
+                while k < toks.len() {
+                    let name = toks[k].to_ascii_uppercase();
+                    k += 1;
+                    if kind == InitKind::Temperature {
+                        // node, [11,] value
+                        if k < toks.len() {
+                            if parse_i32(&toks[k]).ok() == Some(11) {
+                                k += 1;
+                            }
+                        }
+                        if k >= toks.len() {
+                            break;
+                        }
+                        let val = parse_f64(&toks[k])?;
+                        k += 1;
+                        if let Ok(id) = parse_i32(&name) {
+                            model.init.push(InitCond {
+                                node: id,
+                                dof: 0,
+                                value: val,
+                                kind,
+                            });
+                        } else {
+                            model.warnings.push(format!("__IC__|T|{name}|0|{val}"));
+                        }
+                    } else {
+                        if k + 1 >= toks.len() {
+                            break;
+                        }
+                        let dof = parse_i32(&toks[k])? as usize;
+                        let val = parse_f64(&toks[k + 1])?;
+                        k += 2;
+                        if dof < 1 || dof > 6 {
+                            continue;
+                        }
+                        if let Ok(id) = parse_i32(&name) {
+                            model.init.push(InitCond {
+                                node: id,
+                                dof: dof - 1,
+                                value: val,
+                                kind,
+                            });
+                        } else {
+                            let tag = match kind {
+                                InitKind::Velocity => "V",
+                                _ => "U",
+                            };
+                            model
+                                .warnings
+                                .push(format!("__IC__|{tag}|{name}|{}|{val}", dof - 1));
+                        }
+                    }
+                }
             }
             "*EQUATION" => {
                 let (toks, ni) = collect_tokens(&lines, i + 1);
@@ -960,6 +1234,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                     match t.to_ascii_uppercase().as_str() {
                         "U" => model.output_u = true,
                         "RF" => model.output_rf = true,
+                        "NT" => model.output_nt = true,
                         _ => {}
                     }
                 }
@@ -996,14 +1271,12 @@ fn parse_expanded(inp: &str) -> Result<Model> {
             other => {
                 if other.starts_with('*') {
                     match other {
-                        "*DYNAMIC" | "*HEAT TRANSFER"
-                        | "*COUPLED TEMPERATURE-DISPLACEMENT" | "*VISCO" | "*CREEP" => {
+                        "*COUPLED TEMPERATURE-DISPLACEMENT" | "*VISCO" | "*CREEP" => {
                             return err(format!(
                                 "{other} nicht unterstützt in dieser Version."
                             ));
                         }
-                        "*CONTACT" | "*AMPLITUDE" | "*INITIAL CONDITIONS"
-                        | "*ORIENTATION" => {
+                        "*CONTACT" | "*ORIENTATION" => {
                             model.warn(format!("{other} wird ignoriert."));
                             let (_toks, ni) = collect_tokens(&lines, i + 1);
                             i = ni;
@@ -1104,7 +1377,16 @@ fn expand_deferred(model: &mut Model) -> Result<()> {
                 let mag: f64 = p[2].parse().unwrap_or(0.0);
                 let nodes = model.expand_nset(name)?;
                 for node in nodes {
-                    model.cloads.push(Cload { node, dof, mag });
+                    model.cloads.push(Cload {
+                        node,
+                        dof,
+                        mag,
+                        amplitude: if p.len() >= 4 {
+                            p[3].to_string()
+                        } else {
+                            String::new()
+                        },
+                    });
                 }
             }
         } else if let Some(rest) = w.strip_prefix("__DL__|") {
@@ -1168,6 +1450,85 @@ fn expand_deferred(model: &mut Model) -> Result<()> {
                 if let Ok(nodes) = model.expand_nset(name) {
                     for n in nodes {
                         model.temperatures.insert(n, t);
+                    }
+                }
+            }
+        } else if let Some(rest) = w.strip_prefix("__TB__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 2 {
+                let name = p[0];
+                let val: f64 = p[1].parse().unwrap_or(0.0);
+                if let Ok(nodes) = model.expand_nset(name) {
+                    for node in nodes {
+                        model.thermal_bcs.push(ThermalBc { node, value: val });
+                    }
+                }
+            }
+        } else if let Some(rest) = w.strip_prefix("__CF__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 2 {
+                let name = p[0];
+                let mag: f64 = p[1].parse().unwrap_or(0.0);
+                if let Ok(nodes) = model.expand_nset(name) {
+                    for node in nodes {
+                        model.cfluxes.push(Cflux { node, mag });
+                    }
+                }
+            }
+        } else if let Some(rest) = w.strip_prefix("__DF__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 3 {
+                let name = p[0];
+                let tag: i32 = p[1].parse().unwrap_or(0);
+                let mag: f64 = p[2].parse().unwrap_or(0.0);
+                let kind = if tag == 0 {
+                    FluxKind::Body
+                } else {
+                    FluxKind::Face(tag)
+                };
+                if let Ok(elems) = model.expand_elset(name) {
+                    for elem in elems {
+                        model.dfluxes.push(Dflux { elem, kind, mag });
+                    }
+                }
+            }
+        } else if let Some(rest) = w.strip_prefix("__FM__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 4 {
+                let name = p[0];
+                let face: i32 = p[1].parse().unwrap_or(1);
+                let tinf: f64 = p[2].parse().unwrap_or(0.0);
+                let h: f64 = p[3].parse().unwrap_or(0.0);
+                if let Ok(elems) = model.expand_elset(name) {
+                    for elem in elems {
+                        model.films.push(Film {
+                            elem,
+                            face,
+                            t_inf: tinf,
+                            h,
+                        });
+                    }
+                }
+            }
+        } else if let Some(rest) = w.strip_prefix("__IC__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 4 {
+                let kind = match p[0] {
+                    "V" => InitKind::Velocity,
+                    "U" => InitKind::Displacement,
+                    _ => InitKind::Temperature,
+                };
+                let name = p[1];
+                let dof: usize = p[2].parse().unwrap_or(0);
+                let val: f64 = p[3].parse().unwrap_or(0.0);
+                if let Ok(nodes) = model.expand_nset(name) {
+                    for node in nodes {
+                        model.init.push(InitCond {
+                            node,
+                            dof,
+                            value: val,
+                            kind,
+                        });
                     }
                 }
             }

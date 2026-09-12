@@ -259,6 +259,8 @@ pub struct Material {
     pub density: f64,
     pub alpha: f64,
     pub tref: f64,
+    pub conductivity: f64,
+    pub specific_heat: f64,
 }
 
 impl Default for Material {
@@ -269,6 +271,8 @@ impl Default for Material {
             density: 0.0,
             alpha: 0.0,
             tref: 0.0,
+            conductivity: 0.0,
+            specific_heat: 0.0,
         }
     }
 }
@@ -379,11 +383,12 @@ pub struct Boundary {
     pub value: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Cload {
     pub node: i32,
     pub dof: usize,
     pub mag: f64,
+    pub amplitude: String,
 }
 
 #[derive(Clone, Debug)]
@@ -446,11 +451,91 @@ pub struct Transform {
     pub axes: [[f64; 3]; 3],
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ThermalBc {
+    pub node: i32,
+    pub value: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Cflux {
+    pub node: i32,
+    pub mag: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum FluxKind {
+    Body,
+    Face(i32),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Dflux {
+    pub elem: i32,
+    pub kind: FluxKind,
+    pub mag: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Film {
+    pub elem: i32,
+    pub face: i32,
+    pub t_inf: f64,
+    pub h: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Amplitude {
+    pub name: String,
+    pub points: Vec<(f64, f64)>,
+}
+
+impl Amplitude {
+    pub fn value_at(&self, t: f64) -> f64 {
+        if self.points.is_empty() {
+            return 1.0;
+        }
+        if t <= self.points[0].0 {
+            return self.points[0].1;
+        }
+        for w in self.points.windows(2) {
+            let (t0, v0) = w[0];
+            let (t1, v1) = w[1];
+            if t <= t1 {
+                let d = t1 - t0;
+                if d.abs() < 1e-18 {
+                    return v1;
+                }
+                let a = (t - t0) / d;
+                return v0 + a * (v1 - v0);
+            }
+        }
+        self.points[self.points.len() - 1].1
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitKind {
+    Displacement,
+    Velocity,
+    Temperature,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InitCond {
+    pub node: i32,
+    pub dof: usize,
+    pub value: f64,
+    pub kind: InitKind,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Procedure {
     Static { nlgeom: bool, increments: usize },
     Frequency { nmodes: usize },
     Buckle { nmodes: usize },
+    HeatTransfer { steady: bool, dt: f64, period: f64 },
+    Dynamic { dt: f64, period: f64 },
 }
 
 impl Default for Procedure {
@@ -469,6 +554,9 @@ impl Procedure {
             Self::Static { .. } => "STATIC",
             Self::Frequency { .. } => "FREQUENCY",
             Self::Buckle { .. } => "BUCKLE",
+            Self::HeatTransfer { steady: true, .. } => "HEAT TRANSFER, STEADY STATE",
+            Self::HeatTransfer { .. } => "HEAT TRANSFER",
+            Self::Dynamic { .. } => "DYNAMIC",
         }
     }
 }
@@ -499,12 +587,21 @@ pub struct Model {
     pub elset_spring: HashMap<String, f64>,
     pub temperatures: HashMap<i32, f64>,
     pub plastic: HashMap<String, Vec<(f64, f64)>>, // material -> [(peeq, sy)]
+    pub thermal_bcs: Vec<ThermalBc>,
+    pub cfluxes: Vec<Cflux>,
+    pub dfluxes: Vec<Dflux>,
+    pub films: Vec<Film>,
+    pub amplitudes: Vec<Amplitude>,
+    pub init: Vec<InitCond>,
+    pub damp_alpha: f64,
+    pub damp_beta: f64,
     pub procedure: Procedure,
     pub dim: usize,
     pub output_u: bool,
     pub output_s: bool,
     pub output_rf: bool,
     pub output_e: bool,
+    pub output_nt: bool,
     pub warnings: Vec<String>,
 }
 
@@ -535,12 +632,21 @@ impl Model {
             elset_spring: HashMap::new(),
             temperatures: HashMap::new(),
             plastic: HashMap::new(),
+            thermal_bcs: Vec::new(),
+            cfluxes: Vec::new(),
+            dfluxes: Vec::new(),
+            films: Vec::new(),
+            amplitudes: Vec::new(),
+            init: Vec::new(),
+            damp_alpha: 0.0,
+            damp_beta: 0.0,
             procedure: Procedure::default(),
             dim: 3,
             output_u: true,
             output_s: true,
             output_rf: true,
             output_e: false,
+            output_nt: false,
             warnings: Vec::new(),
         }
     }
@@ -726,5 +832,26 @@ impl Model {
 
     pub fn has_plastic(&self) -> bool {
         !self.plastic.is_empty()
+    }
+
+    pub fn amp_value(&self, name: &str, t: f64) -> f64 {
+        if name.is_empty() {
+            return 1.0;
+        }
+        let n = name.to_ascii_uppercase();
+        self.amplitudes
+            .iter()
+            .find(|a| a.name == n)
+            .map(|a| a.value_at(t))
+            .unwrap_or(1.0)
+    }
+
+    pub fn find_amplitude(&self, name: &str) -> usize {
+        let n = name.to_ascii_uppercase();
+        self.amplitudes
+            .iter()
+            .position(|a| a.name == n)
+            .map(|i| i + 1)
+            .unwrap_or(0)
     }
 }
