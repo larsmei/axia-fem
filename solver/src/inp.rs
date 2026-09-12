@@ -1095,9 +1095,6 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                         it.mu = mu.abs();
                     }
                 }
-                if mu.abs() > 0.0 {
-                    model.warn("*FRICTION wird in 1.6 ignoriert (reibungsfreier Kontakt).");
-                }
             }
             "*CONTACT PAIR" => {
                 let (toks, ni) = collect_tokens(&lines, i + 1);

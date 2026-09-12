@@ -2290,4 +2290,151 @@ SLV, 1, 2
         );
         assert!(utop < uz(9), "block must compress");
     }
+
+    fn contact_shear_deck(mu: f64) -> String {
+        format!(
+            r#"
+*HEADING
+friction cube, mu={mu}
+*NODE
+1, 0, 0, -10
+2, 10, 0, -10
+3, 10, 10, -10
+4, 0, 10, -10
+5, 0, 0, 0
+6, 10, 0, 0
+7, 10, 10, 0
+8, 0, 10, 0
+9, 0, 0, -0.001
+10, 10, 0, -0.001
+11, 10, 10, -0.001
+12, 0, 10, -0.001
+13, 0, 0, 10
+14, 10, 0, 10
+15, 10, 10, 10
+16, 0, 10, 10
+*ELEMENT, TYPE=C3D8, ELSET=FND
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*ELEMENT, TYPE=C3D8, ELSET=BLK
+2, 9, 10, 11, 12, 13, 14, 15, 16
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.0
+*SOLID SECTION, ELSET=FND, MATERIAL=STEEL
+*SOLID SECTION, ELSET=BLK, MATERIAL=STEEL
+*NSET, NSET=FOUND
+1, 2, 3, 4, 5, 6, 7, 8
+*NSET, NSET=TOP
+13, 14, 15, 16
+*NSET, NSET=ALL
+1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
+*SURFACE, NAME=MASTER, TYPE=ELEMENT
+1, S2
+*SURFACE, NAME=SLAVE, TYPE=ELEMENT
+2, S1
+*SURFACE INTERACTION, NAME=INT
+*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR
+1e8
+*FRICTION
+{mu}
+*CONTACT PAIR, INTERACTION=INT
+SLAVE, MASTER
+*BOUNDARY
+FOUND, 1, 3
+ALL, 2, 2
+TOP, 1, 1, 0.01
+TOP, 3, 3, -0.01
+*CONTROLS, MAXITER=40
+*STEP
+*STATIC
+*END STEP
+"#
+        )
+    }
+
+    #[test]
+    fn contact_friction_stick() {
+        let out = solve_native(&contact_shear_deck(0.8)).unwrap();
+        assert!((out.model.contact_pairs[0].mu - 0.8).abs() < 1e-12);
+        let ux = |id: i32| out.u[out.model.node_index(id).unwrap()][0];
+        assert!((ux(13) - 0.01).abs() < 1e-12);
+        let slave = 0.25 * (ux(9) + ux(10) + ux(11) + ux(12));
+        assert!(
+            slave.abs() < 1.5e-3,
+            "stick: slave ux={slave}, expected ~0"
+        );
+        assert!(out.residual < 1.0, "stick residual={}", out.residual);
+    }
+
+    #[test]
+    fn contact_friction_slip() {
+        let out = solve_native(&contact_shear_deck(0.0)).unwrap();
+        let ux = |id: i32| out.u[out.model.node_index(id).unwrap()][0];
+        let slave = 0.25 * (ux(9) + ux(10) + ux(11) + ux(12));
+        assert!(
+            slave > 0.005,
+            "frictionless: slave ux={slave}, expected to slide (~0.01)"
+        );
+        assert!(
+            (slave - 0.01).abs() < 0.004,
+            "frictionless: slave ux={slave}"
+        );
+    }
+
+    #[test]
+    fn nlgeom_plastic_c3d8_matches_small_strain() {
+        let inp = r#"
+*HEADING
+C3D8 NLGEOM+PLASTIC, σ=250
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+*ELEMENT, TYPE=C3D8, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*PLASTIC
+210, 0.0
+420, 0.01
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*NSET, NSET=FIXED
+1, 4, 5, 8
+*BOUNDARY
+FIXED, 1, 1
+1, 2, 3
+4, 3, 3
+*STEP, NLGEOM
+*STATIC
+*CLOAD
+2, 1, 6250
+3, 1, 6250
+6, 1, 6250
+7, 1, 6250
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let mut ux = 0.0;
+        let mut n = 0.0;
+        for (i, &id) in out.model.node_ids.iter().enumerate() {
+            if id == 2 || id == 3 || id == 6 || id == 7 {
+                ux += out.u[i][0];
+                n += 1.0;
+            }
+        }
+        ux /= n;
+        assert!(
+            (ux - 0.03095).abs() / 0.03095 < 0.1,
+            "NLGEOM+J2 ux={ux}, expected ~0.03095"
+        );
+        let pe = out.peeq.iter().copied().fold(0.0_f64, f64::max);
+        assert!(pe > 0.001, "peeq={pe}");
+        assert!(out.solver.contains("J2"));
+    }
 }

@@ -1134,6 +1134,113 @@ S
 `,
   },
   {
+    id: "contact-friction",
+    name: "Kontakt mit Reibung",
+    blurb: "Coulomb μ=0.8, Interface haftet",
+    inp: `*HEADING
+Coulomb-Haften: Würfel auf Fundament, μ=0.8, ux_top=0.01
+*NODE
+1, 0, 0, -10
+2, 10, 0, -10
+3, 10, 10, -10
+4, 0, 10, -10
+5, 0, 0, 0
+6, 10, 0, 0
+7, 10, 10, 0
+8, 0, 10, 0
+9, 0, 0, -0.001
+10, 10, 0, -0.001
+11, 10, 10, -0.001
+12, 0, 10, -0.001
+13, 0, 0, 10
+14, 10, 0, 10
+15, 10, 10, 10
+16, 0, 10, 10
+*ELEMENT, TYPE=C3D8, ELSET=FND
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*ELEMENT, TYPE=C3D8, ELSET=BLK
+2, 9, 10, 11, 12, 13, 14, 15, 16
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.0
+*SOLID SECTION, ELSET=FND, MATERIAL=STEEL
+*SOLID SECTION, ELSET=BLK, MATERIAL=STEEL
+*NSET, NSET=FOUND
+1, 2, 3, 4, 5, 6, 7, 8
+*NSET, NSET=TOP
+13, 14, 15, 16
+*NSET, NSET=ALL
+1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
+*SURFACE, NAME=MASTER, TYPE=ELEMENT
+1, S2
+*SURFACE, NAME=SLAVE, TYPE=ELEMENT
+2, S1
+*SURFACE INTERACTION, NAME=INT
+*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR
+1e8
+*FRICTION
+0.8
+*CONTACT PAIR, INTERACTION=INT
+SLAVE, MASTER
+*BOUNDARY
+FOUND, 1, 3
+ALL, 2, 2
+TOP, 1, 1, 0.01
+TOP, 3, 3, -0.01
+*STEP
+*STATIC
+*NODE FILE
+U, RF
+*EL FILE
+S
+*END STEP
+`,
+  },
+  {
+    id: "nlgeom-plastic",
+    name: "NLGEOM + Plastizität",
+    blurb: "C3D8 J2 mit NLGEOM, ux≈0.031",
+    inp: `*HEADING
+C3D8 *STEP, NLGEOM + *PLASTIC, σ=250, ux ≈ 0.03095
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+*ELEMENT, TYPE=C3D8, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*PLASTIC
+210, 0.0
+420, 0.01
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*NSET, NSET=FIXED
+1, 4, 5, 8
+*BOUNDARY
+FIXED, 1, 1
+1, 2, 3
+4, 3, 3
+*STEP, NLGEOM
+*STATIC
+*CLOAD
+2, 1, 6250
+3, 1, 6250
+6, 1, 6250
+7, 1, 6250
+*NODE FILE
+U, RF
+*EL FILE
+S, PEEQ
+*END STEP
+`,
+  },
+  {
     id: "heat",
     name: "Wärmeleitung T3D2",
     blurb: "*HEAT TRANSFER, T(L/2)=50",

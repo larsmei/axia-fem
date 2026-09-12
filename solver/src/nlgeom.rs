@@ -14,6 +14,7 @@ pub struct NlElem {
     pub vol: f64,
     pub cauchy: [f64; 6],
     pub gl: [f64; 6],
+    pub peeq: f64,
 }
 
 fn voigt_s(e: &[[f64; 3]; 3], lam: f64, mu: f64) -> [f64; 6] {
@@ -28,7 +29,7 @@ fn voigt_s(e: &[[f64; 3]; 3], lam: f64, mu: f64) -> [f64; 6] {
     ]
 }
 
-fn green_lagrange(f: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+pub(crate) fn green_lagrange(f: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let mut c = [[0.0; 3]; 3];
     for i in 0..3 {
         for j in 0..3 {
@@ -44,7 +45,7 @@ fn green_lagrange(f: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     e
 }
 
-fn deformation_gradient(dndx: &[[f64; 3]], ue: &[f64], nn: usize) -> [[f64; 3]; 3] {
+pub(crate) fn deformation_gradient(dndx: &[[f64; 3]], ue: &[f64], nn: usize) -> [[f64; 3]; 3] {
     let mut f = [[0.0; 3]; 3];
     for i in 0..3 {
         f[i][i] = 1.0;
@@ -66,7 +67,7 @@ fn det3(a: &[[f64; 3]; 3]) -> f64 {
         + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])
 }
 
-fn pk2_to_cauchy(f: &[[f64; 3]; 3], s: &[f64; 6]) -> Result<[f64; 6]> {
+pub(crate) fn pk2_to_cauchy(f: &[[f64; 3]; 3], s: &[f64; 6]) -> Result<[f64; 6]> {
     let sm = [
         [s[0], s[3], s[5]],
         [s[3], s[1], s[4]],
@@ -99,7 +100,7 @@ fn pk2_to_cauchy(f: &[[f64; 3]; 3], s: &[f64; 6]) -> Result<[f64; 6]> {
     ])
 }
 
-fn fill_b_nl(b: &mut [f64], nn: usize, f: &[[f64; 3]; 3], dndx: &[[f64; 3]]) {
+pub(crate) fn fill_b_nl(b: &mut [f64], nn: usize, f: &[[f64; 3]; 3], dndx: &[[f64; 3]]) {
     // Voigt E_eng: [Exx, Eyy, Ezz, 2Exy, 2Eyz, 2Ezx]
     let n = 3 * nn;
     for a in 0..nn {
@@ -152,6 +153,7 @@ struct GpAcc {
     vol: f64,
     cauchy: [f64; 6],
     gl: [f64; 6],
+    peeq: f64,
 }
 
 impl GpAcc {
@@ -162,6 +164,7 @@ impl GpAcc {
             vol: 0.0,
             cauchy: [0.0; 6],
             gl: [0.0; 6],
+            peeq: 0.0,
         }
     }
     fn finish(self) -> NlElem {
@@ -182,6 +185,7 @@ impl GpAcc {
             vol: self.vol,
             cauchy,
             gl,
+            peeq: self.peeq * inv,
         }
     }
 }

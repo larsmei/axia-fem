@@ -111,14 +111,14 @@ fn solve_one(model: Model, t0: f64) -> Result<SolveOutput> {
         if truss2_only {
             return solve_truss_newton(model, t0, nlgeom);
         }
-        if nlgeom && continuum_only && !model.has_plastic() {
+        if nlgeom && continuum_only {
             return solve_continuum_newton(model, t0);
         }
         if continuum_only && model.has_plastic() && !nlgeom {
             return solve_continuum_plastic(model, t0);
         }
         return err(
-            "NLGEOM ist für T3D2 und Kontinuum (C3D*) implementiert; *PLASTIC für T3D2 und C3D* (ohne NLGEOM).",
+            "NLGEOM/*PLASTIC sind für T3D2 und Kontinuum (C3D*) implementiert; gemischte Netze nicht.",
         );
     }
     solve_linear(model, t0)
@@ -1354,10 +1354,12 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut iters = 0usize;
     let mut last_fint = vec![0.0; ndof];
     let mut n_active = 0usize;
+    let mut n_slip = 0usize;
     for it in 0..model.max_newton.max(1) {
         iters = it + 1;
         let cf = contact::assemble(&model, ndn, ndof, &u_full)?;
         n_active = cf.n_active;
+        n_slip = cf.n_slip;
         let mut ku = vec![0.0; ndof];
         for &(i, j, v) in &trips {
             ku[i] += v * u_full[j];
@@ -1402,7 +1404,9 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     if solver.is_empty() {
         solver = "Newton (contact)".into();
     } else {
-        solver = format!("Newton-contact ({solver}, {iters} iters, {n_active} active)");
+        solver = format!(
+            "Newton-contact ({solver}, {iters} iters, {n_active} active, {n_slip} slip)"
+        );
     }
 
     constraint::dofs_to_global(&mut u_full, ndn, &model.node_ids, &model.node_transform);
@@ -1729,7 +1733,13 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut iters = 0usize;
     let mut last_cauchy: Vec<[f64; 6]> = vec![[0.0; 6]; model.elements.len()];
     let mut last_gl: Vec<[f64; 6]> = vec![[0.0; 6]; model.elements.len()];
+    let mut last_peeq: Vec<f64> = vec![0.0; model.elements.len()];
     let mut last_fint = vec![0.0; ndof];
+    let hist: Vec<Vec<plastic::GpHist>> = model
+        .elements
+        .iter()
+        .map(|el| vec![plastic::GpHist::default(); plastic::n_gauss(el.kind).max(1)])
+        .collect();
     for it in 0..model.max_newton.max(1) {
         iters = it + 1;
         let mut trips: Vec<(usize, usize, f64)> = Vec::new();
@@ -1748,9 +1758,22 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
                 }
             }
             let mat = model.material_for(el)?;
-            let nl = nlgeom::continuum_nl(el.kind, &xyz0, &ue, mat.e, mat.nu)?;
+            let nl = if let Some(curve) = model.plastic_for(el) {
+                plastic::continuum_plastic_nl(
+                    el.kind,
+                    &xyz0,
+                    &ue,
+                    mat.e,
+                    mat.nu,
+                    curve,
+                    &hist[ei],
+                )?
+            } else {
+                nlgeom::continuum_nl(el.kind, &xyz0, &ue, mat.e, mat.nu)?
+            };
             last_cauchy[ei] = nl.cauchy;
             last_gl[ei] = nl.gl;
+            last_peeq[ei] = nl.peeq;
             let nd = gdofs.len();
             for i in 0..nd {
                 f_int[gdofs[i]] += nl.fe[i];
@@ -1799,6 +1822,9 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
     } else {
         solver = format!("Newton ({solver}, {iters} iters)");
     }
+    if model.has_plastic() {
+        solver = format!("{solver}, J2");
+    }
 
     let mut u = vec![[0.0; 3]; nnode];
     let ur = vec![[0.0; 3]; nnode];
@@ -1813,16 +1839,19 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut accs = vec![[0.0; 6]; nnode];
     let mut cnt = vec![0.0; nnode];
     let mut gacc = vec![[0.0; 6]; nnode];
+    let mut pacc = vec![0.0; nnode];
     let mut stress_gp = Vec::new();
     for (ei, el) in model.elements.iter().enumerate() {
         let s = last_cauchy[ei];
         let g = last_gl[ei];
+        let p = last_peeq[ei];
         for &id in &el.nodes {
             let ni = model.node_index(id)?;
             for c in 0..6 {
                 accs[ni][c] += s[c];
                 gacc[ni][c] += g[c];
             }
+            pacc[ni] += p;
             cnt[ni] += 1.0;
         }
         stress_gp.push((el.id, 1usize, s));
@@ -1830,16 +1859,18 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut stress = vec![[0.0; 6]; nnode];
     let mut strain = vec![[0.0; 6]; nnode];
     let mut vm = vec![0.0; nnode];
+    let mut peeq = vec![0.0; nnode];
     for i in 0..nnode {
         if cnt[i] > 0.0 {
             for c in 0..6 {
                 stress[i][c] = accs[i][c] / cnt[i];
                 strain[i][c] = gacc[i][c] / cnt[i];
             }
+            peeq[i] = pacc[i] / cnt[i];
         }
         vm[i] = von_mises(&stress[i]);
     }
-    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &[]);
+    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &peeq);
     let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
     let procedure = model.procedure.name().to_string();
     let nsteps = model.steps.len().max(1);
@@ -1865,7 +1896,7 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
         frequencies: vec![],
         buckles: vec![],
         nsteps,
-        peeq: Vec::new(),
+        peeq,
     })
 }
 

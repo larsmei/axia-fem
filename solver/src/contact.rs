@@ -1,5 +1,5 @@
-//! Penalty node-to-surface contact (`*CONTACT PAIR`, frictionless).
-//! Gap g = n·(x_s − x_c); active if g < 0. Force on slave F_s = −k n g.
+//! Penalty node-to-surface contact (`*CONTACT PAIR`).
+//! Gap g = n·(x_s − x_c); active if g < 0. Coulomb on nodal forces, small sliding.
 
 use crate::constraint;
 use crate::error::{err, Result};
@@ -9,6 +9,7 @@ pub struct ContactForce {
     pub trips: Vec<(usize, usize, f64)>,
     pub f: Vec<f64>,
     pub n_active: usize,
+    pub n_slip: usize,
 }
 
 fn vsub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -64,11 +65,9 @@ fn project_tri(xs: [f64; 3], p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]) -> Option
         return None;
     }
     n = vscale(n, 1.0 / a2);
-    let gap = vdot(n, vsub(xs, p0));
-    let q = vsub(xs, vscale(n, gap));
     let v0 = e1;
     let v1 = e2;
-    let v2 = vsub(q, p0);
+    let v2 = vsub(xs, p0);
     let d00 = vdot(v0, v0);
     let d01 = vdot(v0, v1);
     let d11 = vdot(v1, v1);
@@ -78,11 +77,36 @@ fn project_tri(xs: [f64; 3], p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]) -> Option
     if den.abs() < 1e-30 {
         return None;
     }
-    let v = (d11 * d20 - d01 * d21) / den;
-    let w = (d00 * d21 - d01 * d20) / den;
-    let u = 1.0 - v - w;
-    const EPS: f64 = 1e-7;
-    if u < -EPS || v < -EPS || w < -EPS {
+    let mut v = (d11 * d20 - d01 * d21) / den;
+    let mut w = (d00 * d21 - d01 * d20) / den;
+    let mut u = 1.0 - v - w;
+    // Clamp to triangle (closest point).
+    if u < 0.0 {
+        let e = vsub(p2, p1);
+        let t = vdot(vsub(xs, p1), e) / vdot(e, e).max(1e-30);
+        let t = t.clamp(0.0, 1.0);
+        u = 0.0;
+        v = 1.0 - t;
+        w = t;
+    } else if v < 0.0 {
+        let e = vsub(p0, p2);
+        let t = vdot(vsub(xs, p2), e) / vdot(e, e).max(1e-30);
+        let t = t.clamp(0.0, 1.0);
+        v = 0.0;
+        w = 1.0 - t;
+        u = t;
+    } else if w < 0.0 {
+        let e = vsub(p1, p0);
+        let t = vdot(vsub(xs, p0), e) / vdot(e, e).max(1e-30);
+        let t = t.clamp(0.0, 1.0);
+        w = 0.0;
+        u = 1.0 - t;
+        v = t;
+    }
+    let xc = vadd(vadd(vscale(p0, u), vscale(p1, v)), vscale(p2, w));
+    let gap = vdot(n, vsub(xs, xc));
+    let tang = vnorm(vsub(vsub(xs, xc), vscale(n, gap)));
+    if tang > 1.5 {
         return None;
     }
     Some((gap, [u, v, w], n))
@@ -221,13 +245,15 @@ pub fn assemble(
     let mut trips = Vec::new();
     let mut f = vec![0.0; ndof];
     let mut n_active = 0usize;
+    let mut n_slip = 0usize;
     for pair in &model.contact_pairs {
-        add_pair(model, pair, ndn, u, &mut trips, &mut f, &mut n_active)?;
+        add_pair(model, pair, ndn, u, &mut trips, &mut f, &mut n_active, &mut n_slip)?;
     }
     Ok(ContactForce {
         trips,
         f,
         n_active,
+        n_slip,
     })
 }
 
@@ -239,11 +265,14 @@ fn add_pair(
     trips: &mut Vec<(usize, usize, f64)>,
     f: &mut [f64],
     n_active: &mut usize,
+    n_slip: &mut usize,
 ) -> Result<()> {
     let kn = pair.kn.max(0.0);
     if kn == 0.0 {
         return Ok(());
     }
+    let kt = kn;
+    let mu = pair.mu.max(0.0);
     let faces = master_faces(model, &pair.master)?;
     let slaves = slave_ids(model, &pair.slave)?;
     let mut master_set = std::collections::HashSet::new();
@@ -260,19 +289,16 @@ fn add_pair(
         let Some(hit) = find_hit(model, u, ndn, xs, &faces)? else {
             continue;
         };
-        if hit.gap >= 0.0 {
+        if hit.gap > 1e-12 {
             continue;
         }
         *n_active += 1;
-        let sni = model.node_index(sid)?;
         let mut nodes = vec![sid];
         let mut w = vec![-1.0];
         for (a, &mid) in hit.master.iter().enumerate() {
             nodes.push(mid);
             w.push(hit.shape.get(a).copied().unwrap_or(0.0));
         }
-        // F_s = −kn g n, F_m = kn g N n. Residual contribution is −F_int, but
-        // here `f` is the internal contact force (same sign as F).
         let fnod = -kn * hit.gap;
         for (a, &id) in nodes.iter().enumerate() {
             let ni = model.node_index(id)?;
@@ -288,6 +314,61 @@ fn add_pair(
                 for i in 0..3 {
                     for j in 0..3 {
                         let v = kab * hit.n[i] * hit.n[j];
+                        if v.abs() > 0.0 {
+                            trips.push((dof_t(ndn, ia, i), dof_t(ndn, ib, j), v));
+                        }
+                    }
+                }
+            }
+        }
+        if mu <= 0.0 {
+            continue;
+        }
+        // Small-sliding Coulomb: g_t = (I−nn)(u_s − u_c).
+        let mut g_raw = [0.0; 3];
+        for (a, &id) in nodes.iter().enumerate() {
+            let ni = model.node_index(id)?;
+            for d in 0..3 {
+                g_raw[d] += w[a] * u.get(dof_t(ndn, ni, d)).copied().unwrap_or(0.0);
+            }
+        }
+        let mut gt = [-g_raw[0], -g_raw[1], -g_raw[2]];
+        let gn = vdot(gt, hit.n);
+        gt = vsub(gt, vscale(hit.n, gn));
+        let gt_n = vnorm(gt);
+        let p = (kn * (-hit.gap)).max(0.0);
+        let mut ft = vscale(gt, kt);
+        let ft_n = vnorm(ft);
+        let slip = ft_n > mu * p + 1e-12 && gt_n > 1e-16;
+        if slip {
+            *n_slip += 1;
+            let tdir = vscale(gt, 1.0 / gt_n);
+            ft = vscale(tdir, mu * p);
+        }
+        for (a, &id) in nodes.iter().enumerate() {
+            let ni = model.node_index(id)?;
+            for d in 0..3 {
+                f[dof_t(ndn, ni, d)] += w[a] * (-ft[d]);
+            }
+        }
+        let (k_t, tdir) = if slip {
+            (mu * p / gt_n, vscale(gt, 1.0 / gt_n))
+        } else {
+            (kt, [0.0; 3])
+        };
+        for (a, &ida) in nodes.iter().enumerate() {
+            let ia = model.node_index(ida)?;
+            for (b, &idb) in nodes.iter().enumerate() {
+                let ib = model.node_index(idb)?;
+                let wab = w[a] * w[b];
+                for i in 0..3 {
+                    for j in 0..3 {
+                        let mut pij = if i == j { 1.0 } else { 0.0 };
+                        pij -= hit.n[i] * hit.n[j];
+                        if slip {
+                            pij -= tdir[i] * tdir[j];
+                        }
+                        let v = k_t * wab * pij;
                         if v.abs() > 0.0 {
                             trips.push((dof_t(ndn, ia, i), dof_t(ndn, ib, j), v));
                         }

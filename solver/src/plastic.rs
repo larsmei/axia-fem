@@ -369,6 +369,73 @@ pub fn continuum_plastic(
     })
 }
 
+/// Total-Lagrange J2: Green–Lagrange strain, PK2 from the small-strain return map,
+/// geometric stiffness from S. Small strain recovers `continuum_plastic`.
+pub fn continuum_plastic_nl(
+    kind: ElemKind,
+    xyz0: &[[f64; 3]],
+    ue: &[f64],
+    e: f64,
+    nu: f64,
+    curve: &[(f64, f64)],
+    hist: &[GpHist],
+) -> Result<crate::nlgeom::NlElem> {
+    let gp = gps(kind, xyz0)?;
+    let nn = kind.nnodes();
+    let nd = 3 * nn;
+    let mut ke = vec![0.0; nd * nd];
+    let mut fe = vec![0.0; nd];
+    let mut acc_s = [0.0; 6];
+    let mut acc_e = [0.0; 6];
+    let mut acc_p = 0.0;
+    let mut vol = 0.0;
+    for (g, (dndx, w)) in gp.iter().enumerate() {
+        let f = crate::nlgeom::deformation_gradient(dndx, ue, nn);
+        let egl = crate::nlgeom::green_lagrange(&f);
+        let eps = [
+            egl[0][0],
+            egl[1][1],
+            egl[2][2],
+            2.0 * egl[0][1],
+            2.0 * egl[1][2],
+            2.0 * egl[2][0],
+        ];
+        let h = hist.get(g).copied().unwrap_or_default();
+        let (s, cep, hnew) = j2_return(&eps, &h, e, nu, curve)?;
+        let mut b = vec![0.0; 6 * nd];
+        crate::nlgeom::fill_b_nl(&mut b, nn, &f, dndx);
+        gemm_bt_d_b(&mut ke, nd, &b, 6, &cep, *w);
+        crate::eigen::add_continuum_kg(&mut ke, nn, dndx, &s, *w);
+        for j in 0..nd {
+            let mut q = 0.0;
+            for i in 0..6 {
+                q += b[i * nd + j] * s[i];
+            }
+            fe[j] += q * *w;
+        }
+        let cauchy = crate::nlgeom::pk2_to_cauchy(&f, &s)?;
+        for i in 0..6 {
+            acc_s[i] += cauchy[i] * *w;
+            acc_e[i] += eps[i] * *w;
+        }
+        acc_p += hnew.alpha * *w;
+        vol += *w;
+    }
+    let inv = if vol.abs() > 0.0 { 1.0 / vol } else { 0.0 };
+    for i in 0..6 {
+        acc_s[i] *= inv;
+        acc_e[i] *= inv;
+    }
+    Ok(crate::nlgeom::NlElem {
+        ke,
+        fe,
+        vol,
+        cauchy: acc_s,
+        gl: acc_e,
+        peeq: acc_p * inv,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
