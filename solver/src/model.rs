@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ElemKind {
@@ -249,6 +249,16 @@ impl ElemKind {
 
     pub fn is_gap(self) -> bool {
         matches!(self, Self::GapUni)
+    }
+
+    /// MASS / ROTARYI / DASHPOT / GAP have no continuum *MATERIAL.
+    pub fn is_special(self) -> bool {
+        self.is_point() || self.is_dashpot() || self.is_gap()
+    }
+
+    /// Constitutive *ELASTIC is required (not springs or concentrated mass).
+    pub fn needs_material(self) -> bool {
+        !self.is_special() && !self.is_spring()
     }
 
     pub fn is_quadratic(self) -> bool {
@@ -926,6 +936,7 @@ impl Model {
         let all_elems: Vec<i32> = self.elements.iter().map(|e| e.id).collect();
         self.nsets.insert("NALL".into(), all_nodes);
         self.elsets.insert("EALL".into(), all_elems);
+        self.apply_named_elset_sections();
         let has_2d = self.elements.iter().any(|e| e.kind.spatial_dim() == 2);
         let has_3d = self.elements.iter().any(|e| e.kind.spatial_dim() == 3);
         self.dim = if has_2d && !has_3d { 2 } else { 3 };
@@ -938,6 +949,46 @@ impl Model {
         }
         self.expand_transforms();
         self.expand_surfaces();
+    }
+
+    /// CalculiX/Mecway: `*ELEMENT` often has no `ELSET=`; properties come from a
+    /// later `*ELSET` plus `*SHELL SECTION` / `*MASS` / `*BEAM SECTION` on that set.
+    /// Rebind each element to a sectioned elset it belongs to.
+    fn apply_named_elset_sections(&mut self) {
+        let mut sectioned: HashSet<String> = HashSet::new();
+        sectioned.extend(self.elset_material.keys().cloned());
+        sectioned.extend(self.elset_thickness.keys().cloned());
+        sectioned.extend(self.elset_beam.keys().cloned());
+        sectioned.extend(self.elset_spring.keys().cloned());
+        sectioned.extend(self.elset_mass.keys().cloned());
+        sectioned.extend(self.elset_rotary.keys().cloned());
+        sectioned.extend(self.elset_dashpot.keys().cloned());
+        sectioned.extend(self.elset_gap.keys().cloned());
+        if sectioned.is_empty() {
+            return;
+        }
+        let mut names: Vec<String> = sectioned.iter().cloned().collect();
+        names.sort_by(|a, b| {
+            let am = self.elset_material.contains_key(a) as u8;
+            let bm = self.elset_material.contains_key(b) as u8;
+            bm.cmp(&am).then(a.cmp(b))
+        });
+        let mut id_to_set: HashMap<i32, String> = HashMap::new();
+        for name in &names {
+            if let Some(ids) = self.elsets.get(name) {
+                for &id in ids {
+                    id_to_set.entry(id).or_insert_with(|| name.clone());
+                }
+            }
+        }
+        for el in &mut self.elements {
+            if sectioned.contains(&el.elset) {
+                continue;
+            }
+            if let Some(name) = id_to_set.get(&el.id) {
+                el.elset = name.clone();
+            }
+        }
     }
 
     fn expand_transforms(&mut self) {

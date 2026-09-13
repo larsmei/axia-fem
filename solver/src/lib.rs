@@ -262,6 +262,149 @@ S
     }
 
     #[test]
+    fn mecway_elset_after_element_gets_material() {
+        // Mecway writes *ELEMENT without ELSET=, then *ELSET + *SHELL SECTION.
+        let inp = r#"
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+*ELEMENT, TYPE=S4
+1, 1, 2, 3, 4
+*ELSET, ELSET=TRÄGERTEIL_R
+1
+*ELSET, ELSET=EALL
+1
+*MATERIAL, NAME=V2A_T3
+*ELASTIC
+210000, 0.3
+*DENSITY
+7800
+*MATERIAL, NAME=STAHL
+*ELASTIC
+210000, 0.3
+*SHELL SECTION, ELSET=TRÄGERTEIL_R, MATERIAL=V2A_T3
+0.003
+"#;
+        let m = parse_model(inp).unwrap();
+        assert_eq!(m.elements.len(), 1);
+        assert_eq!(m.elements[0].elset, "TRÄGERTEIL_R");
+        let mat = m.material_for(&m.elements[0]).unwrap();
+        assert!((mat.e - 210000.0).abs() < 1e-9);
+        assert!((m.thickness_for(&m.elements[0]) - 0.003).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mecway_mass_without_material_static() {
+        // Mecway: *ELEMENT without ELSET, later *ELSET + *SHELL SECTION, *MASS
+        // without a continuum material. Two materials so the unique-material
+        // fallback cannot hide a missing assignment.
+        let inp = r#"
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+*ELEMENT, TYPE=S4
+1, 1, 2, 3, 4
+*ELEMENT, TYPE=MASS
+2, 3
+*ELSET, ELSET=TRÄGERTEIL_R
+1
+*ELSET, ELSET=MASS_1
+2
+*MATERIAL, NAME=V2A_T3
+*ELASTIC
+210000, 0.3
+*DENSITY
+7800
+*MATERIAL, NAME=STAHL
+*ELASTIC
+210000, 0.3
+*SHELL SECTION, ELSET=TRÄGERTEIL_R, MATERIAL=V2A_T3
+0.003
+*MASS, ELSET=MASS_1
+2
+*BOUNDARY
+1, 1, 6
+2, 1, 6
+4, 1, 6
+*STEP
+*STATIC
+*DLOAD
+EALL, GRAV, -9.81, 0, 0, 1
+*END STEP
+"#;
+        let m = parse_model(inp).unwrap();
+        assert_eq!(m.elements[0].elset, "TRÄGERTEIL_R");
+        assert_eq!(m.elements[1].kind, ElemKind::Mass);
+        assert_eq!(m.elements[1].elset, "MASS_1");
+        let out = solve_native(inp).unwrap();
+        assert!(out.u.iter().any(|u| u.iter().any(|v| v.abs() > 0.0)));
+        assert!(out.von_mises.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn mass_grav_spring_two_materials() {
+        // Concentrated mass under GRAV, no *MATERIAL on MASS, two dummy metals.
+        let inp = r#"
+*NODE
+1, 0, 0, 0
+2, 0, 1, 0
+*ELEMENT, TYPE=SPRINGA, ELSET=S
+1, 1, 2
+*ELEMENT, TYPE=MASS, ELSET=M
+2, 2
+*SPRING, ELSET=S
+100
+*MASS, ELSET=M
+2.0
+*MATERIAL, NAME=A
+*ELASTIC
+1, 0
+*MATERIAL, NAME=B
+*ELASTIC
+2, 0
+*BOUNDARY
+1, 1, 3
+2, 1, 1
+2, 3, 3
+*STEP
+*STATIC
+*DLOAD
+EALL, GRAV, -9.81, 0, 1, 0
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let uy = out.u[out.model.node_index(2).unwrap()][1];
+        let expect = 2.0 * -9.81 / 100.0;
+        assert!(
+            (uy - expect).abs() < 1e-8,
+            "MASS GRAV uy={uy}, expected {expect}"
+        );
+    }
+
+    #[test]
+    fn patch_test_c3d8_elset_deferred() {
+        let inp = cube_tension()
+            .replace("*ELEMENT, TYPE=C3D8, ELSET=SOLID", "*ELEMENT, TYPE=C3D8")
+            .replace(
+                "*SOLID SECTION, ELSET=SOLID, MATERIAL=STEEL",
+                "*ELSET, ELSET=SOLID\n1\n*MATERIAL, NAME=DUMMY\n*ELASTIC\n1.0, 0.0\n*SOLID SECTION, ELSET=SOLID, MATERIAL=STEEL",
+            );
+        let out = solve_native(&inp).unwrap();
+        let mut ux_loaded = Vec::new();
+        for (i, &id) in out.model.node_ids.iter().enumerate() {
+            if id == 2 || id == 3 || id == 6 || id == 7 {
+                ux_loaded.push(out.u[i][0]);
+            }
+        }
+        let mean: f64 = ux_loaded.iter().sum::<f64>() / ux_loaded.len() as f64;
+        assert!((mean - 0.01).abs() < 1e-6, "ux={mean}, expected 0.01");
+    }
+
+    #[test]
     fn patch_test_c3d8() {
         let out = solve_native(&cube_tension()).unwrap();
         // ux at x=10 should be FL/EA = 21000*10/(210000*100) = 0.01

@@ -14,7 +14,7 @@ use crate::frd;
 use crate::heat;
 use crate::linalg::solve_kff;
 use crate::material::truss_1d_stress;
-use crate::model::{Dload, ElemKind, FluxKind, InitKind, Model, Procedure, RiksCtrl};
+use crate::model::{Dload, ElemKind, FluxKind, InitKind, Material, Model, Procedure, RiksCtrl};
 use crate::nlgeom;
 use crate::plastic;
 use crate::quadratic;
@@ -196,7 +196,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut c_trips: Vec<(usize, usize, f64)> = Vec::new();
     for el in &model.elements {
         let xyz = elem_xyz(&model, &el.nodes)?;
-        if el.kind.is_point() || el.kind.is_dashpot() || el.kind.is_gap() {
+        if el.kind.is_special() {
             scatter_special(
                 &model,
                 el,
@@ -206,9 +206,14 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                 &mut trips,
                 &mut c_trips,
             )?;
+            apply_point_grav(&model, el, ndn, &mut f_full)?;
             continue;
         }
-        let mat = model.material_for(el)?;
+        let mat = if el.kind.needs_material() {
+            model.material_for(el)?
+        } else {
+            Material::default()
+        };
         let th = if el.kind.is_spring() {
             model.spring_k_for(el)?
         } else if el.kind.is_gap() {
@@ -479,6 +484,9 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut cnt = vec![0.0; nnode];
     let mut stress_gp = Vec::new();
     for el in &model.elements {
+        if !el.kind.needs_material() {
+            continue;
+        }
         let xyz = elem_xyz(&model, &el.nodes)?;
         let mat = model.material_for(el)?;
         let nn = el.kind.nnodes();
@@ -858,6 +866,35 @@ fn scatter_fe(fe: &[f64], gdofs: &[usize], fe_dim: usize, local_dim: usize, f_fu
     }
 }
 
+/// GRAV on *MASS: F = m · mag · dir̂. Concentrated mass has no continuum density.
+fn apply_point_grav(
+    model: &Model,
+    el: &crate::model::Element,
+    ndn: usize,
+    f: &mut [f64],
+) -> Result<()> {
+    if el.kind != ElemKind::Mass {
+        return Ok(());
+    }
+    let m = model.mass_for(el)?;
+    let ni = model.node_index(el.nodes[0])?;
+    for dl in &model.dloads {
+        if let Dload::Grav { mag, dir } = dl {
+            let mut ndir = *dir;
+            let len = (ndir[0] * ndir[0] + ndir[1] * ndir[1] + ndir[2] * ndir[2]).sqrt();
+            if len > 0.0 {
+                ndir[0] /= len;
+                ndir[1] /= len;
+                ndir[2] /= len;
+            }
+            for d in 0..3.min(ndn) {
+                f[dof_of(ndn, ni, d)] += m * *mag * ndir[d];
+            }
+        }
+    }
+    Ok(())
+}
+
 fn scatter_special(
     model: &Model,
     el: &crate::model::Element,
@@ -1129,7 +1166,7 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut f = vec![0.0; ndof];
     let mut c_diag = vec![0.0; ndof];
     for el in &model.elements {
-        if el.kind.is_point() || el.kind.is_dashpot() || el.kind.is_gap() {
+        if !el.kind.needs_material() {
             continue;
         }
         let xyz = elem_xyz(&model, &el.nodes)?;
@@ -1346,6 +1383,10 @@ fn assemble_fext(model: &Model, ndn: usize, ndof: usize) -> Result<Vec<f64>> {
     let mut f = vec![0.0; ndof];
     add_cloads(model, ndn, 0.0, &mut f)?;
     for el in &model.elements {
+        if el.kind.is_special() {
+            apply_point_grav(model, el, ndn, &mut f)?;
+            continue;
+        }
         let xyz = elem_xyz(model, &el.nodes)?;
         let nn = el.kind.nnodes();
         let local_dim = el.kind.ndof_per_node();
@@ -1357,7 +1398,11 @@ fn assemble_fext(model: &Model, ndn: usize, ndof: usize) -> Result<Vec<f64>> {
             }
         }
         let th = model.thickness_for(el);
-        let mat = model.material_for(el)?;
+        let mat = if el.kind.needs_material() {
+            model.material_for(el)?
+        } else {
+            Material::default()
+        };
         for dl in &model.dloads {
             match dl {
                 Dload::Pressure { elem, face, mag } if *elem == el.id => {
@@ -1442,7 +1487,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut m_unused = vec![0.0; ndof];
     for el in &model.elements {
         let xyz = elem_xyz(&model, &el.nodes)?;
-        if el.kind.is_point() || el.kind.is_dashpot() || el.kind.is_gap() {
+        if el.kind.is_special() {
             scatter_special(
                 &model,
                 el,
@@ -1454,7 +1499,11 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
             )?;
             continue;
         }
-        let mat = model.material_for(el)?;
+        let mat = if el.kind.needs_material() {
+            model.material_for(el)?
+        } else {
+            Material::default()
+        };
         let th = if el.kind.is_spring() {
             model.spring_k_for(el)?
         } else if el.kind.is_gap() {
@@ -1589,6 +1638,9 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut cnt = vec![0.0; nnode];
     let mut stress_gp = Vec::new();
     for el in &model.elements {
+        if !el.kind.needs_material() {
+            continue;
+        }
         let xyz = elem_xyz(&model, &el.nodes)?;
         let mat = model.material_for(el)?;
         let nn = el.kind.nnodes();

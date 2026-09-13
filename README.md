@@ -9,7 +9,7 @@ Zwei Frontends, ein Solver:
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
 
-**1.9.2** — Windows-MKL: `mkl_rt.dll` **neben `axia.exe`** (Shim `libmkl_rt.dll` im selben Ordner, nicht in `%TEMP%`). **1.9.1** — FRD long-ASCII wie ccx (Spalte 74, Fortran `E-02`, ` -1`/` -2`/` -3`), Windows-MKL findet `mkl_rt.dll` unter `$MKLROOT/bin`, Viewer Jet-Farbverlauf / Mecway-Colorbar. **1.9** — fehlende Elemente: CAX3/CAX6, C3D10T (B-bar), MASS, ROTARYI, DASHPOTA, GAPUNI, Aliase B21/B22 und C3D20RI. **1.8** — `*STATIC, RIKS` (Crisfield-Bogenlänge, Snap-Through). **1.7.1** — Viewer zeichnet T3D2/T3D3/SPRINGA (Fachwerk NLGEOM). **1.7** — Coulomb-`*FRICTION`, `NLGEOM`+`*PLASTIC` auf Kontinuum. **1.6** — `*CONTACT PAIR` Node-to-Surface, Penalty, reibungsfrei. **1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
+**1.9.3** — Mecway/CalculiX: `*ELEMENT` ohne `ELSET=` bekommt Material/Dicke/`*MASS` über spätere `*ELSET`-Mitgliedschaft; MASS/DASHPOT/GAP brauchen kein Kontinuum-`*MATERIAL`; GRAV auf `*MASS` als \(F=mg\). **1.9.2** — Windows-MKL: `mkl_rt.dll` **neben `axia.exe`** (Shim `libmkl_rt.dll` im selben Ordner, nicht in `%TEMP%`). **1.9.1** — FRD long-ASCII wie ccx (Spalte 74, Fortran `E-02`, ` -1`/` -2`/` -3`), Windows-MKL findet `mkl_rt.dll` unter `$MKLROOT/bin`, Viewer Jet-Farbverlauf / Mecway-Colorbar. **1.9** — fehlende Elemente: CAX3/CAX6, C3D10T (B-bar), MASS, ROTARYI, DASHPOTA, GAPUNI, Aliase B21/B22 und C3D20RI. **1.8** — `*STATIC, RIKS` (Crisfield-Bogenlänge, Snap-Through). **1.7.1** — Viewer zeichnet T3D2/T3D3/SPRINGA (Fachwerk NLGEOM). **1.7** — Coulomb-`*FRICTION`, `NLGEOM`+`*PLASTIC` auf Kontinuum. **1.6** — `*CONTACT PAIR` Node-to-Surface, Penalty, reibungsfrei. **1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
 
 ## CLI
 
@@ -141,6 +141,7 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 ## Features
 
 - INP-Parser: `*NODE`, `*ELEMENT`, `*NSET`/`*ELSET` (+ `GENERATE`), `*MATERIAL`/`*ELASTIC`/`*DENSITY`, `*INCLUDE`, `*EQUATION`, `*SURFACE`
+- Schnitte über ELSET-Mitgliedschaft (CalculiX/Mecway): `*ELEMENT` darf `ELSET=` weglassen; `*SHELL SECTION` / `*SOLID SECTION` / `*MASS` gelten für jedes Element, das später in dem Set steht
 - Schnitte: `*SOLID SECTION`, `*SHELL SECTION`, `*MEMBRANE SECTION`, `*BEAM SECTION` (`RECT`, `CIRC`, `PIPE`, `GENERAL`), `*SPRING`, `*MASS`, `*ROTARY INERTIA`, `*DASHPOT`, `*GAP`
 - Lasten und Lager: `*BOUNDARY` (DOF 1–6, NT=11), `*CLOAD`, `*DLOAD` (`P`, `P1…P6`, `GRAV`, `PX`/`PY`/`PZ`)
 - Linear-statische Analyse, isotrope Elastizität, MPC-Elimination (`*EQUATION`)
@@ -199,7 +200,7 @@ Knotenreihenfolge der quadratischen Elemente wie Abaqus/CalculiX: **Ecken zuerst
 | S3 / S3R | 3 | DKT-Biegung + CST-Membran |
 | S6 | 6 | quadratisches Dreieck |
 
-Dicke über `*SHELL SECTION`. Positive Drucklast `P` wirkt in Richtung der positiven Elementnormalen (rechte Hand, Knoten CCW).
+Dicke über `*SHELL SECTION`. Positive Drucklast `P` wirkt in Richtung der positiven Elementnormalen (rechte Hand, Knoten CCW). Mecway schreibt oft `*ELEMENT, TYPE=S4` **ohne** `ELSET=` und weist das Material erst über ein späteres `*ELSET` plus `*SHELL SECTION` zu — Axia bindet das wie CalculiX über die Set-Mitgliedschaft.
 
 ### Membran (3 translatorische DOF)
 
