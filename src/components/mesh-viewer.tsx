@@ -88,7 +88,10 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
     controls?: OrbitControls;
     solid?: THREE.Mesh;
     edges?: THREE.LineSegments;
+    points?: THREE.Points;
     extras?: THREE.Object3D[];
+    axesScene?: THREE.Scene;
+    axesCam?: THREE.PerspectiveCamera;
     raf?: number;
   }>({});
 
@@ -104,7 +107,8 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
       powerPreference: "high-performance",
     });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setClearColor(0x0c1014, 1);
+    renderer.setClearColor(0xf4f5f7, 1);
+    renderer.autoClear = false;
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 5000);
     camera.position.set(80, 50, 110);
@@ -113,19 +117,32 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
     controls.dampingFactor = 0.08;
     controls.target.set(0, 0, 0);
 
-    scene.add(new THREE.AmbientLight(0xb8c4ce, 0.85));
-    const key = new THREE.DirectionalLight(0xf2f4f6, 0.9);
-    key.position.set(0.6, 1, 0.4);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.92));
+    const key = new THREE.DirectionalLight(0xffffff, 0.45);
+    key.position.set(0.55, 1.1, 0.45);
     scene.add(key);
-    const fill = new THREE.DirectionalLight(0x7f93a3, 0.35);
-    fill.position.set(-0.8, 0.2, -0.6);
+    const fill = new THREE.DirectionalLight(0xffffff, 0.22);
+    fill.position.set(-0.7, 0.25, -0.5);
     scene.add(fill);
 
-    const grid = new THREE.GridHelper(120, 12, 0x2a3340, 0x1a212a);
+    const grid = new THREE.GridHelper(120, 12, 0xc5cad1, 0xdce0e5);
     grid.position.y = 0;
     scene.add(grid);
 
-    state.current = { renderer, scene, camera, controls };
+    const axesScene = new THREE.Scene();
+    const triad = new THREE.Group();
+    const axisLine = (to: [number, number, number]) => {
+      const g = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(...to),
+      ]);
+      return new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0x1a1a1a }));
+    };
+    triad.add(axisLine([1, 0, 0]), axisLine([0, 1, 0]), axisLine([0, 0, 1]));
+    axesScene.add(triad);
+    const axesCam = new THREE.PerspectiveCamera(50, 1, 0.1, 10);
+
+    state.current = { renderer, scene, camera, controls, axesScene, axesCam };
 
     const resize = () => {
       const w = wrap.clientWidth || 1;
@@ -140,7 +157,30 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
 
     const loop = () => {
       controls.update();
+      const w = wrap.clientWidth || 1;
+      const h = wrap.clientHeight || 1;
+      renderer.setViewport(0, 0, w, h);
+      renderer.setScissorTest(false);
+      renderer.clear();
       renderer.render(scene, camera);
+
+      axesCam.up.copy(camera.up);
+      axesCam.position.copy(camera.position).sub(controls.target);
+      if (axesCam.position.lengthSq() < 1e-12) axesCam.position.set(0.7, 0.45, 0.7);
+      axesCam.position.setLength(2.2);
+      axesCam.lookAt(0, 0, 0);
+      const aw = 72;
+      const ah = 72;
+      const ax = w - aw - 10;
+      const ay = h - ah - 52;
+      renderer.clearDepth();
+      renderer.setScissorTest(true);
+      renderer.setScissor(ax, Math.max(ay, 0), aw, ah);
+      renderer.setViewport(ax, Math.max(ay, 0), aw, ah);
+      renderer.render(axesScene, axesCam);
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, w, h);
+
       state.current.raf = requestAnimationFrame(loop);
     };
     loop();
@@ -169,6 +209,12 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
       state.current.edges.geometry.dispose();
       (state.current.edges.material as THREE.Material).dispose();
       state.current.edges = undefined;
+    }
+    if (state.current.points) {
+      scene.remove(state.current.points);
+      state.current.points.geometry.dispose();
+      (state.current.points.material as THREE.Material).dispose();
+      state.current.points = undefined;
     }
     if (state.current.extras) {
       for (const o of state.current.extras) {
@@ -606,7 +652,7 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
       ego.setAttribute("position", new THREE.Float32BufferAttribute(epos, 3));
       const edges = new THREE.LineSegments(
         ego,
-        new THREE.LineBasicMaterial({ color: 0x0a0c0e, transparent: true, opacity: 0.55 }),
+        new THREE.LineBasicMaterial({ color: 0x1a1a1a, transparent: false }),
       );
       scene.add(edges);
       state.current.edges = edges;
@@ -614,6 +660,21 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
         ego.computeBoundingBox();
         fitBox = ego.boundingBox;
       }
+    }
+    if (n > 0) {
+      const pgeo = new THREE.BufferGeometry();
+      pgeo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+      const pts = new THREE.Points(
+        pgeo,
+        new THREE.PointsMaterial({
+          color: 0xc41e3a,
+          size: 5,
+          sizeAttenuation: false,
+          depthTest: true,
+        }),
+      );
+      scene.add(pts);
+      state.current.points = pts;
     }
     if (extras.length > 0) {
       const extraBox = new THREE.Box3();

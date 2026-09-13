@@ -10,7 +10,7 @@ import { Group, Panel, Separator } from "react-resizable-panels";
 import { Button } from "@/components/ui/button";
 import { InpEditor } from "@/components/inp-editor";
 import { MeshViewer, fieldRange, type FieldId } from "@/components/mesh-viewer";
-import { COLORBAR_CSS } from "@/lib/colormap";
+import { COLORBAR_TICKS, formatLegend, sampleCss } from "@/lib/colormap";
 import { DEFAULT_EXAMPLE, EXAMPLES } from "@/lib/examples";
 import {
   initSolver,
@@ -22,16 +22,16 @@ import { cn, downloadText, formatNum } from "@/lib/utils";
 
 export const Route = createFileRoute("/")({ component: Home });
 
-const FIELDS: { id: FieldId; label: string }[] = [
-  { id: "vm", label: "von Mises" },
-  { id: "u", label: "|u|" },
-  { id: "ux", label: "ux" },
-  { id: "uy", label: "uy" },
-  { id: "uz", label: "uz" },
-  { id: "sxx", label: "Sxx" },
-  { id: "syy", label: "Syy" },
-  { id: "szz", label: "Szz" },
-  { id: "sxy", label: "Sxy" },
+const FIELDS: { id: FieldId; label: string; title: string }[] = [
+  { id: "vm", label: "von Mises", title: "von Mises stress" },
+  { id: "u", label: "|u|", title: "Displacement" },
+  { id: "ux", label: "ux", title: "Displacement ux" },
+  { id: "uy", label: "uy", title: "Displacement uy" },
+  { id: "uz", label: "uz", title: "Displacement uz" },
+  { id: "sxx", label: "Sxx", title: "Stress Sxx" },
+  { id: "syy", label: "Syy", title: "Stress Syy" },
+  { id: "szz", label: "Szz", title: "Stress Szz" },
+  { id: "sxy", label: "Sxy", title: "Stress Sxy" },
 ];
 
 function Home() {
@@ -459,7 +459,7 @@ function ViewerColumn({
   return (
     <div className="relative flex h-full min-h-0 flex-col bg-viewport">
       <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex flex-wrap items-start justify-between gap-2 p-3">
-        <div className="pointer-events-auto flex flex-wrap items-center gap-1.5 rounded-xl bg-bg/80 p-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.08)]">
+        <div className="pointer-events-auto flex flex-wrap items-center gap-1.5 rounded-xl bg-bg/90 p-1.5 shadow-[0_8px_24px_rgba(0,0,0,0.18)]">
           {FIELDS.map((f) => (
             <button
               key={f.id}
@@ -475,7 +475,7 @@ function ViewerColumn({
             </button>
           ))}
         </div>
-        <div className="pointer-events-auto flex items-center gap-2 rounded-xl bg-bg/80 px-2.5 py-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.08)]">
+        <div className="pointer-events-auto flex items-center gap-2 rounded-xl bg-bg/90 px-2.5 py-1.5 shadow-[0_8px_24px_rgba(0,0,0,0.18)]">
           <label className="flex items-center gap-2 text-xs text-muted">
             <input
               type="checkbox"
@@ -509,15 +509,28 @@ function ViewerColumn({
 
       <MeshViewer mesh={mesh} result={solved ? result : mesh} field={field} deformed={deformed && solved} scale={scale} />
 
-      <div className="absolute right-3 bottom-16 z-10 flex items-stretch gap-2">
-        <div
-          className="h-36 w-2.5 rounded-full"
-          style={{ background: `linear-gradient(to top, ${COLORBAR_CSS})` }}
-        />
-        <div className="flex flex-col justify-between py-0.5 font-mono text-[11px] text-muted tabular-nums">
-          <span>{solved && range ? formatNum(range.max, 3) : "—"}</span>
-          <span>{solved && range ? formatNum((range.min + range.max) / 2, 3) : ""}</span>
-          <span>{solved && range ? formatNum(range.min, 3) : "—"}</span>
+      <div className="absolute left-3 top-[3.35rem] z-10 pointer-events-none select-none">
+        <p className="mb-1 text-[11px] font-medium text-zinc-800">
+          {FIELDS.find((f) => f.id === field)?.title ?? field}
+        </p>
+        <div className="flex items-stretch gap-1.5">
+          <div className="flex w-[18px] flex-col overflow-hidden rounded-[2px] shadow-[0_0_0_1px_rgba(0,0,0,0.25)]">
+            {Array.from({ length: COLORBAR_TICKS }, (_, i) => (
+              <div
+                key={i}
+                className="min-h-3.5 flex-1"
+                style={{ background: sampleCss(1 - i / Math.max(COLORBAR_TICKS - 1, 1)) }}
+              />
+            ))}
+          </div>
+          <div className="flex flex-col justify-between py-px font-mono text-[10px] leading-none text-zinc-700 tabular-nums">
+            {Array.from({ length: COLORBAR_TICKS }, (_, i) => {
+              if (!solved || !range) return <span key={i}>—</span>;
+              const t = i / Math.max(COLORBAR_TICKS - 1, 1);
+              const v = range.max - t * (range.max - range.min);
+              return <span key={i}>{formatLegend(v)}</span>;
+            })}
+          </div>
         </div>
       </div>
 
