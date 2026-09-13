@@ -1,4 +1,4 @@
-//! Extra continuum / discrete elements: C3D6, C3D8I, C3D8R, T3D2/T3D3, SPRINGA.
+//! Extra continuum / discrete elements: C3D6, C3D8I, C3D8R, T3D2/T3D3, SPRINGA, GAPUNI.
 
 use crate::elem::{
     d_iso_3d, fill_b3, gemm_bt_d_b, invert3, sigma_from_b, G2, hex8_dndx, hex8_shape, QUAD_XI,

@@ -562,6 +562,59 @@ pub fn element_ke(
                 volume: vol,
             })
         }
+        ElemKind::Cax3 => {
+            let (ke, vol) = crate::axisym::cax3_stiffness(xyz, e, nu)?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 6],
+                ndof: 6,
+                volume: vol,
+            })
+        }
+        ElemKind::Cax6 => {
+            let (ke, vol) = crate::axisym::cax6_stiffness(xyz, e, nu)?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 12],
+                ndof: 12,
+                volume: vol,
+            })
+        }
+        ElemKind::Tet10T => {
+            let (ke, vol) = quadratic::tet10t_stiffness(xyz, e, nu)?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 30],
+                ndof: 30,
+                volume: vol,
+            })
+        }
+        ElemKind::Mass | ElemKind::RotaryI => {
+            let nd = kind.ndof_per_node() * kind.nnodes();
+            Ok(KeFe {
+                ke: vec![0.0; nd * nd],
+                fe: vec![0.0; nd],
+                ndof: nd,
+                volume: 0.0,
+            })
+        }
+        ElemKind::DashpotA => {
+            Ok(KeFe {
+                ke: vec![0.0; 36],
+                fe: vec![0.0; 6],
+                ndof: 6,
+                volume: 0.0,
+            })
+        }
+        ElemKind::GapUni => {
+            let (ke, vol) = extra::spring_stiffness(xyz, thickness.max(0.0))?;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; 6],
+                ndof: 6,
+                volume: vol,
+            })
+        }
     }
 }
 
@@ -616,6 +669,11 @@ pub fn element_nodal_stress(
         }
         ElemKind::Cax4 | ElemKind::Cax4R => crate::axisym::cax4_nodal_stress(xyz, ue, e, nu),
         ElemKind::Cax8 | ElemKind::Cax8R => crate::axisym::cax8_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Cax3 => crate::axisym::cax3_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Cax6 => crate::axisym::cax6_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Tet10T => quadratic::tet10_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Mass | ElemKind::RotaryI => Ok(vec![[0.0; 6]; 1]),
+        ElemKind::DashpotA | ElemKind::GapUni => Ok(vec![[0.0; 6]; 2]),
     }
 }
 

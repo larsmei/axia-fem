@@ -25,6 +25,8 @@ pub enum ElemKind {
     Cax4R,
     Cax8,
     Cax8R,
+    Cax3,
+    Cax6,
     Beam31,
     Beam32,
     Shell4,
@@ -41,6 +43,11 @@ pub enum ElemKind {
     Truss2,
     Truss3,
     SpringA,
+    Tet10T,
+    Mass,
+    RotaryI,
+    DashpotA,
+    GapUni,
 }
 
 impl ElemKind {
@@ -69,6 +76,14 @@ impl ElemKind {
             "CAX4R" => Self::Cax4R,
             "CAX8" => Self::Cax8,
             "CAX8R" => Self::Cax8R,
+            "CAX3" => Self::Cax3,
+            "CAX6" => Self::Cax6,
+            "C3D10T" => Self::Tet10T,
+            "C3D20RI" => Self::Hex20R,
+            "MASS" => Self::Mass,
+            "ROTARYI" => Self::RotaryI,
+            "DASHPOTA" | "DASHPOT" => Self::DashpotA,
+            "GAPUNI" => Self::GapUni,
             "S4" => Self::Shell4,
             "S4R" => Self::Shell4R,
             "S3" | "S3R" | "STRI3" => Self::Shell3,
@@ -80,23 +95,8 @@ impl ElemKind {
             "M3D4R" => Self::Mem4R,
             "M3D6" => Self::Mem6,
             "M3D8" | "M3D8R" => Self::Mem8,
-            "CPE4" | "CPE4R" | "CPE4I" => Self::Quad4Pe,
-            "CPS8" => Self::Quad8Ps,
-            "CPE8" => Self::Quad8Pe,
-            "CPS8R" => Self::Quad8RPs,
-            "CPE8R" => Self::Quad8RPe,
-            "CPS3" => Self::Tri3Ps,
-            "CPE3" => Self::Tri3Pe,
-            "CPS6" => Self::Tri6Ps,
-            "CPE6" => Self::Tri6Pe,
-            "S4" => Self::Shell4,
-            "S4R" => Self::Shell4R,
-            "S3" | "S3R" | "STRI3" => Self::Shell3,
-            "S8" => Self::Shell8,
-            "S8R" => Self::Shell8R,
-            "S6" | "STRI65" => Self::Shell6,
-            "B31" | "B31R" => Self::Beam31,
-            "B32" | "B32R" => Self::Beam32,
+            "B31" | "B31R" | "B21" | "B21R" => Self::Beam31,
+            "B32" | "B32R" | "B22" | "B22R" => Self::Beam32,
             "T3D2" | "T2D2" => Self::Truss2,
             "T3D3" => Self::Truss3,
             "SPRINGA" | "SPRING2" => Self::SpringA,
@@ -109,7 +109,7 @@ impl ElemKind {
             Self::Hex8 | Self::Hex8I | Self::Hex8R => 8,
             Self::Hex20 | Self::Hex20R => 20,
             Self::Tet4 => 4,
-            Self::Tet10 => 10,
+            Self::Tet10 | Self::Tet10T => 10,
             Self::Wedge6 => 6,
             Self::Wedge15 => 15,
             Self::Quad4Ps | Self::Quad4Pe | Self::Cax4 | Self::Cax4R | Self::Mem4 | Self::Mem4R => 4,
@@ -120,15 +120,16 @@ impl ElemKind {
             | Self::Cax8
             | Self::Cax8R
             | Self::Mem8 => 8,
-            Self::Tri3Ps | Self::Tri3Pe | Self::Mem3 => 3,
-            Self::Tri6Ps | Self::Tri6Pe | Self::Shell6 | Self::Mem6 => 6,
+            Self::Tri3Ps | Self::Tri3Pe | Self::Mem3 | Self::Cax3 => 3,
+            Self::Tri6Ps | Self::Tri6Pe | Self::Shell6 | Self::Mem6 | Self::Cax6 => 6,
             Self::Beam31 => 2,
             Self::Beam32 => 3,
             Self::Shell4 | Self::Shell4R => 4,
             Self::Shell3 => 3,
             Self::Shell8 | Self::Shell8R => 8,
-            Self::Truss2 | Self::SpringA => 2,
+            Self::Truss2 | Self::SpringA | Self::DashpotA | Self::GapUni => 2,
             Self::Truss3 => 3,
+            Self::Mass | Self::RotaryI => 1,
         }
     }
 
@@ -141,6 +142,7 @@ impl ElemKind {
             | Self::Hex20R
             | Self::Tet4
             | Self::Tet10
+            | Self::Tet10T
             | Self::Wedge6
             | Self::Wedge15
             | Self::Beam31
@@ -148,6 +150,10 @@ impl ElemKind {
             | Self::Truss2
             | Self::Truss3
             | Self::SpringA
+            | Self::Mass
+            | Self::RotaryI
+            | Self::DashpotA
+            | Self::GapUni
             | Self::Shell4
             | Self::Shell4R
             | Self::Shell3
@@ -173,6 +179,7 @@ impl ElemKind {
             | Self::Shell8
             | Self::Shell8R
             | Self::Shell6 => 6,
+            Self::RotaryI => 6,
             k if k.spatial_dim() == 3 => 3,
             _ => 2,
         }
@@ -202,7 +209,10 @@ impl ElemKind {
     }
 
     pub fn is_axisym(self) -> bool {
-        matches!(self, Self::Cax4 | Self::Cax4R | Self::Cax8 | Self::Cax8R)
+        matches!(
+            self,
+            Self::Cax4 | Self::Cax4R | Self::Cax8 | Self::Cax8R | Self::Cax3 | Self::Cax6
+        )
     }
 
     pub fn is_continuum3d(self) -> bool {
@@ -215,6 +225,7 @@ impl ElemKind {
                 | Self::Hex20R
                 | Self::Tet4
                 | Self::Tet10
+                | Self::Tet10T
                 | Self::Wedge6
                 | Self::Wedge15
         )
@@ -228,12 +239,25 @@ impl ElemKind {
         matches!(self, Self::SpringA)
     }
 
+    pub fn is_point(self) -> bool {
+        matches!(self, Self::Mass | Self::RotaryI)
+    }
+
+    pub fn is_dashpot(self) -> bool {
+        matches!(self, Self::DashpotA)
+    }
+
+    pub fn is_gap(self) -> bool {
+        matches!(self, Self::GapUni)
+    }
+
     pub fn is_quadratic(self) -> bool {
         matches!(
             self,
             Self::Hex20
                 | Self::Hex20R
                 | Self::Tet10
+                | Self::Tet10T
                 | Self::Quad8Ps
                 | Self::Quad8Pe
                 | Self::Quad8RPs
@@ -247,6 +271,7 @@ impl ElemKind {
                 | Self::Wedge15
                 | Self::Cax8
                 | Self::Cax8R
+                | Self::Cax6
                 | Self::Mem6
                 | Self::Mem8
         )
@@ -283,6 +308,7 @@ impl ElemKind {
             Self::Hex20R => "C3D20R",
             Self::Tet4 => "C3D4",
             Self::Tet10 => "C3D10",
+            Self::Tet10T => "C3D10T",
             Self::Wedge6 => "C3D6",
             Self::Wedge15 => "C3D15",
             Self::Quad4Ps => "CPS4",
@@ -299,6 +325,8 @@ impl ElemKind {
             Self::Cax4R => "CAX4R",
             Self::Cax8 => "CAX8",
             Self::Cax8R => "CAX8R",
+            Self::Cax3 => "CAX3",
+            Self::Cax6 => "CAX6",
             Self::Beam31 => "B31",
             Self::Beam32 => "B32",
             Self::Shell4 => "S4",
@@ -313,26 +341,12 @@ impl ElemKind {
             Self::Mem6 => "M3D6",
             Self::Mem8 => "M3D8",
             Self::Truss2 => "T3D2",
-            Self::Quad4Pe => "CPE4",
-            Self::Quad8Ps => "CPS8",
-            Self::Quad8Pe => "CPE8",
-            Self::Quad8RPs => "CPS8R",
-            Self::Quad8RPe => "CPE8R",
-            Self::Tri3Ps => "CPS3",
-            Self::Tri3Pe => "CPE3",
-            Self::Tri6Ps => "CPS6",
-            Self::Tri6Pe => "CPE6",
-            Self::Beam31 => "B31",
-            Self::Beam32 => "B32",
-            Self::Shell4 => "S4",
-            Self::Shell4R => "S4R",
-            Self::Shell3 => "S3",
-            Self::Shell8 => "S8",
-            Self::Shell8R => "S8R",
-            Self::Shell6 => "S6",
-            Self::Truss2 => "T3D2",
             Self::Truss3 => "T3D3",
             Self::SpringA => "SPRINGA",
+            Self::Mass => "MASS",
+            Self::RotaryI => "ROTARYI",
+            Self::DashpotA => "DASHPOTA",
+            Self::GapUni => "GAPUNI",
         }
     }
 
@@ -341,12 +355,12 @@ impl ElemKind {
         match self {
             Self::Hex8 | Self::Hex8I | Self::Hex8R => 1,
             Self::Wedge6 => 2,
-            Self::Wedge15 => 5,
-            Self::Hex20 | Self::Hex20R => 4,
             Self::Tet4 => 3,
-            Self::Tet10 => 6,
-            Self::Tri3Ps | Self::Tri3Pe | Self::Shell3 | Self::Mem3 => 7,
-            Self::Tri6Ps | Self::Tri6Pe | Self::Shell6 | Self::Mem6 => 8,
+            Self::Hex20 | Self::Hex20R => 4,
+            Self::Wedge15 => 5,
+            Self::Tet10 | Self::Tet10T => 6,
+            Self::Tri3Ps | Self::Tri3Pe | Self::Shell3 | Self::Mem3 | Self::Cax3 => 7,
+            Self::Tri6Ps | Self::Tri6Pe | Self::Shell6 | Self::Mem6 | Self::Cax6 => 8,
             Self::Quad4Ps
             | Self::Quad4Pe
             | Self::Shell4
@@ -364,18 +378,13 @@ impl ElemKind {
             | Self::Cax8
             | Self::Cax8R
             | Self::Mem8 => 10,
-            Self::Tet4 => 3,
-            Self::Tet10 => 6,
-            Self::Tri3Ps | Self::Tri3Pe | Self::Shell3 => 7,
-            Self::Tri6Ps | Self::Tri6Pe | Self::Shell6 => 8,
-            Self::Quad4Ps | Self::Quad4Pe | Self::Shell4 | Self::Shell4R => 9,
-            Self::Quad8Ps
-            | Self::Quad8Pe
-            | Self::Quad8RPs
-            | Self::Quad8RPe
-            | Self::Shell8
-            | Self::Shell8R => 10,
-            Self::Beam31 | Self::Truss2 | Self::SpringA => 11,
+            Self::Beam31
+            | Self::Truss2
+            | Self::SpringA
+            | Self::Mass
+            | Self::RotaryI
+            | Self::DashpotA
+            | Self::GapUni => 11,
             Self::Beam32 | Self::Truss3 => 12,
         }
     }
@@ -427,6 +436,13 @@ pub struct BeamSection {
     pub jtor: f64,
     pub k11: f64,
     pub k22: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GapSection {
+    pub clearance: f64,
+    pub k: f64,
+    pub dir: [f64; 3],
 }
 
 impl BeamSection {
@@ -777,6 +793,10 @@ pub struct Model {
     pub transforms: Vec<Transform>,
     pub node_transform: HashMap<i32, [[f64; 3]; 3]>,
     pub elset_spring: HashMap<String, f64>,
+    pub elset_mass: HashMap<String, f64>,
+    pub elset_rotary: HashMap<String, [f64; 6]>,
+    pub elset_dashpot: HashMap<String, f64>,
+    pub elset_gap: HashMap<String, GapSection>,
     pub temperatures: HashMap<i32, f64>,
     pub plastic: HashMap<String, Vec<(f64, f64)>>, // material -> [(peeq, sy)]
     pub interactions: HashMap<String, SurfaceInteraction>,
@@ -828,6 +848,10 @@ impl Model {
             transforms: Vec::new(),
             node_transform: HashMap::new(),
             elset_spring: HashMap::new(),
+            elset_mass: HashMap::new(),
+            elset_rotary: HashMap::new(),
+            elset_dashpot: HashMap::new(),
+            elset_gap: HashMap::new(),
             temperatures: HashMap::new(),
             plastic: HashMap::new(),
             interactions: HashMap::new(),
@@ -870,6 +894,7 @@ impl Model {
     pub fn ndof_node(&self) -> usize {
         if self.has_beams()
             || self.has_shells()
+            || self.elements.iter().any(|e| e.kind == ElemKind::RotaryI)
             || !self.rigid_bodies.is_empty()
             || self.couplings.iter().any(|c| c.kinematic)
         {
@@ -1016,6 +1041,59 @@ impl Model {
             "Keine *SPRING-Steifigkeit für Element {} (ELSET={})",
             el.id, el.elset
         ))
+    }
+
+    pub fn mass_for(&self, el: &Element) -> crate::error::Result<f64> {
+        if let Some(&m) = self.elset_mass.get(&el.elset) {
+            return Ok(m);
+        }
+        if self.elset_mass.len() == 1 {
+            return Ok(*self.elset_mass.values().next().unwrap());
+        }
+        crate::error::err(format!(
+            "Keine *MASS für Element {} (ELSET={})",
+            el.id, el.elset
+        ))
+    }
+
+    pub fn rotary_for(&self, el: &Element) -> crate::error::Result<[f64; 6]> {
+        if let Some(&i) = self.elset_rotary.get(&el.elset) {
+            return Ok(i);
+        }
+        if self.elset_rotary.len() == 1 {
+            return Ok(*self.elset_rotary.values().next().unwrap());
+        }
+        crate::error::err(format!(
+            "Keine *ROTARY INERTIA für Element {} (ELSET={})",
+            el.id, el.elset
+        ))
+    }
+
+    pub fn dashpot_for(&self, el: &Element) -> crate::error::Result<f64> {
+        if let Some(&c) = self.elset_dashpot.get(&el.elset) {
+            return Ok(c);
+        }
+        if self.elset_dashpot.len() == 1 {
+            return Ok(*self.elset_dashpot.values().next().unwrap());
+        }
+        crate::error::err(format!(
+            "Keine *DASHPOT-Dämpfung für Element {} (ELSET={})",
+            el.id, el.elset
+        ))
+    }
+
+    pub fn gap_for(&self, el: &Element) -> crate::error::Result<GapSection> {
+        if let Some(&g) = self.elset_gap.get(&el.elset) {
+            return Ok(g);
+        }
+        if self.elset_gap.len() == 1 {
+            return Ok(*self.elset_gap.values().next().unwrap());
+        }
+        Ok(GapSection {
+            clearance: 0.0,
+            k: 1.0e8,
+            dir: [0.0, 0.0, 0.0],
+        })
     }
 
     pub fn temperature_at(&self, node: i32) -> f64 {

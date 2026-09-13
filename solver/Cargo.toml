@@ -1,8 +1,8 @@
 [package]
 name = "axia-fem"
-version = "1.8.0"
+version = "1.9.0"
 edition = "2021"
-description = "FEM solver with CalculiX INP/FRD compatibility (linear, frequency, buckle, heat, dynamic, NLGEOM, J2, contact, Riks)"
+description = "FEM solver with CalculiX INP/FRD compatibility (linear, frequency, buckle, heat, dynamic, NLGEOM, J2, contact, Riks, CAX3/6, C3D10T, MASS/GAP/DASHPOT)"
 license = "MIT"
 authors = ["Lars Meindl"]
 repository = "https://github.com/larsmei/axia-fem"

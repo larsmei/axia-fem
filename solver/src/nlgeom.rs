@@ -137,7 +137,7 @@ pub fn continuum_nl(
         ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R => hex8_nl(xyz0, ue, e, nu),
         ElemKind::Hex20 | ElemKind::Hex20R => hex20_nl(xyz0, ue, e, nu, kind.reduced_int()),
         ElemKind::Tet4 => tet4_nl(xyz0, ue, e, nu),
-        ElemKind::Tet10 => tet10_nl(xyz0, ue, e, nu),
+        ElemKind::Tet10 | ElemKind::Tet10T => tet10_nl(xyz0, ue, e, nu),
         ElemKind::Wedge6 => wedge6_nl(xyz0, ue, e, nu),
         ElemKind::Wedge15 => wedge15_nl(xyz0, ue, e, nu),
         _ => err(format!(

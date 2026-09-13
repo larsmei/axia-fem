@@ -1303,6 +1303,67 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                 };
                 model.elset_spring.insert(elset, k);
             }
+            "*MASS" => {
+                let elset = params
+                    .get("ELSET")
+                    .cloned()
+                    .unwrap_or_else(|| "EALL".into());
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let m = if !toks.is_empty() {
+                    parse_f64(&toks[0])?
+                } else {
+                    return err("*MASS ohne Wert");
+                };
+                model.elset_mass.insert(elset, m);
+            }
+            "*ROTARY INERTIA" | "*ROTARYI" => {
+                let elset = params
+                    .get("ELSET")
+                    .cloned()
+                    .unwrap_or_else(|| "EALL".into());
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut ijk = [0.0; 6];
+                for (k, t) in toks.iter().take(6).enumerate() {
+                    ijk[k] = parse_f64(t).unwrap_or(0.0);
+                }
+                model.elset_rotary.insert(elset, ijk);
+            }
+            "*DASHPOT" => {
+                let elset = params
+                    .get("ELSET")
+                    .cloned()
+                    .unwrap_or_else(|| "EALL".into());
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let c = if !toks.is_empty() {
+                    parse_f64(&toks[toks.len() - 1])?
+                } else {
+                    return err("*DASHPOT ohne Dämpfung");
+                };
+                model.elset_dashpot.insert(elset, c);
+            }
+            "*GAP" => {
+                let elset = params
+                    .get("ELSET")
+                    .cloned()
+                    .unwrap_or_else(|| "EALL".into());
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let clearance = toks.get(0).and_then(|t| parse_f64(t).ok()).unwrap_or(0.0);
+                let k = toks.get(1).and_then(|t| parse_f64(t).ok()).unwrap_or(1.0e8);
+                let mut dir = [0.0; 3];
+                if toks.len() >= 5 {
+                    dir[0] = parse_f64(&toks[toks.len() - 3]).unwrap_or(0.0);
+                    dir[1] = parse_f64(&toks[toks.len() - 2]).unwrap_or(0.0);
+                    dir[2] = parse_f64(&toks[toks.len() - 1]).unwrap_or(0.0);
+                }
+                model.elset_gap.insert(
+                    elset,
+                    crate::model::GapSection { clearance, k, dir },
+                );
+            }
             "*PLASTIC" => {
                 let (toks, ni) = collect_tokens(&lines, i + 1);
                 i = ni;

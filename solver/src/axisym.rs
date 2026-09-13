@@ -1,10 +1,10 @@
-//! Axisymmetric solids CAX4/CAX4R/CAX8/CAX8R.
+//! Axisymmetric solids CAX3/CAX4/CAX4R/CAX6/CAX8/CAX8R.
 //! r = x, z = y. Strains [εr, εz, εθ, γrz], 2 DOF/node (ur, uz).
 //! Integration weight 2π r det J (CalculiX convention).
 
 use crate::elem::{gemm_bt_d_b, invert2, sigma_from_b, G2};
 use crate::error::{err, Result};
-use crate::quadratic::{quad8_dndx, quad8_shape, QUAD8_XI, G3, W3};
+use crate::quadratic::{quad8_dndx, QUAD8_XI, G3, W3};
 
 const QUAD_XI: [[f64; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
 
@@ -248,6 +248,65 @@ pub fn cax_edge_pressure(xyz: &[[f64; 3]], nn: usize, face: i32, p: f64) -> Resu
     }
     let edges4 = [[0, 1], [1, 2], [2, 3], [3, 0]];
     let mut fe = vec![0.0; 2 * nn];
+    if nn == 3 {
+        let edges = [[0, 1], [1, 2], [2, 0]];
+        if !(1..=3).contains(&face) {
+            return err(format!("Ungültige CAX3-Kante P{face}"));
+        }
+        let a = edges[(face - 1) as usize][0];
+        let b = edges[(face - 1) as usize][1];
+        let pa = xyz[a];
+        let pb = xyz[b];
+        let dr = pb[0] - pa[0];
+        let dz = pb[1] - pa[1];
+        let len = (dr * dr + dz * dz).sqrt().max(1e-18);
+        let nr = dz / len;
+        let nz = -dr / len;
+        let rmid = 0.5 * (pa[0] + pb[0]).max(0.0);
+        let f = -p * len * two_pi() * rmid.max(1e-16) / 2.0;
+        fe[2 * a] += f * nr;
+        fe[2 * a + 1] += f * nz;
+        fe[2 * b] += f * nr;
+        fe[2 * b + 1] += f * nz;
+        return Ok(fe);
+    }
+    if nn == 6 {
+        // CAX6: 3-node edges 1-2-4, 2-3-5, 3-1-6
+        if !(1..=3).contains(&face) {
+            return err(format!("Ungültige CAX6-Kante P{face}"));
+        }
+        let e6 = [[0, 1, 3], [1, 2, 4], [2, 0, 5]];
+        let idx = e6[(face - 1) as usize];
+        for k in 0..3 {
+            let xi = G3[k];
+            let w = W3[k];
+            let n1 = -0.5 * xi * (1.0 - xi);
+            let n2 = 0.5 * xi * (1.0 + xi);
+            let n3 = 1.0 - xi * xi;
+            let dn1 = xi - 0.5;
+            let dn2 = xi + 0.5;
+            let dn3 = -2.0 * xi;
+            let nshp = [n1, n2, n3];
+            let dn = [dn1, dn2, dn3];
+            let mut r = 0.0;
+            let mut dr = 0.0;
+            let mut dz = 0.0;
+            for a in 0..3 {
+                r += nshp[a] * xyz[idx[a]][0];
+                dr += dn[a] * xyz[idx[a]][0];
+                dz += dn[a] * xyz[idx[a]][1];
+            }
+            let jac = (dr * dr + dz * dz).sqrt();
+            let nr = dz / jac.max(1e-18);
+            let nz = -dr / jac.max(1e-18);
+            let coef = -p * jac * two_pi() * r.max(1e-16) * w;
+            for a in 0..3 {
+                fe[2 * idx[a]] += nshp[a] * coef * nr;
+                fe[2 * idx[a] + 1] += nshp[a] * coef * nz;
+            }
+        }
+        return Ok(fe);
+    }
     if nn == 4 {
         let a = edges4[(face - 1) as usize][0];
         let b = edges4[(face - 1) as usize][1];
@@ -300,6 +359,165 @@ pub fn cax_edge_pressure(xyz: &[[f64; 3]], nn: usize, face: i32, p: f64) -> Resu
                 fe[2 * idx[a]] += nshp[a] * coef * nr;
                 fe[2 * idx[a] + 1] += nshp[a] * coef * nz;
             }
+        }
+    }
+    Ok(fe)
+}
+
+fn tri_gauss3() -> [(f64, f64, f64); 3] {
+    [
+        (1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0),
+        (2.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0),
+        (1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0),
+    ]
+}
+
+fn tri3_dndx(xy: &[[f64; 2]]) -> Result<([[f64; 2]; 3], f64)> {
+    let two_a = xy[0][0] * (xy[1][1] - xy[2][1])
+        + xy[1][0] * (xy[2][1] - xy[0][1])
+        + xy[2][0] * (xy[0][1] - xy[1][1]);
+    if two_a <= 0.0 {
+        return err("CAX3: nicht-positive Fläche (Knotenreihenfolge).");
+    }
+    let mut dndx = [[0.0; 2]; 3];
+    dndx[0] = [(xy[1][1] - xy[2][1]) / two_a, (xy[2][0] - xy[1][0]) / two_a];
+    dndx[1] = [(xy[2][1] - xy[0][1]) / two_a, (xy[0][0] - xy[2][0]) / two_a];
+    dndx[2] = [(xy[0][1] - xy[1][1]) / two_a, (xy[1][0] - xy[0][0]) / two_a];
+    Ok((dndx, two_a))
+}
+
+pub fn cax3_stiffness(xyz: &[[f64; 3]], e: f64, nu: f64) -> Result<(Vec<f64>, f64)> {
+    if xyz.len() < 3 {
+        return err("CAX3 braucht 3 Knoten.");
+    }
+    let mut xy = [[0.0; 2]; 3];
+    for i in 0..3 {
+        xy[i] = [xyz[i][0], xyz[i][1]];
+    }
+    let d = d_axisym(e, nu)?;
+    let n = 6usize;
+    let mut ke = vec![0.0; n * n];
+    let mut vol = 0.0;
+    let (dndx, two_a) = tri3_dndx(&xy)?;
+    for (xi, eta, w0) in tri_gauss3() {
+        let nshp = [1.0 - xi - eta, xi, eta];
+        let r = radius(&xy, &nshp, 3);
+        let w = two_pi() * r.max(1e-16) * two_a * w0;
+        let mut b = vec![0.0; 4 * n];
+        fill_b_cax(&mut b, 3, &dndx, &nshp, r);
+        gemm_bt_d_b(&mut ke, n, &b, 4, &d, w);
+        vol += w;
+    }
+    Ok((ke, vol))
+}
+
+pub fn cax6_stiffness(xyz: &[[f64; 3]], e: f64, nu: f64) -> Result<(Vec<f64>, f64)> {
+    if xyz.len() < 6 {
+        return err("CAX6 braucht 6 Knoten.");
+    }
+    let mut xy = [[0.0; 2]; 6];
+    for i in 0..6 {
+        xy[i] = [xyz[i][0], xyz[i][1]];
+    }
+    let d = d_axisym(e, nu)?;
+    let n = 12usize;
+    let mut ke = vec![0.0; n * n];
+    let mut vol = 0.0;
+    for (xi, eta, w0) in tri_gauss3() {
+        let (dndx, det, nshp) = crate::quadratic::tri6_dndx(&xy, xi, eta)?;
+        if det <= 0.0 {
+            return err("CAX6: negative Jakobideterminante.");
+        }
+        let r = radius(&xy, &nshp, 6);
+        let w = two_pi() * r.max(1e-16) * det * w0;
+        let mut b = vec![0.0; 4 * n];
+        fill_b_cax(&mut b, 6, &dndx, &nshp, r);
+        gemm_bt_d_b(&mut ke, n, &b, 4, &d, w);
+        vol += w;
+    }
+    Ok((ke, vol))
+}
+
+pub fn cax3_nodal_stress(xyz: &[[f64; 3]], ue: &[f64], e: f64, nu: f64) -> Result<Vec<[f64; 6]>> {
+    let mut xy = [[0.0; 2]; 3];
+    for i in 0..3 {
+        xy[i] = [xyz[i][0], xyz[i][1]];
+    }
+    let d = d_axisym(e, nu)?;
+    let n = 6usize;
+    let (dndx, _) = tri3_dndx(&xy)?;
+    let mut out = vec![[0.0; 6]; 3];
+    for a in 0..3 {
+        let mut nshp = [0.0; 3];
+        nshp[a] = 1.0;
+        let r = radius(&xy, &nshp, 3);
+        let mut b = vec![0.0; 4 * n];
+        fill_b_cax(&mut b, 3, &dndx, &nshp, r);
+        let s = sigma_from_b(&b, 4, n, &d, ue);
+        out[a] = voigt_from_cax(&s);
+    }
+    Ok(out)
+}
+
+pub fn cax6_nodal_stress(xyz: &[[f64; 3]], ue: &[f64], e: f64, nu: f64) -> Result<Vec<[f64; 6]>> {
+    let mut xy = [[0.0; 2]; 6];
+    for i in 0..6 {
+        xy[i] = [xyz[i][0], xyz[i][1]];
+    }
+    let d = d_axisym(e, nu)?;
+    let n = 12usize;
+    let corners = [
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.5, 0.0],
+        [0.5, 0.5],
+        [0.0, 0.5],
+    ];
+    let mut out = vec![[0.0; 6]; 6];
+    for a in 0..6 {
+        let (dndx, _, nshp) = crate::quadratic::tri6_dndx(&xy, corners[a][0], corners[a][1])?;
+        let r = radius(&xy, &nshp, 6);
+        let mut b = vec![0.0; 4 * n];
+        fill_b_cax(&mut b, 6, &dndx, &nshp, r);
+        let s = sigma_from_b(&b, 4, n, &d, ue);
+        out[a] = voigt_from_cax(&s);
+    }
+    Ok(out)
+}
+
+pub fn cax3_body_force(xyz: &[[f64; 3]], br: f64, bz: f64) -> Result<Vec<f64>> {
+    let mut xy = [[0.0; 2]; 3];
+    for i in 0..3 {
+        xy[i] = [xyz[i][0], xyz[i][1]];
+    }
+    let (_, two_a) = tri3_dndx(&xy)?;
+    let mut fe = vec![0.0; 6];
+    for (xi, eta, w0) in tri_gauss3() {
+        let nshp = [1.0 - xi - eta, xi, eta];
+        let r = radius(&xy, &nshp, 3);
+        let w = two_pi() * r.max(1e-16) * two_a * w0;
+        for a in 0..3 {
+            fe[2 * a] += nshp[a] * br * w;
+            fe[2 * a + 1] += nshp[a] * bz * w;
+        }
+    }
+    Ok(fe)
+}
+
+pub fn cax6_body_force(xyz: &[[f64; 3]], br: f64, bz: f64) -> Result<Vec<f64>> {
+    let mut xy = [[0.0; 2]; 6];
+    for i in 0..6 {
+        xy[i] = [xyz[i][0], xyz[i][1]];
+    }
+    let mut fe = vec![0.0; 12];
+    for (xi, eta, w0) in tri_gauss3() {
+        let (_, det, nshp) = crate::quadratic::tri6_dndx(&xy, xi, eta)?;
+        let r = radius(&xy, &nshp, 6);
+        let w = two_pi() * r.max(1e-16) * det * w0;
+        for a in 0..6 {
+            fe[2 * a] += nshp[a] * br * w;
+            fe[2 * a + 1] += nshp[a] * bz * w;
         }
     }
     Ok(fe)

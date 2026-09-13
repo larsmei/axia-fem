@@ -193,11 +193,26 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut m_full = vec![0.0; ndof];
 
     let mut trips: Vec<(usize, usize, f64)> = Vec::new();
+    let mut c_trips: Vec<(usize, usize, f64)> = Vec::new();
     for el in &model.elements {
         let xyz = elem_xyz(&model, &el.nodes)?;
+        if el.kind.is_point() || el.kind.is_dashpot() || el.kind.is_gap() {
+            scatter_special(
+                &model,
+                el,
+                &xyz,
+                ndn,
+                &mut m_full,
+                &mut trips,
+                &mut c_trips,
+            )?;
+            continue;
+        }
         let mat = model.material_for(el)?;
         let th = if el.kind.is_spring() {
             model.spring_k_for(el)?
+        } else if el.kind.is_gap() {
+            model.gap_for(el)?.k
         } else {
             model.thickness_for(el)
         };
@@ -411,6 +426,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
             nfree,
             &map,
             &trips,
+            &c_trips,
             &m_full,
             &f_dload,
             dt,
@@ -585,7 +601,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                         mean = *s;
                     }
                     crate::eigen::tet4_kg(&xyz, &mean)?
-                } else if el.kind == ElemKind::Tet10 {
+                } else if el.kind == ElemKind::Tet10 || el.kind == ElemKind::Tet10T {
                     let mut mean = [0.0; 6];
                     if let Some((_, _, s)) = stress_gp.iter().find(|(id, _, _)| *id == el.id) {
                         mean = *s;
@@ -730,7 +746,7 @@ fn apply_pressure(
             let fe = quadratic::quad8_edge_pressure(&p, face, mag, th)?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
         }
-        ElemKind::Cax4 | ElemKind::Cax4R | ElemKind::Cax8 | ElemKind::Cax8R => {
+        ElemKind::Cax4 | ElemKind::Cax4R | ElemKind::Cax8 | ElemKind::Cax8R | ElemKind::Cax3 | ElemKind::Cax6 => {
             let fe = crate::axisym::cax_edge_pressure(xyz, kind.nnodes(), face, mag)?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
         }
@@ -796,7 +812,7 @@ fn apply_body(
             let fe = quadratic::hex20_body_force(xyz, bx, by, bz, kind.reduced_int())?;
             scatter_fe(&fe, gdofs, 3, local_dim, f_full);
         }
-        ElemKind::Tet10 => {
+        ElemKind::Tet10 | ElemKind::Tet10T => {
             let fe = quadratic::tet10_body_force(xyz, bx, by, bz)?;
             scatter_fe(&fe, gdofs, 3, local_dim, f_full);
         }
@@ -820,6 +836,14 @@ fn apply_body(
             let fe = crate::axisym::cax4_body_force(xyz, bx, by, kind.reduced_int())?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
         }
+        ElemKind::Cax3 => {
+            let fe = crate::axisym::cax3_body_force(xyz, bx, by)?;
+            scatter_fe(&fe, gdofs, 2, local_dim, f_full);
+        }
+        ElemKind::Cax6 => {
+            let fe = crate::axisym::cax6_body_force(xyz, bx, by)?;
+            scatter_fe(&fe, gdofs, 2, local_dim, f_full);
+        }
         _ => {}
     }
     Ok(())
@@ -832,6 +856,84 @@ fn scatter_fe(fe: &[f64], gdofs: &[usize], fe_dim: usize, local_dim: usize, f_fu
             f_full[gdofs[a * local_dim + d]] += fe[a * fe_dim + d];
         }
     }
+}
+
+fn scatter_special(
+    model: &Model,
+    el: &crate::model::Element,
+    xyz: &[[f64; 3]],
+    ndn: usize,
+    m_full: &mut [f64],
+    trips: &mut Vec<(usize, usize, f64)>,
+    c_trips: &mut Vec<(usize, usize, f64)>,
+) -> Result<()> {
+    if el.kind == ElemKind::Mass {
+        let m = model.mass_for(el)?;
+        let ni = model.node_index(el.nodes[0])?;
+        for d in 0..3.min(ndn) {
+            m_full[dof_of(ndn, ni, d)] += m;
+        }
+        return Ok(());
+    }
+    if el.kind == ElemKind::RotaryI {
+        let ijk = model.rotary_for(el)?;
+        let ni = model.node_index(el.nodes[0])?;
+        if ndn >= 6 {
+            m_full[dof_of(ndn, ni, 3)] += ijk[0];
+            m_full[dof_of(ndn, ni, 4)] += ijk[1];
+            m_full[dof_of(ndn, ni, 5)] += ijk[2];
+        }
+        return Ok(());
+    }
+    if el.kind == ElemKind::DashpotA {
+        let c = model.dashpot_for(el)?;
+        let (ke, _) = extra::spring_stiffness(xyz, c)?;
+        let n0 = model.node_index(el.nodes[0])?;
+        let n1 = model.node_index(el.nodes[1])?;
+        let gd = [
+            dof_of(ndn, n0, 0),
+            dof_of(ndn, n0, 1),
+            dof_of(ndn, n0, 2),
+            dof_of(ndn, n1, 0),
+            dof_of(ndn, n1, 1),
+            dof_of(ndn, n1, 2),
+        ];
+        for i in 0..6 {
+            for j in 0..6 {
+                let v = ke[i * 6 + j];
+                if v.abs() > 0.0 {
+                    c_trips.push((gd[i], gd[j], v));
+                }
+            }
+        }
+        return Ok(());
+    }
+    if el.kind == ElemKind::GapUni {
+        let g = model.gap_for(el)?;
+        if g.clearance > 1e-14 {
+            return Ok(());
+        }
+        let (ke, _) = extra::spring_stiffness(xyz, g.k)?;
+        let n0 = model.node_index(el.nodes[0])?;
+        let n1 = model.node_index(el.nodes[1])?;
+        let gd = [
+            dof_of(ndn, n0, 0),
+            dof_of(ndn, n0, 1),
+            dof_of(ndn, n0, 2),
+            dof_of(ndn, n1, 0),
+            dof_of(ndn, n1, 1),
+            dof_of(ndn, n1, 2),
+        ];
+        for i in 0..6 {
+            for j in 0..6 {
+                let v = ke[i * 6 + j];
+                if v.abs() > 0.0 {
+                    trips.push((gd[i], gd[j], v));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn add_cloads(model: &Model, ndn: usize, t: f64, f: &mut [f64]) -> Result<()> {
@@ -853,6 +955,7 @@ fn newmark(
     nfree: usize,
     map: &DofMap,
     trips: &[(usize, usize, f64)],
+    c_trips: &[(usize, usize, f64)],
     m_full: &[f64],
     f_dload: &[f64],
     dt_in: f64,
@@ -894,6 +997,9 @@ fn newmark(
             keff_trips.push((d, d, m_full[d] * m_scale));
         }
     }
+    for &(i, j, v) in c_trips {
+        keff_trips.push((i, j, v * a1));
+    }
 
     let mut u_full = map.u0.clone();
     for ic in &model.init {
@@ -928,13 +1034,17 @@ fn newmark(
         ku[i] += v * u_full[j];
         kv[i] += v * v_full[j];
     }
+    let mut cv = vec![0.0; ndof];
+    for &(i, j, v) in c_trips {
+        cv[i] += v * v_full[j];
+    }
     let mut a_full = vec![0.0; ndof];
     for i in 0..ndof {
         if map.ind_of[i] < 0 {
             v_full[i] = 0.0;
             continue;
         }
-        let rhs = f0[i] - ku[i] - alpha_r * m_full[i] * v_full[i] - beta_r * kv[i];
+        let rhs = f0[i] - ku[i] - alpha_r * m_full[i] * v_full[i] - beta_r * kv[i] - cv[i];
         if m_full[i].abs() > 1e-30 {
             a_full[i] = rhs / m_full[i];
         }
@@ -956,6 +1066,13 @@ fn newmark(
         }
         for i in 0..ndof {
             reff[i] += alpha_r * m_full[i] * pred[i];
+        }
+        let mut cpred = vec![0.0; ndof];
+        for &(i, j, v) in c_trips {
+            cpred[i] += v * pred[j];
+        }
+        for i in 0..ndof {
+            reff[i] += cpred[i];
         }
         let mut kpred = vec![0.0; ndof];
         for &(i, j, v) in trips {
@@ -1012,6 +1129,9 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut f = vec![0.0; ndof];
     let mut c_diag = vec![0.0; ndof];
     for el in &model.elements {
+        if el.kind.is_point() || el.kind.is_dashpot() || el.kind.is_gap() {
+            continue;
+        }
         let xyz = elem_xyz(&model, &el.nodes)?;
         let mat = model.material_for(el)?;
         let kth = mat.conductivity;
@@ -1318,11 +1438,27 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     }
     let f_ext = assemble_fext(&model, ndn, ndof)?;
     let mut trips: Vec<(usize, usize, f64)> = Vec::new();
+    let mut c_trips_unused: Vec<(usize, usize, f64)> = Vec::new();
+    let mut m_unused = vec![0.0; ndof];
     for el in &model.elements {
         let xyz = elem_xyz(&model, &el.nodes)?;
+        if el.kind.is_point() || el.kind.is_dashpot() || el.kind.is_gap() {
+            scatter_special(
+                &model,
+                el,
+                &xyz,
+                ndn,
+                &mut m_unused,
+                &mut trips,
+                &mut c_trips_unused,
+            )?;
+            continue;
+        }
         let mat = model.material_for(el)?;
         let th = if el.kind.is_spring() {
             model.spring_k_for(el)?
+        } else if el.kind.is_gap() {
+            model.gap_for(el)?.k
         } else {
             model.thickness_for(el)
         };

@@ -7,6 +7,7 @@ export type FemElement = {
   n1?: number[];
   area?: number;
   th?: number;
+  mass?: number;
 };
 
 export type FemStats = {

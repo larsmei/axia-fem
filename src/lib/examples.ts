@@ -803,6 +803,105 @@ S
 `,
   },
   {
+    id: "cax3",
+    name: "Rohr CAX3",
+    blurb: "Achsensymmetrie Dreieck, Innendruck",
+    inp: `*HEADING
+CAX3 thick cylinder
+*NODE
+1, 10, 0
+2, 10, 2
+3, 12.5, 0
+4, 12.5, 2
+5, 15, 0
+6, 15, 2
+7, 17.5, 0
+8, 17.5, 2
+9, 20, 0
+10, 20, 2
+*ELEMENT, TYPE=CAX3, ELSET=S
+1, 1, 3, 2
+2, 3, 4, 2
+3, 3, 5, 4
+4, 5, 6, 4
+5, 5, 7, 6
+6, 7, 8, 6
+7, 7, 9, 8
+8, 9, 10, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 2, 2
+2, 2, 2
+3, 2, 2
+4, 2, 2
+5, 2, 2
+6, 2, 2
+7, 2, 2
+8, 2, 2
+9, 2, 2
+10, 2, 2
+*STEP
+*STATIC
+*DLOAD
+1, P3, 10
+*NODE FILE
+U
+*EL FILE
+S
+*END STEP
+`,
+  },
+  {
+    id: "c3d10t",
+    name: "C3D10T B-bar",
+    blurb: "Tetraeder mit mittlerer Dilatation, εx=0.001",
+    inp: `*HEADING
+C3D10T B-bar tet, confined εx=0.001
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 0, 10, 0
+4, 0, 0, 10
+5, 5, 0, 0
+6, 5, 5, 0
+7, 0, 5, 0
+8, 0, 0, 5
+9, 5, 0, 5
+10, 0, 5, 5
+*ELEMENT, TYPE=C3D10T, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 3
+2, 1, 1, 0.01
+2, 2, 3
+3, 1, 3
+4, 1, 3
+5, 1, 1, 0.005
+5, 2, 3
+6, 1, 1, 0.005
+6, 2, 3
+7, 1, 3
+8, 1, 3
+9, 1, 1, 0.005
+9, 2, 3
+10, 1, 3
+*STEP
+*STATIC
+*NODE FILE
+U
+*EL FILE
+S
+*END STEP
+`,
+  },
+  {
     id: "m3d4",
     name: "Membran M3D4",
     blurb: "Plane-Stress in 3D, ux=0.01",
@@ -1296,6 +1395,93 @@ T3D2 SDOF, ω=10 rad/s, u(0)=0.01 → u(π/10)=-0.01
 *STEP
 *DYNAMIC
 0.005, 0.3141592653589793
+*NODE FILE
+U
+*END STEP
+`,
+  },
+  {
+    id: "mass",
+    name: "Massepunkt",
+    blurb: "*MASS + SPRINGA, f≈1.59 Hz",
+    inp: `*HEADING
+MASS + SPRINGA, f = sqrt(k/m)/(2π) ≈ 1.5915 Hz
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=SPRINGA, ELSET=S
+1, 1, 2
+*ELEMENT, TYPE=MASS, ELSET=M
+2, 2
+*SPRING, ELSET=S
+100
+*MASS, ELSET=M
+1.0
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP
+*FREQUENCY
+1
+*NODE FILE
+U
+*END STEP
+`,
+  },
+  {
+    id: "gapuni",
+    name: "Spalt GAPUNI",
+    blurb: "geschlossener Spalt als Axialfeder, u=0.01",
+    inp: `*HEADING
+GAPUNI closed gap, k=1000, F=10 → u=0.01
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=GAPUNI, ELSET=G
+1, 1, 2
+*GAP, ELSET=G
+0.0, 1000
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 10
+*NODE FILE
+U, RF
+*END STEP
+`,
+  },
+  {
+    id: "dashpot",
+    name: "Dämpfer DASHPOTA",
+    blurb: "überdämpftes SDOF, |u(T)|≪u0",
+    inp: `*HEADING
+DASHPOTA overdamped SDOF, ζ=1
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=SPRINGA, ELSET=S
+1, 1, 2
+*ELEMENT, TYPE=MASS, ELSET=M
+2, 2
+*ELEMENT, TYPE=DASHPOTA, ELSET=D
+3, 1, 2
+*SPRING, ELSET=S
+100
+*MASS, ELSET=M
+1.0
+*DASHPOT, ELSET=D
+20
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*INITIAL CONDITIONS, TYPE=DISPLACEMENT
+2, 1, 0.01
+*STEP
+*DYNAMIC
+0.005, 0.6283185307179586
 *NODE FILE
 U
 *END STEP

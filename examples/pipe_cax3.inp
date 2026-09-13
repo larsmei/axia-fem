@@ -1,0 +1,46 @@
+*HEADING
+CAX3 thick cylinder, inner pressure 10. Lamé ur(a) ≈ 9.08e-4
+*NODE
+1, 10, 0
+2, 10, 2
+3, 12.5, 0
+4, 12.5, 2
+5, 15, 0
+6, 15, 2
+7, 17.5, 0
+8, 17.5, 2
+9, 20, 0
+10, 20, 2
+*ELEMENT, TYPE=CAX3, ELSET=S
+1, 1, 3, 2
+2, 3, 4, 2
+3, 3, 5, 4
+4, 5, 6, 4
+5, 5, 7, 6
+6, 7, 8, 6
+7, 7, 9, 8
+8, 9, 10, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 2, 2
+2, 2, 2
+3, 2, 2
+4, 2, 2
+5, 2, 2
+6, 2, 2
+7, 2, 2
+8, 2, 2
+9, 2, 2
+10, 2, 2
+*STEP
+*STATIC
+*DLOAD
+1, P3, 10
+*NODE FILE
+U
+*EL FILE
+S
+*END STEP

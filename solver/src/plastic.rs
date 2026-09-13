@@ -232,7 +232,7 @@ fn gps(kind: ElemKind, xyz0: &[[f64; 3]]) -> Result<Vec<(Vec<[f64; 3]>, f64)>> {
             }
             Ok(vec![(dndx, vol)])
         }
-        ElemKind::Tet10 => {
+        ElemKind::Tet10 | ElemKind::Tet10T => {
             let a = 0.5854101966249685;
             let b = 0.1381966011250105;
             let w0 = 1.0 / 24.0;
@@ -300,7 +300,7 @@ pub fn n_gauss(kind: ElemKind) -> usize {
         ElemKind::Hex20 => 27,
         ElemKind::Hex20R => 8,
         ElemKind::Tet4 => 1,
-        ElemKind::Tet10 => 4,
+        ElemKind::Tet10 | ElemKind::Tet10T => 4,
         ElemKind::Wedge6 => 6,
         ElemKind::Wedge15 => 9,
         _ => 0,

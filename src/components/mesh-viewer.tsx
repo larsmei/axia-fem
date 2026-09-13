@@ -88,6 +88,7 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
     controls?: OrbitControls;
     solid?: THREE.Mesh;
     edges?: THREE.LineSegments;
+    extras?: THREE.Object3D[];
     raf?: number;
   }>({});
 
@@ -169,6 +170,18 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
       (state.current.edges.material as THREE.Material).dispose();
       state.current.edges = undefined;
     }
+    if (state.current.extras) {
+      for (const o of state.current.extras) {
+        scene.remove(o);
+        o.traverse((c) => {
+          if (c instanceof THREE.Mesh) {
+            c.geometry.dispose();
+            (c.material as THREE.Material).dispose();
+          }
+        });
+      }
+      state.current.extras = undefined;
+    }
 
     if (!mesh?.ok || !mesh.coords || !mesh.nodeIds || !mesh.elements) return;
 
@@ -234,6 +247,7 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
     ];
 
     const extraEdges: number[] = [];
+    const extras: THREE.Object3D[] = [];
 
     const emitBeam = (
       i0: number,
@@ -427,12 +441,12 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
         addEdge(loc[1], loc[2]);
         addEdge(loc[2], loc[3]);
         addEdge(loc[3], loc[0]);
-      } else if ((t === "CPS3" || t === "CPE3" || t === "S3" || t === "S3R") && loc.length >= 3) {
+      } else if ((t === "CPS3" || t === "CPE3" || t === "S3" || t === "S3R" || t === "CAX3") && loc.length >= 3) {
         pushTri(loc[0], loc[1], loc[2]);
         addEdge(loc[0], loc[1]);
         addEdge(loc[1], loc[2]);
         addEdge(loc[2], loc[0]);
-      } else if ((t === "C3D20" || t === "C3D20R") && loc.length >= 20) {
+      } else if ((t === "C3D20" || t === "C3D20R" || t === "C3D20RI") && loc.length >= 20) {
         for (const f of HEX20_FACES) {
           const [c0, c1, c2, c3, m01, m12, m23, m30] = f.map((i) => loc[i]);
           pushTri(c0, m01, m30);
@@ -450,7 +464,7 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
           addEdge(c3, m30);
           addEdge(m30, c0);
         }
-      } else if (t === "C3D10" && loc.length >= 10) {
+      } else if ((t === "C3D10" || t === "C3D10T") && loc.length >= 10) {
         for (const f of TET10_FACES) {
           const [c0, c1, c2, m01, m12, m20] = f.map((i) => loc[i]);
           pushTri(c0, m01, m20);
@@ -491,7 +505,7 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
         addEdge(m23, c3);
         addEdge(c3, m30);
         addEdge(m30, c0);
-      } else if ((t === "CPS6" || t === "CPE6" || t === "S6") && loc.length >= 6) {
+      } else if ((t === "CPS6" || t === "CPE6" || t === "S6" || t === "CAX6") && loc.length >= 6) {
         const [c0, c1, c2, m01, m12, m20] = loc;
         pushTri(c0, m01, m20);
         pushTri(m01, c1, m12);
@@ -503,9 +517,9 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
         addEdge(m12, c2);
         addEdge(c2, m20);
         addEdge(m20, c0);
-      } else if ((t === "B32" || t === "B32R") && loc.length >= 3) {
+      } else if ((t === "B32" || t === "B32R" || t === "B22" || t === "B22R") && loc.length >= 3) {
         emitBeam(loc[0], loc[1], loc[2], el.secA ?? 8, el.secB ?? 8, el.n1 ?? [0, 0, -1], true);
-      } else if ((t === "B31" || t === "B31R") && loc.length >= 2) {
+      } else if ((t === "B31" || t === "B31R" || t === "B21" || t === "B21R") && loc.length >= 2) {
         emitBeam(loc[0], loc[1], loc[0], el.secA ?? 8, el.secB ?? 8, el.n1 ?? [0, 0, -1], false);
       } else if ((t === "T3D3") && loc.length >= 3) {
         const i0 = loc[0];
@@ -519,7 +533,14 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
         const side = Math.max(Math.sqrt(Math.max(el.area ?? 0, 0)), L * 0.02, 0.5);
         emitBeam(i0, i1, loc[2], side, side, [0, 0, 1], true);
       } else if (
-        (t === "T3D2" || t === "T2D2" || t === "SPRINGA" || t === "SPRING2" || loc.length === 2) &&
+        (t === "T3D2" ||
+          t === "T2D2" ||
+          t === "SPRINGA" ||
+          t === "SPRING2" ||
+          t === "DASHPOTA" ||
+          t === "DASHPOT" ||
+          t === "GAPUNI" ||
+          loc.length === 2) &&
         loc.length >= 2
       ) {
         const i0 = loc[0];
@@ -532,10 +553,28 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
           ) || 1;
         const side = Math.max(Math.sqrt(Math.max(el.area ?? 0, 0)), L * 0.02, 0.5);
         emitBeam(i0, i1, i0, side, side, [0, 0, 1], false);
+      } else if ((t === "MASS" || t === "ROTARYI") && loc.length >= 1) {
+        const i0 = loc[0];
+        const r = Math.max(el.mass ? Math.cbrt(Math.max(el.mass, 0)) * 0.5 : 1.2, 0.6);
+        const geo = new THREE.SphereGeometry(r, 16, 12);
+        const [cr, cg, cb] = values
+          ? sampleColor((values[i0] - vmin) / (vmax - vmin))
+          : ([0.82, 0.64, 0.18] as [number, number, number]);
+        const mat = new THREE.MeshLambertMaterial({
+          color: new THREE.Color(cr, cg, cb),
+        });
+        const sph = new THREE.Mesh(geo, mat);
+        sph.position.set(pos[3 * i0], pos[3 * i0 + 1], pos[3 * i0 + 2]);
+        scene.add(sph);
+        extras.push(sph);
       }
     }
 
-    if (positions.length === 0 && extraEdges.length === 0 && edgeSet.size === 0) return;
+    if (positions.length === 0 && extraEdges.length === 0 && edgeSet.size === 0 && extras.length === 0) return;
+
+    if (extras.length > 0) {
+      state.current.extras = extras;
+    }
 
     let fitBox: THREE.Box3 | null = null;
     if (positions.length > 0) {
@@ -574,6 +613,13 @@ export function MeshViewer({ mesh, result, field, deformed, scale }: Props) {
       if (!fitBox) {
         ego.computeBoundingBox();
         fitBox = ego.boundingBox;
+      }
+    }
+    if (extras.length > 0) {
+      const extraBox = new THREE.Box3();
+      for (const o of extras) extraBox.expandByObject(o);
+      if (!extraBox.isEmpty()) {
+        fitBox = fitBox ? fitBox.union(extraBox) : extraBox;
       }
     }
 

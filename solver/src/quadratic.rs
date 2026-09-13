@@ -1,4 +1,4 @@
-//! Quadratic continuum elements: C3D20(R), C3D10, CPS8/CPE8(R), CPS6/CPE6.
+//! Quadratic continuum elements: C3D20(R), C3D10/C3D10T, CPS8/CPE8(R), CPS6/CPE6.
 //! Node numbering matches Abaqus / CalculiX.
 
 use crate::elem::{
@@ -483,6 +483,55 @@ pub fn tet10_stiffness(xyz: &[[f64; 3]], e: f64, nu: f64) -> Result<(Vec<f64>, f
     Ok((ke, vol))
 }
 
+fn fill_b_vol(b: &mut [f64], nnode: usize, dndx: &[[f64; 3]]) {
+    let n = 3 * nnode;
+    for i in 0..nnode {
+        let c = 3 * i;
+        let dx = dndx[i][0] / 3.0;
+        let dy = dndx[i][1] / 3.0;
+        let dz = dndx[i][2] / 3.0;
+        for row in 0..3 {
+            b[row * n + c] += dx;
+            b[row * n + c + 1] += dy;
+            b[row * n + c + 2] += dz;
+        }
+    }
+}
+
+/// C3D10T: tet10 with mean-dilatation (B-bar) volumetric strain.
+pub fn tet10t_stiffness(xyz: &[[f64; 3]], e: f64, nu: f64) -> Result<(Vec<f64>, f64)> {
+    let d = d_iso_3d(e, nu)?;
+    let n = 30usize;
+    let mut ke = vec![0.0; n * n];
+    let mut vol = 0.0;
+    let a = 0.5854101966249685;
+    let b = 0.1381966011250105;
+    let w = 1.0 / 24.0;
+    let pts = [[b, b, b], [a, b, b], [b, a, b], [b, b, a]];
+    let (dndx0, det0, _) = tet10_dndx(xyz, 0.25, 0.25, 0.25)?;
+    if det0 <= 0.0 {
+        return err("C3D10T: negative Jakobideterminante.");
+    }
+    let mut bvol0 = vec![0.0; 6 * n];
+    fill_b_vol(&mut bvol0, 10, &dndx0);
+    for p in &pts {
+        let (dndx, det, _) = tet10_dndx(xyz, p[0], p[1], p[2])?;
+        if det <= 0.0 {
+            return err("C3D10T: negative Jakobideterminante (Knotenreihenfolge).");
+        }
+        let mut bb = vec![0.0; 6 * n];
+        fill_b3(&mut bb, 10, &dndx);
+        let mut bvol = vec![0.0; 6 * n];
+        fill_b_vol(&mut bvol, 10, &dndx);
+        for i in 0..bb.len() {
+            bb[i] += bvol0[i] - bvol[i];
+        }
+        gemm_bt_d_b(&mut ke, n, &bb, 6, &d, w * det);
+        vol += w * det;
+    }
+    Ok((ke, vol))
+}
+
 pub fn tet10_nodal_stress(xyz: &[[f64; 3]], ue: &[f64], e: f64, nu: f64) -> Result<Vec<[f64; 6]>> {
     let d = d_iso_3d(e, nu)?;
     let n = 30usize;
@@ -551,7 +600,7 @@ pub(crate) fn tri6_shape(xi: f64, eta: f64) -> ([f64; 6], [[f64; 2]; 6]) {
     (n, dn)
 }
 
-fn tri6_dndx(xy: &[[f64; 2]], xi: f64, eta: f64) -> Result<([[f64; 2]; 6], f64, [f64; 6])> {
+pub(crate) fn tri6_dndx(xy: &[[f64; 2]], xi: f64, eta: f64) -> Result<([[f64; 2]; 6], f64, [f64; 6])> {
     let (n, dn) = tri6_shape(xi, eta);
     let mut j = [[0.0; 2]; 2];
     for a in 0..6 {

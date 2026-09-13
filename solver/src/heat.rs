@@ -512,6 +512,65 @@ fn shell_quad_conductivity(xyz: &[[f64; 3]], k: f64, th: f64) -> Result<(Vec<f64
     quad4_conductivity(&xyz2, k, th)
 }
 
+fn tri3_conductivity(xyz: &[[f64; 3]], k: f64, th: f64) -> Result<(Vec<f64>, f64)> {
+    if xyz.len() < 3 {
+        return err("Dreieck-Wärmeleitung braucht 3 Knoten.");
+    }
+    let two_a = xyz[0][0] * (xyz[1][1] - xyz[2][1])
+        + xyz[1][0] * (xyz[2][1] - xyz[0][1])
+        + xyz[2][0] * (xyz[0][1] - xyz[1][1]);
+    if two_a.abs() < 1e-18 {
+        return err("Dreieck-Wärmeleitung: Fläche null.");
+    }
+    let area = two_a.abs() / 2.0;
+    let dndx = [
+        [(xyz[1][1] - xyz[2][1]) / two_a, (xyz[2][0] - xyz[1][0]) / two_a],
+        [(xyz[2][1] - xyz[0][1]) / two_a, (xyz[0][0] - xyz[2][0]) / two_a],
+        [(xyz[0][1] - xyz[1][1]) / two_a, (xyz[1][0] - xyz[0][0]) / two_a],
+    ];
+    let mut ke = vec![0.0; 9];
+    let w = k.max(0.0) * th.max(1e-30) * area;
+    for a in 0..3 {
+        for b in 0..3 {
+            ke[a * 3 + b] = w * (dndx[a][0] * dndx[b][0] + dndx[a][1] * dndx[b][1]);
+        }
+    }
+    Ok((ke, area * th))
+}
+
+fn tri6_conductivity(xyz: &[[f64; 3]], k: f64, th: f64) -> Result<(Vec<f64>, f64)> {
+    if xyz.len() < 6 {
+        return err("CPS6-Wärmeleitung braucht 6 Knoten.");
+    }
+    let mut xy = [[0.0; 2]; 6];
+    for i in 0..6 {
+        xy[i] = [xyz[i][0], xyz[i][1]];
+    }
+    let nn = 6usize;
+    let mut ke = vec![0.0; nn * nn];
+    let mut area = 0.0;
+    let pts = [
+        [1.0 / 6.0, 1.0 / 6.0],
+        [2.0 / 3.0, 1.0 / 6.0],
+        [1.0 / 6.0, 2.0 / 3.0],
+    ];
+    let w0 = 1.0 / 6.0;
+    for p in &pts {
+        let (dndx, det, _) = crate::quadratic::tri6_dndx(&xy, p[0], p[1])?;
+        if det <= 0.0 {
+            return err("CPS6 Wärmeleitung: negative Jakobideterminante.");
+        }
+        let w = k.max(0.0) * th.max(1e-30) * w0 * det;
+        area += w0 * det;
+        for a in 0..nn {
+            for b in 0..nn {
+                ke[a * nn + b] += w * (dndx[a][0] * dndx[b][0] + dndx[a][1] * dndx[b][1]);
+            }
+        }
+    }
+    Ok((ke, area * th))
+}
+
 pub fn element_conductivity(
     kind: ElemKind,
     xyz: &[[f64; 3]],
@@ -525,7 +584,7 @@ pub fn element_conductivity(
         ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R => hex8_conductivity(xyz, k),
         ElemKind::Hex20 | ElemKind::Hex20R => hex20_conductivity(xyz, k, kind.reduced_int()),
         ElemKind::Tet4 => tet4_conductivity(xyz, k),
-        ElemKind::Tet10 => tet10_conductivity(xyz, k),
+        ElemKind::Tet10 | ElemKind::Tet10T => tet10_conductivity(xyz, k),
         ElemKind::Wedge6 => wedge6_conductivity(xyz, k),
         ElemKind::Wedge15 => wedge15_conductivity(xyz, k),
         ElemKind::Quad4Ps | ElemKind::Quad4Pe => quad4_conductivity(xyz, k, area_or_th),
@@ -534,6 +593,40 @@ pub fn element_conductivity(
         }
         ElemKind::Shell4 | ElemKind::Shell4R | ElemKind::Mem4 | ElemKind::Mem4R => {
             shell_quad_conductivity(xyz, k, area_or_th)
+        }
+        ElemKind::Cax4 | ElemKind::Cax4R => {
+            let r = xyz.iter().map(|p| p[0]).sum::<f64>() / xyz.len().max(1) as f64;
+            shell_quad_conductivity(xyz, k, 2.0 * std::f64::consts::PI * r.max(1e-16))
+        }
+        ElemKind::Cax8 | ElemKind::Cax8R | ElemKind::Shell8 | ElemKind::Shell8R | ElemKind::Mem8 => {
+            let r = xyz.iter().map(|p| p[0]).sum::<f64>() / xyz.len().max(1) as f64;
+            let th = if kind.is_axisym() {
+                2.0 * std::f64::consts::PI * r.max(1e-16)
+            } else {
+                area_or_th
+            };
+            quad8_conductivity(xyz, k, th, kind.reduced_int())
+        }
+        ElemKind::Cax3 | ElemKind::Tri3Ps | ElemKind::Tri3Pe | ElemKind::Shell3 | ElemKind::Mem3 => {
+            let th = if kind.is_axisym() {
+                let r = xyz.iter().map(|p| p[0]).sum::<f64>() / xyz.len().max(1) as f64;
+                2.0 * std::f64::consts::PI * r.max(1e-16)
+            } else {
+                area_or_th
+            };
+            tri3_conductivity(xyz, k, th)
+        }
+        ElemKind::Cax6 | ElemKind::Tri6Ps | ElemKind::Tri6Pe | ElemKind::Shell6 | ElemKind::Mem6 => {
+            let th = if kind.is_axisym() {
+                let r = xyz.iter().map(|p| p[0]).sum::<f64>() / xyz.len().max(1) as f64;
+                2.0 * std::f64::consts::PI * r.max(1e-16)
+            } else {
+                area_or_th
+            };
+            tri6_conductivity(xyz, k, th)
+        }
+        ElemKind::Mass | ElemKind::RotaryI | ElemKind::DashpotA | ElemKind::GapUni => {
+            Ok((vec![0.0; kind.nnodes() * kind.nnodes()], 0.0))
         }
         _ => err(format!(
             "*HEAT TRANSFER: Element {} nicht implementiert.",

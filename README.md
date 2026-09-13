@@ -9,7 +9,7 @@ Zwei Frontends, ein Solver:
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
 
-**1.8** — `*STATIC, RIKS` (Crisfield-Bogenlänge, Snap-Through). **1.7.1** — Viewer zeichnet T3D2/T3D3/SPRINGA (Fachwerk NLGEOM). **1.7** — Coulomb-`*FRICTION`, `NLGEOM`+`*PLASTIC` auf Kontinuum. **1.6** — `*CONTACT PAIR` Node-to-Surface, Penalty, reibungsfrei. **1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
+**1.9** — fehlende Elemente: CAX3/CAX6, C3D10T (B-bar), MASS, ROTARYI, DASHPOTA, GAPUNI, Aliase B21/B22 und C3D20RI. **1.8** — `*STATIC, RIKS` (Crisfield-Bogenlänge, Snap-Through). **1.7.1** — Viewer zeichnet T3D2/T3D3/SPRINGA (Fachwerk NLGEOM). **1.7** — Coulomb-`*FRICTION`, `NLGEOM`+`*PLASTIC` auf Kontinuum. **1.6** — `*CONTACT PAIR` Node-to-Surface, Penalty, reibungsfrei. **1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
 
 ## CLI
 
@@ -34,6 +34,11 @@ Mitgelieferte Decks in [`examples/`](examples/):
 | `patch_c3d6.inp` | Zug-Patch C3D6-Wedge |
 | `patch_c3d15.inp` | C3D15, confined \(\varepsilon_z=0{,}001\) |
 | `pipe_cax4.inp` | dickwandiges Rohr CAX4, Innendruck (Lamé) |
+| `pipe_cax3.inp` | dasselbe mit CAX3-Dreiecken |
+| `patch_c3d10t.inp` | C3D10T B-bar, confined \(\varepsilon_x=0{,}001\) |
+| `mass_sdof.inp` | `*MASS` + SPRINGA, \(f\approx 1{,}59\,\mathrm{Hz}\) |
+| `gapuni.inp` | GAPUNI geschlossen, \(u=0{,}01\) |
+| `dashpota.inp` | DASHPOTA überdämpft, \(\lvert u(T)\rvert\ll u_0\) |
 | `membrane_m3d4.inp` | M3D4-Membran-Patch, \(u_x=0{,}01\) |
 | `cantilever_b32.inp` | Timoshenko-Kragträger B32 |
 | `plate_s4r.inp` | gelenkig gelagerte S4R-Platte |
@@ -93,7 +98,7 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 ## Features
 
 - INP-Parser: `*NODE`, `*ELEMENT`, `*NSET`/`*ELSET` (+ `GENERATE`), `*MATERIAL`/`*ELASTIC`/`*DENSITY`, `*INCLUDE`, `*EQUATION`, `*SURFACE`
-- Schnitte: `*SOLID SECTION`, `*SHELL SECTION`, `*MEMBRANE SECTION`, `*BEAM SECTION` (`RECT`, `CIRC`, `PIPE`, `GENERAL`), `*SPRING`
+- Schnitte: `*SOLID SECTION`, `*SHELL SECTION`, `*MEMBRANE SECTION`, `*BEAM SECTION` (`RECT`, `CIRC`, `PIPE`, `GENERAL`), `*SPRING`, `*MASS`, `*ROTARY INERTIA`, `*DASHPOT`, `*GAP`
 - Lasten und Lager: `*BOUNDARY` (DOF 1–6, NT=11), `*CLOAD`, `*DLOAD` (`P`, `P1…P6`, `GRAV`, `PX`/`PY`/`PZ`)
 - Linear-statische Analyse, isotrope Elastizität, MPC-Elimination (`*EQUATION`)
 - `*FREQUENCY` (lumped mass, inverse subspace) und `*BUCKLE` (geometrische Steifigkeit für T3D2, B31/B32 **und** C3D8/20/10/4/6/15)
@@ -125,13 +130,16 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
 | C3D8 | 8 | 3 | Hexaeder, volle 2×2×2 Integration |
 | C3D8I | 8 | 3 | inkompatible Wilson/Taylor-Moden, kein Schub-Locking |
 | C3D8R | 8 | 3 | 1-Punkt + Hourglass-Stabilisierung |
-| C3D20 / C3D20R | 20 | 3 | quadratisches Serendipity-Hexaeder, 3×3×3 / 2×2×2 |
+| C3D20 / C3D20R / C3D20RI | 20 | 3 | quadratisches Serendipity-Hexaeder, 3×3×3 / 2×2×2 |
 | C3D6 | 6 | 3 | linearer Wedge/Pentaeder |
 | C3D15 | 15 | 3 | quadratischer Wedge, 3×3 Gauss (Dreieck × ζ) |
 | C3D4 | 4 | 3 | Tetraeder |
 | C3D10 | 10 | 3 | quadratisches Tetraeder, 4-Punkt |
+| C3D10T | 10 | 3 | B-bar / mittlere Dilatation (weniger Volumen-Locking) |
 | CAX4 / CAX4R | 4 | 2 | Achsensymmetrie \(r,z\); Gewicht \(2\pi r\) |
 | CAX8 / CAX8R | 8 | 2 | quadratisch achsensymmetrisch |
+| CAX3 | 3 | 2 | lineares Achsensymmetrie-Dreieck |
+| CAX6 | 6 | 2 | quadratisches Achsensymmetrie-Dreieck |
 | CPS4 / CPE4 | 4 | 2 | Scheibe, Spannungs-/Dehnungszustand |
 | CPS8 / CPE8 / CPS8R | 8 | 2 | quadratische Scheibe, 3×3 / 2×2 |
 | CPS3 / CPE3 | 3 | 2 | Dreiecksscheibe |
@@ -175,8 +183,8 @@ EALL, P, -0.01
 
 | Typ | Knoten | Reihenfolge |
 |---|---|---|
-| B31 | 2 | Ende 1, Ende 2 |
-| B32 | 3 | **Ende 1, Ende 2, Mitte** |
+| B31 / B21 | 2 | Ende 1, Ende 2 |
+| B32 / B22 | 3 | **Ende 1, Ende 2, Mitte** |
 
 Querschnitt: `RECT`, `CIRC`, `PIPE`, `GENERAL`. Die zweite Datenzeile von `*BEAM SECTION` ist die n1-Richtung.
 
@@ -203,6 +211,12 @@ Gemischte Modelle (Kontinuum + Schale/Balken) verwenden 6 DOF pro Knoten. Unbenu
 | T3D2 | 2 | 3D-Fachwerk, Querschnitt = erste Zeile `*SOLID SECTION` |
 | T3D3 | 3 | quadratischer Stab |
 | SPRINGA | 2 | axiale Feder, Steifigkeit über `*SPRING, ELSET=` |
+| MASS | 1 | konzentrierte translatorische Masse, `*MASS, ELSET=` |
+| ROTARYI | 1 | Drehträgheit I11/I22/I33, `*ROTARY INERTIA, ELSET=` (6 DOF) |
+| DASHPOTA | 2 | axialer Dämpfer, `*DASHPOT, ELSET=` (Newmark \(a_1 C\)) |
+| GAPUNI | 2 | Spalt: geschlossen (`clearance≤0`) als Axialfeder `*GAP` |
+
+C3D20RI wird als C3D20R gelesen, B21/B22 als B31/B32.
 
 `*EQUATION` koppelt DOFs (Slave-Elimination). `*INCLUDE, INPUT=datei.inp` zieht relative Dateien (CLI, nicht WASM).
 

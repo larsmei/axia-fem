@@ -51,8 +51,13 @@ fn mesh_json(model: &Model) -> Value {
                     v["area"] = json!(sec.area);
                 }
             }
-            if e.kind.is_truss() || e.kind.is_spring() {
+            if e.kind.is_truss() || e.kind.is_spring() || e.kind.is_dashpot() || e.kind.is_gap() {
                 v["area"] = json!(model.thickness_for(e));
+            }
+            if e.kind == ElemKind::Mass {
+                if let Ok(m) = model.mass_for(e) {
+                    v["mass"] = json!(m);
+                }
             }
             if e.kind.is_shell() {
                 v["th"] = json!(model.thickness_for(e));
@@ -2584,5 +2589,388 @@ von Mises truss — Riks snap-through
         );
         assert!(out.ninc > 1, "need several increments, got {}", out.ninc);
         assert!(out.solver.contains("Riks"));
+    }
+
+    fn cax3_lame_deck() -> String {
+        let mut inp = String::from("*HEADING\nCAX3 Lame\n*NODE\n");
+        let a = 10.0;
+        let b = 20.0;
+        let nr = 4;
+        for i in 0..=nr {
+            let r = a + (b - a) * i as f64 / nr as f64;
+            let n0 = 1 + 2 * i;
+            let n1 = n0 + 1;
+            inp.push_str(&format!("{n0}, {r}, 0\n{n1}, {r}, 2\n"));
+        }
+        inp.push_str("*ELEMENT, TYPE=CAX3, ELSET=S\n");
+        let mut e = 1i32;
+        for i in 0..nr {
+            let n0 = 1 + 2 * i;
+            let n1 = n0 + 2;
+            let n2 = n1 + 1;
+            let n3 = n0 + 1;
+            inp.push_str(&format!("{e}, {n0}, {n1}, {n3}\n"));
+            e += 1;
+            inp.push_str(&format!("{e}, {n1}, {n2}, {n3}\n"));
+            e += 1;
+        }
+        inp.push_str(
+            "*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+",
+        );
+        for i in 0..=nr {
+            let n0 = 1 + 2 * i;
+            let n1 = n0 + 1;
+            inp.push_str(&format!("{n0}, 2, 2\n{n1}, 2, 2\n"));
+        }
+        inp.push_str(
+            "*STEP
+*STATIC
+*DLOAD
+1, P3, 10
+*END STEP
+",
+        );
+        inp
+    }
+
+    fn lame_ur_inner() -> f64 {
+        let a = 10.0;
+        let b = 20.0;
+        let pin = 10.0;
+        let aa = a * a;
+        let bb = b * b;
+        let a_const = pin * aa / (bb - aa);
+        let b_const = pin * aa * bb / (bb - aa);
+        let s_th = a_const + b_const / aa;
+        let s_r = a_const - b_const / aa;
+        let s_z = 2.0 * 0.3 * a_const;
+        let eth = (s_th - 0.3 * s_r - 0.3 * s_z) / 210000.0;
+        a * eth
+    }
+
+    #[test]
+    fn patch_test_cax3_lame() {
+        let out = solve_native(&cax3_lame_deck()).unwrap();
+        let ur = out.u[out.model.node_index(1).unwrap()][0];
+        let expect = lame_ur_inner();
+        assert!(
+            (ur - expect).abs() / expect.abs() < 0.22,
+            "CAX3 ur={ur}, Lame {expect}"
+        );
+    }
+
+    #[test]
+    fn patch_test_cax6_lame() {
+        // two quadratic triangles through the wall (r=10..20, z=0..2)
+        let inp = r#"
+*HEADING
+CAX6 Lame
+*NODE
+1, 10, 0
+2, 20, 0
+3, 10, 2
+4, 15, 0
+5, 15, 1
+6, 10, 1
+7, 20, 2
+8, 20, 1
+9, 15, 2
+*ELEMENT, TYPE=CAX6, ELSET=S
+1, 1, 2, 3, 4, 5, 6
+2, 2, 7, 3, 8, 9, 5
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 2, 2
+2, 2, 2
+3, 2, 2
+4, 2, 2
+5, 2, 2
+6, 2, 2
+7, 2, 2
+8, 2, 2
+9, 2, 2
+*STEP
+*STATIC
+*DLOAD
+1, P3, 10
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let ur = out.u[out.model.node_index(1).unwrap()][0];
+        let expect = lame_ur_inner();
+        assert!(
+            (ur - expect).abs() / expect.abs() < 0.18,
+            "CAX6 ur={ur}, Lame {expect}"
+        );
+    }
+
+    #[test]
+    fn patch_test_c3d10t_confined() {
+        let inp = r#"
+*HEADING
+C3D10T confined uniaxial strain
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 0, 10, 0
+4, 0, 0, 10
+5, 5, 0, 0
+6, 5, 5, 0
+7, 0, 5, 0
+8, 0, 0, 5
+9, 5, 0, 5
+10, 0, 5, 5
+*ELEMENT, TYPE=C3D10T, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 3
+2, 1, 1, 0.01
+2, 2, 3
+3, 1, 3
+4, 1, 3
+5, 1, 1, 0.005
+5, 2, 3
+6, 1, 1, 0.005
+6, 2, 3
+7, 1, 3
+8, 1, 3
+9, 1, 1, 0.005
+9, 2, 3
+10, 1, 3
+*STEP
+*STATIC
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let e = 210000.0;
+        let nu = 0.3;
+        let lam = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
+        let mu = e / (2.0 * (1.0 + nu));
+        let expect = (lam + 2.0 * mu) * 0.001;
+        let sxx: f64 = out.stress.iter().map(|s| s[0]).sum::<f64>() / out.stress.len() as f64;
+        assert!(
+            (sxx - expect).abs() / expect < 0.04,
+            "C3D10T sxx={sxx}, expected {expect}"
+        );
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((u2 - 0.01).abs() < 1e-12, "ux2={u2}");
+    }
+
+    #[test]
+    fn aliases_b21_c3d20ri() {
+        let b21 = parse_model(
+            r#"
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=B21, ELSET=B
+1, 1, 2
+*BEAM SECTION, ELSET=B, MATERIAL=STEEL, SECTION=RECT
+10, 10
+0, 0, 1
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+"#,
+        )
+        .unwrap();
+        assert_eq!(b21.elements[0].kind.ccx_name(), "B31");
+        let ri = parse_model(
+            r#"
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+9, 5, 0, 0
+10, 10, 5, 0
+11, 5, 10, 0
+12, 0, 5, 0
+13, 5, 0, 10
+14, 10, 5, 10
+15, 5, 10, 10
+16, 0, 5, 10
+17, 0, 0, 5
+18, 10, 0, 5
+19, 10, 10, 5
+20, 0, 10, 5
+*ELEMENT, TYPE=C3D20RI, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+"#,
+        )
+        .unwrap();
+        assert_eq!(ri.elements[0].kind.ccx_name(), "C3D20R");
+        assert_eq!(ri.elements[0].kind, ElemKind::Hex20R);
+    }
+
+    #[test]
+    fn mass_sdof_frequency() {
+        let inp = r#"
+*HEADING
+MASS + SPRINGA SDOF
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=SPRINGA, ELSET=S
+1, 1, 2
+*ELEMENT, TYPE=MASS, ELSET=M
+2, 2
+*SPRING, ELSET=S
+100
+*MASS, ELSET=M
+1.0
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP
+*FREQUENCY
+1
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        assert!(!out.frequencies.is_empty());
+        let f = out.frequencies[0];
+        // sqrt(k/m)/(2π) = 10/(2π) ≈ 1.5915
+        assert!(
+            (f - 1.5915).abs() / 1.5915 < 0.04,
+            "MASS f={f}, expected 1.5915 Hz"
+        );
+    }
+
+    #[test]
+    fn rotaryi_parses_and_sets_6dof() {
+        let m = parse_model(
+            r#"
+*NODE
+1, 0, 0, 0
+*ELEMENT, TYPE=ROTARYI, ELSET=R
+1, 1
+*ROTARY INERTIA, ELSET=R
+2.0, 3.0, 4.0, 0.1, 0.2, 0.3
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.elements[0].kind, ElemKind::RotaryI);
+        assert_eq!(m.ndof_node(), 6);
+        let ijk = m.rotary_for(&m.elements[0]).unwrap();
+        assert!((ijk[0] - 2.0).abs() < 1e-12);
+        assert!((ijk[1] - 3.0).abs() < 1e-12);
+        assert!((ijk[2] - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gapuni_closed_spring() {
+        let closed = r#"
+*HEADING
+GAPUNI closed
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=GAPUNI, ELSET=G
+1, 1, 2
+*GAP, ELSET=G
+0.0, 1000
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 10
+*END STEP
+"#;
+        let out = solve_native(closed).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((u2 - 0.01).abs() < 1e-8, "closed GAPUNI ux={u2}");
+
+        let open = r#"
+*HEADING
+GAPUNI open + spring
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=SPRINGA, ELSET=S
+1, 1, 2
+*ELEMENT, TYPE=GAPUNI, ELSET=G
+2, 1, 2
+*SPRING, ELSET=S
+1000
+*GAP, ELSET=G
+1.0, 1e12
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 10
+*END STEP
+"#;
+        let out = solve_native(open).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!(
+            (u2 - 0.01).abs() < 1e-8,
+            "open GAPUNI must not add stiffness, ux={u2}"
+        );
+    }
+
+    #[test]
+    fn dashpota_overdamped_sdof() {
+        // k=100, m=1, c=20 → ζ=1, ωn=10. After T_undamped=2π/10, |u| ≪ u0.
+        let inp = r#"
+*HEADING
+DASHPOTA overdamped
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=SPRINGA, ELSET=S
+1, 1, 2
+*ELEMENT, TYPE=MASS, ELSET=M
+2, 2
+*ELEMENT, TYPE=DASHPOTA, ELSET=D
+3, 1, 2
+*SPRING, ELSET=S
+100
+*MASS, ELSET=M
+1.0
+*DASHPOT, ELSET=D
+20
+*BOUNDARY
+1, 1, 3
+2, 2, 3
+*INITIAL CONDITIONS, TYPE=DISPLACEMENT
+2, 1, 0.01
+*STEP
+*DYNAMIC
+0.005, 0.6283185307179586
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!(
+            u2.abs() < 0.002,
+            "overdamped DASHPOTA u2={u2}, expected near 0"
+        );
+        assert!(out.procedure.contains("DYNAMIC"));
     }
 }
