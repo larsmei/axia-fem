@@ -1,4 +1,4 @@
-use crate::model::{Model, Procedure};
+use crate::model::{ElemKind, Model, Procedure};
 
 /// Fortran ES12.5 (`1P,E12.5`): sign/space + `d.ddddd` + `E` + `±dd` = 12 chars.
 /// Rust `{:.5E}` emits `E-2` (11 chars); CalculiX/Mecway require `E-02`.
@@ -78,6 +78,42 @@ fn line_100cl(kode: i32, time: f64, nout: i32, name: &str) -> String {
     String::from_utf8(t).unwrap() + "\n"
 }
 
+fn write_minus2(o: &mut String, nodes: &[i32]) {
+    const PER: usize = 10;
+    for chunk in nodes.chunks(PER) {
+        o.push_str(" -2");
+        for n in chunk {
+            o.push_str(&format!("{n:10}"));
+        }
+        o.push('\n');
+    }
+}
+
+/// ccx `frd.c` reorders midsides for quadratic bricks/wedges so cgx/Mecway
+/// see FAM/he20 numbering, not Abaqus INP order.
+///
+/// C3D20: INP 1–12, 13–16 top, 17–20 vertical → FRD 1–12, 17–20, 13–16.
+/// C3D15: INP 1–9, 10–12 top, 13–15 vertical → FRD 1–9, 13, 14, 15, 10–12.
+fn frd_nodes(kind: ElemKind, nodes: &[i32]) -> Vec<i32> {
+    match kind {
+        ElemKind::Hex20 | ElemKind::Hex20R if nodes.len() >= 20 => {
+            let n = nodes;
+            vec![
+                n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[10], n[11], n[16],
+                n[17], n[18], n[19], n[12], n[13], n[14], n[15],
+            ]
+        }
+        ElemKind::Wedge15 if nodes.len() >= 15 => {
+            let n = nodes;
+            vec![
+                n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[12], n[13], n[14], n[9],
+                n[10], n[11],
+            ]
+        }
+        _ => nodes.to_vec(),
+    }
+}
+
 pub fn write_frd(
     model: &Model,
     u: &[[f64; 3]],
@@ -98,7 +134,7 @@ pub fn write_frd(
     o.push_str("    1UTIME              18:00:00\n");
     o.push_str("    1UHOST              axia\n");
     o.push_str("    1UPGM               Axia FEM\n");
-    o.push_str("    1UVERSION           1.9.1\n");
+    o.push_str("    1UVERSION           1.9.6\n");
     o.push_str("    1UCODE              CalculiX-compatible Axia FEM\n");
 
     let nn = model.node_ids.len() as i32;
@@ -114,20 +150,20 @@ pub fn write_frd(
     }
     o.push_str(" -3\n");
 
-    let ne = model.elements.len() as i32;
+    // ccx frd.c skips MASS (and other 1-node types). FRD type 11 is a 2-node
+    // beam; Mecway reads a second I10 at column 14 and errors
+    // "Field of length 10 missing at column 14" on ` -2      8975`.
+    let mesh_elems: Vec<_> = model
+        .elements
+        .iter()
+        .filter(|el| !el.kind.is_point())
+        .collect();
+    let ne = mesh_elems.len() as i32;
     o.push_str(&mesh_block_header('3', ne));
-    for el in &model.elements {
+    for el in mesh_elems {
         let ty = el.kind.frd_type();
         o.push_str(&format!(" -1{:10}{:5}{:5}{:5}\n", el.id, ty, 0, 1));
-        o.push_str(" -2");
-        for (i, n) in el.nodes.iter().enumerate() {
-            o.push_str(&format!("{n:10}"));
-            if (i + 1) % 10 == 0 && i + 1 < el.nodes.len() {
-                o.push('\n');
-                o.push_str(" -2");
-            }
-        }
-        o.push('\n');
+        write_minus2(&mut o, &frd_nodes(el.kind, &el.nodes));
     }
     o.push_str(" -3\n");
 
@@ -415,5 +451,226 @@ Flacheisen
         let cl = lines.iter().find(|l| l.starts_with("  100CL")).expect("100CL");
         assert_eq!(cl.len(), 75, "100CL `{cl}`");
         assert_eq!(cl.as_bytes()[74], b'1');
+    }
+
+    fn dummy_frd(inp: &str) -> String {
+        let model = crate::inp::parse(inp).unwrap();
+        let z3 = vec![[0.0; 3]; model.node_ids.len()];
+        let z6 = vec![[0.0; 6]; model.node_ids.len()];
+        write_frd(&model, &z3, &z6, &z3, &z6, &[])
+    }
+
+    fn mesh_minus2(frd: &str) -> Vec<String> {
+        let mut in_elem = false;
+        let mut out = Vec::new();
+        for line in frd.lines() {
+            if line.starts_with("    3C") {
+                in_elem = true;
+                continue;
+            }
+            if in_elem && line == " -3" {
+                break;
+            }
+            if in_elem && line.starts_with(" -2") {
+                out.push(line.to_string());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn hex20_frd_midsides_match_ccx() {
+        // ccx frd.c: kon[0..12], kon[16..20], kon[12..16]
+        let n: Vec<i32> = (1..=20).collect();
+        assert_eq!(
+            frd_nodes(ElemKind::Hex20, &n),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 17, 18, 19, 20, 13, 14, 15, 16]
+        );
+        assert_eq!(
+            frd_nodes(ElemKind::Hex20R, &n),
+            frd_nodes(ElemKind::Hex20, &n)
+        );
+
+        let mut nodes = String::new();
+        for i in 1..=20 {
+            nodes.push_str(&format!("{i}, 0, 0, 0\n"));
+        }
+        let inp = format!(
+            "
+*NODE
+{nodes}*ELEMENT, TYPE=C3D20
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+*MATERIAL, NAME=S
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=S
+*BOUNDARY
+1, 1, 3
+*STEP
+*STATIC
+*CLOAD
+2, 1, 1
+*END STEP
+"
+        );
+        let minus2 = mesh_minus2(&dummy_frd(&inp));
+        assert_eq!(minus2.len(), 2, "{minus2:?}");
+        assert_eq!(
+            minus2[0],
+            " -2         1         2         3         4         5         6         7         8         9        10"
+        );
+        assert_eq!(
+            minus2[1],
+            " -2        11        12        17        18        19        20        13        14        15        16"
+        );
+    }
+
+    #[test]
+    fn wedge15_frd_midsides_match_ccx() {
+        let n: Vec<i32> = (1..=15).collect();
+        assert_eq!(
+            frd_nodes(ElemKind::Wedge15, &n),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 15, 10, 11, 12]
+        );
+
+        let mut nodes = String::new();
+        for i in 1..=15 {
+            nodes.push_str(&format!("{i}, 0, 0, 0\n"));
+        }
+        let inp = format!(
+            "
+*NODE
+{nodes}*ELEMENT, TYPE=C3D15
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+*MATERIAL, NAME=S
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=S
+*BOUNDARY
+1, 1, 3
+*STEP
+*STATIC
+*CLOAD
+2, 3, 1
+*END STEP
+"
+        );
+        let minus2 = mesh_minus2(&dummy_frd(&inp));
+        assert_eq!(minus2.len(), 2, "{minus2:?}");
+        assert_eq!(
+            minus2[0],
+            " -2         1         2         3         4         5         6         7         8         9        13"
+        );
+        assert_eq!(
+            minus2[1],
+            " -2        14        15        10        11        12"
+        );
+    }
+
+    #[test]
+    fn mass_omitted_from_frd_mesh_mecway_type11() {
+        // Mecway 33 freq-test.inp: S4 then MASS 8723,8975. ccx skips MASS;
+        // writing it as FRD type 11 with one node makes Mecway fail:
+        // "Field of length 10 missing at column 14 of line  -2      8975"
+        let inp = r#"
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+8975, -0.291, 0.14, -0.095
+*ELEMENT, TYPE=S4
+8720, 1, 2, 3, 4
+*ELEMENT, TYPE=MASS
+8723, 8975
+*MATERIAL, NAME=S
+*ELASTIC
+210000, 0.3
+*SHELL SECTION, ELSET=EALL, MATERIAL=S
+0.003
+*BOUNDARY
+1, 1, 6
+*STEP
+*STATIC
+*CLOAD
+2, 3, 1
+*END STEP
+"#;
+        let model = crate::inp::parse(inp).unwrap();
+        assert_eq!(model.elements.len(), 2);
+        assert!(model.elements.iter().any(|e| e.kind.is_point()));
+        let frd = dummy_frd(inp);
+        let lines: Vec<&str> = frd.lines().collect();
+
+        let c3 = lines
+            .iter()
+            .find(|l| l.starts_with("    3C"))
+            .expect("3C");
+        assert_eq!(&c3[24..36], "           1", "3C must count only S4, got `{c3}`");
+
+        let mut in_elem = false;
+        let mut elem_ids = Vec::new();
+        for line in &lines {
+            if line.starts_with("    3C") {
+                in_elem = true;
+                continue;
+            }
+            if in_elem && *line == " -3" {
+                break;
+            }
+            if in_elem && line.starts_with(" -1") {
+                let id: i32 = line[3..13].trim().parse().expect(line);
+                elem_ids.push(id);
+            }
+            if line.starts_with(" -2") {
+                assert!(
+                    line.len() >= 23,
+                    "Mecway I10 at column 14 missing: `{line}`"
+                );
+                let nfields = line[3..].split_whitespace().count();
+                assert!(nfields >= 2, "too few nodes on `{line}`");
+            }
+        }
+        assert_eq!(elem_ids, vec![8720]);
+        assert!(
+            !lines.iter().any(|l| *l == " -2      8975"),
+            "MASS node must not appear as a 1-node -2 line"
+        );
+    }
+
+    #[test]
+    fn freq_test_attachment_has_no_short_minus2() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../attachments/freq-test.inp"
+        );
+        let Ok(inp) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let model = crate::inp::parse(&inp).expect("parse freq-test.inp");
+        assert!(
+            model.elements.iter().any(|e| e.kind.is_point()),
+            "fixture should contain MASS"
+        );
+        let n = model.node_ids.len();
+        let z3 = vec![[0.0; 3]; n];
+        let z6 = vec![[0.0; 6]; n];
+        let frd = write_frd(&model, &z3, &z6, &z3, &z6, &[]);
+        for line in frd.lines() {
+            if line.starts_with(" -2") {
+                assert!(
+                    line.len() >= 23,
+                    "Mecway I10 at column 14 missing: `{line}`"
+                );
+            }
+        }
+        assert!(
+            !frd.lines().any(|l| l == " -2      8975"),
+            "exact Mecway failure line still present"
+        );
+        let c3 = frd.lines().find(|l| l.starts_with("    3C")).unwrap();
+        let n_mesh: i32 = c3[24..36].trim().parse().unwrap();
+        let n_point = model.elements.iter().filter(|e| e.kind.is_point()).count() as i32;
+        assert_eq!(n_mesh, model.elements.len() as i32 - n_point);
     }
 }
