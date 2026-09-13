@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { Button } from "@/components/ui/button";
+import { AppMark, AppNav } from "@/components/app-nav";
 import { InpEditor } from "@/components/inp-editor";
 import { MeshViewer, fieldRange, type FieldId } from "@/components/mesh-viewer";
 import { COLORBAR_TICKS, formatLegend, sampleCss } from "@/lib/colormap";
@@ -19,6 +20,7 @@ import {
   type FemResult,
 } from "@/lib/solver";
 import { cn, downloadText, formatNum } from "@/lib/utils";
+import { takeInpFromPreprocessor } from "@/lib/pre/bridge";
 
 export const Route = createFileRoute("/")({ component: Home });
 
@@ -49,6 +51,16 @@ function Home() {
   const [log, setLog] = useState<string[]>(["Axia · FEM · C3D8 / T3D2 / S4R / B32 · NLGEOM / *PLASTIC"]);
   const fileRef = useRef<HTMLInputElement>(null);
   const autoRan = useRef(false);
+  const [booted, setBooted] = useState(false);
+
+  useEffect(() => {
+    const t = takeInpFromPreprocessor();
+    if (t) {
+      setInp(t.inp);
+      setExampleId("pre");
+    }
+    setBooted(true);
+  }, []);
 
   useEffect(() => {
     let live = true;
@@ -65,7 +77,7 @@ function Home() {
   }, []);
 
   useEffect(() => {
-    if (!ready || autoRan.current) return;
+    if (!ready || !booted || autoRan.current) return;
     autoRan.current = true;
     const r = solveInp(inp);
     if (!r.ok) {
@@ -81,7 +93,7 @@ function Home() {
         ...l,
       ].slice(0, 12));
     }
-  }, [ready, inp]);
+  }, [ready, booted, inp]);
 
   useEffect(() => {
     if (!ready) return;
@@ -188,13 +200,14 @@ function Home() {
   return (
     <main className="flex h-dvh flex-col overflow-hidden bg-bg text-fg">
       <header className="flex shrink-0 items-center gap-2 border-b border-border bg-surface px-3 py-2 lg:px-4">
-        <Mark />
+        <AppMark />
         <div className="min-w-0 flex-1">
           <div className="flex items-baseline gap-2">
             <h1 className="text-[15px] font-medium tracking-tight">Axia</h1>
             <p className="hidden text-xs text-muted sm:block">FEM-Solver · INP / FRD</p>
           </div>
         </div>
+        <AppNav active="solver" />
         <label className="hidden sm:block">
           <span className="sr-only">Beispiel</span>
           <select
@@ -208,6 +221,7 @@ function Home() {
               </option>
             ))}
             {exampleId === "file" && <option value="file">Datei</option>}
+            {exampleId === "pre" && <option value="pre">Präprozessor</option>}
           </select>
         </label>
         <input
@@ -251,6 +265,7 @@ function Home() {
               {e.name}
             </option>
           ))}
+          {exampleId === "pre" && <option value="pre">Präprozessor</option>}
         </select>
       </div>
 
@@ -324,24 +339,6 @@ function Home() {
         </div>
       </div>
     </main>
-  );
-}
-
-function Mark() {
-  return (
-    <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden className="shrink-0">
-      <rect width="28" height="28" rx="7" className="fill-surface-2 stroke-border" strokeWidth="1" />
-      <path
-        d="M8 20 L14 7 L20 20 Z"
-        fill="none"
-        className="stroke-fg"
-        strokeWidth="1.4"
-        strokeLinejoin="round"
-      />
-      <circle cx="14" cy="7" r="1.4" className="fill-fg" />
-      <circle cx="8" cy="20" r="1.4" className="fill-fg" />
-      <circle cx="20" cy="20" r="1.4" className="fill-fg" />
-    </svg>
   );
 }
 

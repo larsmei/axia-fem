@@ -13,7 +13,7 @@ export const Route = createRootRoute({
       { title: APP_NAME },
       {
         name: "description",
-        content: "Linearer FEM-Solver in Rust. CalculiX-kompatibles INP und FRD.",
+        content: "FEM-Solver und 2D-Präprozessor. CalculiX-kompatibles INP und FRD.",
       },
       { name: "theme-color", content: "#09090b" },
     ],
