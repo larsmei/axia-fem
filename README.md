@@ -9,7 +9,7 @@ Zwei Frontends, ein Solver:
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
 
-**1.9.1** — FRD long-ASCII wie ccx (Spalte 74, Fortran `E-02`, ` -1`/` -2`/` -3`), Windows-MKL findet `mkl_rt.dll` unter `$MKLROOT/bin` (Shim `libmkl_rt.dll`), Viewer Jet-Farbverlauf / Mecway-Colorbar. **1.9** — fehlende Elemente: CAX3/CAX6, C3D10T (B-bar), MASS, ROTARYI, DASHPOTA, GAPUNI, Aliase B21/B22 und C3D20RI. **1.8** — `*STATIC, RIKS` (Crisfield-Bogenlänge, Snap-Through). **1.7.1** — Viewer zeichnet T3D2/T3D3/SPRINGA (Fachwerk NLGEOM). **1.7** — Coulomb-`*FRICTION`, `NLGEOM`+`*PLASTIC` auf Kontinuum. **1.6** — `*CONTACT PAIR` Node-to-Surface, Penalty, reibungsfrei. **1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
+**1.9.2** — Windows-MKL: `mkl_rt.dll` **neben `axia.exe`** (Shim `libmkl_rt.dll` im selben Ordner, nicht in `%TEMP%`). **1.9.1** — FRD long-ASCII wie ccx (Spalte 74, Fortran `E-02`, ` -1`/` -2`/` -3`), Windows-MKL findet `mkl_rt.dll` unter `$MKLROOT/bin`, Viewer Jet-Farbverlauf / Mecway-Colorbar. **1.9** — fehlende Elemente: CAX3/CAX6, C3D10T (B-bar), MASS, ROTARYI, DASHPOTA, GAPUNI, Aliase B21/B22 und C3D20RI. **1.8** — `*STATIC, RIKS` (Crisfield-Bogenlänge, Snap-Through). **1.7.1** — Viewer zeichnet T3D2/T3D3/SPRINGA (Fachwerk NLGEOM). **1.7** — Coulomb-`*FRICTION`, `NLGEOM`+`*PLASTIC` auf Kontinuum. **1.6** — `*CONTACT PAIR` Node-to-Surface, Penalty, reibungsfrei. **1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
 
 ## CLI
 
@@ -84,22 +84,35 @@ Die Browser-WASM-Variante verwendet weiterhin die eingebaute Cholesky-/PCG-Kette
 
 #### Intel MKL unter Windows
 
-`pardiso-wrapper` 0.1.2 sucht nach **`libmkl_rt.dll`** in `$MKLROOT/lib`. Intel oneAPI legt die Runtime aber als **`mkl_rt.dll`** (plus `mkl_rt.2.dll`) unter **`$MKLROOT/bin`** ab. Axia sucht deshalb selbst nach `mkl_rt.dll` / `mkl_rt.2.dll` unter
+`pardiso-wrapper` 0.1.2 sucht nach **`libmkl_rt.dll`**. Intel oneAPI liefert **`mkl_rt.dll`**. Axia sucht in dieser Reihenfolge:
 
-`$MKLROOT\bin`, `bin\intel64`, `redist\intel64`, `lib`, `lib\intel64`
+1. **Ordner von `axia.exe`** (portable: DLLs neben die EXE legen)
+2. aktuelles Arbeitsverzeichnis
+3. `$MKLROOT\bin`, `bin\intel64`, `redist\intel64`, `lib`, …
+4. `PATH`
 
-und erzeugt bei Bedarf einen Shim `libmkl_rt.dll` (plus `MKL_PARDISO_PATH`). `MKLROOT` allein reicht; `setvars.bat` ist nicht zwingend, hilft aber für OpenMP.
+und legt bei Bedarf **`libmkl_rt.dll` im selben Ordner** wie `mkl_rt.dll` an (Hardlink/Kopie). Der Shim darf nicht in `%TEMP%` allein liegen: `mkl_rt` lädt `mkl_core` aus **seinem eigenen Verzeichnis**.
+
+**Nur `mkl_rt.dll` + `libiomp5md.dll` reicht nicht.** Mindestens:
+
+| Datei | Rolle |
+|---|---|
+| `mkl_rt.dll` / `mkl_rt.2.dll` | Dispatcher (SDL) |
+| `libmkl_rt.dll` | Name, den der Wrapper sucht (Axia erzeugt ihn) |
+| `mkl_core.2.dll` | Kern |
+| `mkl_intel_thread.2.dll` oder `mkl_sequential.2.dll` | Threading |
+| `mkl_avx2.2.dll` oder `mkl_def.2.dll` | CPU-Kernels |
+| `libiomp5md.dll` | Intel OpenMP (bei `intel_thread`) |
+
+Einfach den Inhalt von `%MKLROOT%\bin` (plus `libiomp5md.dll` aus `compiler\latest\bin`) **neben `axia.exe` kopieren**, oder:
 
 ```bat
 set MKLROOT=C:\Program Files (x86)\Intel\oneAPI\mkl\latest
+call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
 axia job
 ```
 
-Zusätzlich muss die Intel-OpenMP-Runtime **`libiomp5md.dll`** ladbar sein — typisch
-
-`C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin`
-
-(oder `oneAPI setvars.bat`, das `PATH` vollständig setzt). Wenn `MKLROOT` gesetzt ist, die DLL aber fehlt oder OpenMP nicht gefunden wird, schreibt Axia den Grund auf stderr und fällt auf rivrs-sparse zurück.
+Wenn PARDISO nicht lädt, schreibt Axia auf stderr, welche DLLs gefunden wurden und den Win32-Fehler von `LoadLibrary` (126 = abhängige DLL fehlt). Danach Fallback auf rivrs-sparse.
 
 #### FRD (CalculiX / Mecway / cgx)
 
