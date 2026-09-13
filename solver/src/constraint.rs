@@ -505,30 +505,61 @@ fn surface_nodes(model: &Model, name: &str) -> Result<Vec<i32>> {
 }
 
 pub(crate) fn face_nodes(el: &crate::model::Element, face: i32) -> Vec<i32> {
+    use crate::model::ElemKind::*;
     let n = &el.nodes;
-    match (el.kind.ccx_name(), face) {
-        ("C3D8" | "C3D8I" | "C3D8R", 1) if n.len() >= 4 => n[0..4].to_vec(),
-        ("C3D8" | "C3D8I" | "C3D8R", 2) if n.len() >= 8 => vec![n[4], n[7], n[6], n[5]],
-        ("C3D8" | "C3D8I" | "C3D8R", 3) if n.len() >= 8 => vec![n[0], n[4], n[5], n[1]],
-        ("C3D8" | "C3D8I" | "C3D8R", 4) if n.len() >= 8 => vec![n[1], n[5], n[6], n[2]],
-        ("C3D8" | "C3D8I" | "C3D8R", 5) if n.len() >= 8 => vec![n[2], n[6], n[7], n[3]],
-        ("C3D8" | "C3D8I" | "C3D8R", 6) if n.len() >= 8 => vec![n[3], n[7], n[4], n[0]],
-        ("C3D20" | "C3D20R", 1) if n.len() >= 4 => n[0..4].to_vec(),
-        ("C3D20" | "C3D20R", 2) if n.len() >= 8 => vec![n[4], n[7], n[6], n[5]],
-        ("C3D20" | "C3D20R", 3) if n.len() >= 8 => vec![n[0], n[4], n[5], n[1]],
-        ("C3D20" | "C3D20R", 4) if n.len() >= 8 => vec![n[1], n[5], n[6], n[2]],
-        ("C3D20" | "C3D20R", 5) if n.len() >= 8 => vec![n[2], n[6], n[7], n[3]],
-        ("C3D20" | "C3D20R", 6) if n.len() >= 8 => vec![n[3], n[7], n[4], n[0]],
-        ("C3D4", 1) if n.len() >= 3 => n[0..3].to_vec(),
-        ("C3D4", 2) if n.len() >= 4 => vec![n[0], n[3], n[1]],
-        ("C3D4", 3) if n.len() >= 4 => vec![n[1], n[3], n[2]],
-        ("C3D4", 4) if n.len() >= 4 => vec![n[2], n[3], n[0]],
-        ("C3D10", 1) if n.len() >= 3 => n[0..3].to_vec(),
-        ("C3D10", 2) if n.len() >= 4 => vec![n[0], n[3], n[1]],
-        ("C3D10", 3) if n.len() >= 4 => vec![n[1], n[3], n[2]],
-        ("C3D10", 4) if n.len() >= 4 => vec![n[2], n[3], n[0]],
-        ("C3D6", 1) if n.len() >= 3 => n[0..3].to_vec(),
-        ("C3D6", 2) if n.len() >= 6 => n[3..6].to_vec(),
+    let pick = |idx: &[usize]| -> Vec<i32> {
+        idx.iter().filter_map(|&i| n.get(i).copied()).collect()
+    };
+    match (el.kind, face) {
+        (Hex8 | Hex8I | Hex8R, 1) => pick(&[0, 1, 2, 3]),
+        (Hex8 | Hex8I | Hex8R, 2) => pick(&[4, 7, 6, 5]),
+        (Hex8 | Hex8I | Hex8R, 3) => pick(&[0, 4, 5, 1]),
+        (Hex8 | Hex8I | Hex8R, 4) => pick(&[1, 5, 6, 2]),
+        (Hex8 | Hex8I | Hex8R, 5) => pick(&[2, 6, 7, 3]),
+        (Hex8 | Hex8I | Hex8R, 6) => pick(&[3, 7, 4, 0]),
+        (Hex20 | Hex20R, f) if (1..=6).contains(&f) => {
+            pick(&crate::quadratic::HEX20_FACE[(f - 1) as usize])
+        }
+        (Tet4, 1) => pick(&[0, 1, 2]),
+        (Tet4, 2) => pick(&[0, 3, 1]),
+        (Tet4, 3) => pick(&[1, 3, 2]),
+        (Tet4, 4) => pick(&[2, 3, 0]),
+        // C3D10 / C3D10T: 3 corners + 3 edge midsides (ccx faces).
+        (Tet10 | Tet10T, 1) => pick(&[0, 1, 2, 4, 5, 6]),
+        (Tet10 | Tet10T, 2) => pick(&[0, 3, 1, 7, 8, 4]),
+        (Tet10 | Tet10T, 3) => pick(&[1, 3, 2, 8, 9, 5]),
+        (Tet10 | Tet10T, 4) => pick(&[2, 3, 0, 9, 7, 6]),
+        (Wedge6, 1) => pick(&[0, 1, 2]),
+        (Wedge6, 2) => pick(&[3, 5, 4]),
+        (Wedge6, 3) => pick(&[0, 1, 4, 3]),
+        (Wedge6, 4) => pick(&[1, 2, 5, 4]),
+        (Wedge6, 5) => pick(&[2, 0, 3, 5]),
+        // C3D15: same connectivity as extra::wedge15_face_pressure.
+        (Wedge15, 1) => pick(&[0, 1, 2, 6, 7, 8]),
+        (Wedge15, 2) => pick(&[3, 5, 4, 11, 10, 9]),
+        (Wedge15, 3) => pick(&[0, 1, 4, 3, 6, 13, 9, 12]),
+        (Wedge15, 4) => pick(&[1, 2, 5, 4, 7, 14, 10, 13]),
+        (Wedge15, 5) => pick(&[2, 0, 3, 5, 8, 12, 11, 14]),
+        // Quadratic 2-D / shell edges S3–S6 (S1/S2 = the face = all nodes).
+        (
+            Quad8Ps | Quad8Pe | Quad8RPs | Quad8RPe | Cax8 | Cax8R | Shell8 | Shell8R | Mem8,
+            3,
+        ) => pick(&[0, 1, 4]),
+        (
+            Quad8Ps | Quad8Pe | Quad8RPs | Quad8RPe | Cax8 | Cax8R | Shell8 | Shell8R | Mem8,
+            4,
+        ) => pick(&[1, 2, 5]),
+        (
+            Quad8Ps | Quad8Pe | Quad8RPs | Quad8RPe | Cax8 | Cax8R | Shell8 | Shell8R | Mem8,
+            5,
+        ) => pick(&[2, 3, 6]),
+        (
+            Quad8Ps | Quad8Pe | Quad8RPs | Quad8RPe | Cax8 | Cax8R | Shell8 | Shell8R | Mem8,
+            6,
+        ) => pick(&[3, 0, 7]),
+        (Tri6Ps | Tri6Pe | Cax6, 1) => pick(&[0, 1, 3]),
+        (Tri6Ps | Tri6Pe | Cax6, 2) => pick(&[1, 2, 4]),
+        (Tri6Ps | Tri6Pe | Cax6, 3) => pick(&[2, 0, 5]),
         _ => n.clone(),
     }
 }
@@ -644,5 +675,55 @@ pub fn dofs_to_global(
                 u[base + 3 + p] = r[p][0] * rl[0] + r[p][1] * rl[1] + r[p][2] * rl[2];
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::face_nodes;
+    use crate::model::{ElemKind, Element};
+
+    fn el(kind: ElemKind, n: usize) -> Element {
+        Element {
+            id: 1,
+            kind,
+            nodes: (1..=n as i32).collect(),
+            elset: String::new(),
+        }
+    }
+
+    #[test]
+    fn c3d20_faces_include_midsides() {
+        let e = el(ElemKind::Hex20, 20);
+        assert_eq!(face_nodes(&e, 1), vec![1, 2, 3, 4, 9, 10, 11, 12]);
+        assert_eq!(face_nodes(&e, 2), vec![5, 8, 7, 6, 16, 15, 14, 13]);
+        assert_eq!(face_nodes(&e, 3).len(), 8);
+        assert_eq!(face_nodes(&el(ElemKind::Hex20R, 20), 1), face_nodes(&e, 1));
+    }
+
+    #[test]
+    fn c3d10_faces_include_midsides() {
+        let e = el(ElemKind::Tet10, 10);
+        assert_eq!(face_nodes(&e, 1), vec![1, 2, 3, 5, 6, 7]);
+        assert_eq!(face_nodes(&e, 2), vec![1, 4, 2, 8, 9, 5]);
+        assert_eq!(face_nodes(&el(ElemKind::Tet10T, 10), 1), face_nodes(&e, 1));
+        // linear tet stays 3-node
+        assert_eq!(face_nodes(&el(ElemKind::Tet4, 4), 1), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn c3d15_faces_include_midsides() {
+        let e = el(ElemKind::Wedge15, 15);
+        assert_eq!(face_nodes(&e, 1), vec![1, 2, 3, 7, 8, 9]);
+        assert_eq!(face_nodes(&e, 3).len(), 8);
+        assert_eq!(face_nodes(&el(ElemKind::Wedge6, 6), 1), vec![1, 2, 3]);
+        assert_eq!(face_nodes(&el(ElemKind::Wedge6, 6), 3), vec![1, 2, 5, 4]);
+    }
+
+    #[test]
+    fn shell8_spos_keeps_all_eight() {
+        let e = el(ElemKind::Shell8, 8);
+        assert_eq!(face_nodes(&e, 1).len(), 8, "SPOS/S1 is the 8-node face");
+        assert_eq!(face_nodes(&e, 3), vec![1, 2, 5]);
     }
 }

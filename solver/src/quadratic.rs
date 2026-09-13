@@ -171,16 +171,17 @@ pub fn hex20_body_force(xyz: &[[f64; 3]], bx: f64, by: f64, bz: f64, reduced: bo
 }
 
 /// CalculiX P1..P6 on C3D20. 8-node faces: 4 corners + 4 midsides.
+pub(crate) const HEX20_FACE: [[usize; 8]; 6] = [
+    [0, 1, 2, 3, 8, 9, 10, 11],
+    [4, 7, 6, 5, 15, 14, 13, 12],
+    [0, 4, 5, 1, 16, 12, 17, 8],
+    [1, 5, 6, 2, 17, 13, 18, 9],
+    [2, 6, 7, 3, 18, 14, 19, 10],
+    [3, 7, 4, 0, 19, 15, 16, 11],
+];
+
 pub fn hex20_face_pressure(xyz: &[[f64; 3]], face: i32, p: f64) -> Result<Vec<f64>> {
-    // corners then mids AB,BC,CD,DA
-    let faces: [[usize; 8]; 6] = [
-        [0, 1, 2, 3, 8, 9, 10, 11],
-        [4, 7, 6, 5, 15, 14, 13, 12],
-        [0, 4, 5, 1, 16, 12, 17, 8],
-        [1, 5, 6, 2, 17, 13, 18, 9],
-        [2, 6, 7, 3, 18, 14, 19, 10],
-        [3, 7, 4, 0, 19, 15, 16, 11],
-    ];
+    let faces = HEX20_FACE;
     if !(1..=6).contains(&face) {
         return err(format!("Ungültige C3D20-Fläche P{face}"));
     }

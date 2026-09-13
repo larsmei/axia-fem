@@ -1255,6 +1255,107 @@ SL, MA
     }
 
     #[test]
+    fn tie_c3d20_applies_to_midsides() {
+        // Two C3D20 stacked on z=10. Interface midside 13 (master) and 29 (slave)
+        // must share ux; without midsides in face_nodes they independent.
+        let inp = r#"
+*HEADING
+c3d20 tie midsides
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 10, 0
+4, 0, 10, 0
+5, 0, 0, 10
+6, 10, 0, 10
+7, 10, 10, 10
+8, 0, 10, 10
+9, 5, 0, 0
+10, 10, 5, 0
+11, 5, 10, 0
+12, 0, 5, 0
+13, 5, 0, 10
+14, 10, 5, 10
+15, 5, 10, 10
+16, 0, 5, 10
+17, 0, 0, 5
+18, 10, 0, 5
+19, 10, 10, 5
+20, 0, 10, 5
+21, 0, 0, 10
+22, 10, 0, 10
+23, 10, 10, 10
+24, 0, 10, 10
+25, 0, 0, 20
+26, 10, 0, 20
+27, 10, 10, 20
+28, 0, 10, 20
+29, 5, 0, 10
+30, 10, 5, 10
+31, 5, 10, 10
+32, 0, 5, 10
+33, 5, 0, 20
+34, 10, 5, 20
+35, 5, 10, 20
+36, 0, 5, 20
+37, 0, 0, 15
+38, 10, 0, 15
+39, 10, 10, 15
+40, 0, 10, 15
+*ELEMENT, TYPE=C3D20, ELSET=SOLID
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+2, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=SOLID, MATERIAL=STEEL
+*SURFACE, NAME=MA, TYPE=ELEMENT
+1, S2
+*SURFACE, NAME=SL, TYPE=ELEMENT
+2, S1
+*TIE, POSITION TOLERANCE=0.01
+SL, MA
+*BOUNDARY
+1, 1, 3
+4, 1, 3
+9, 1, 3
+12, 1, 3
+2, 2, 3
+3, 3, 3
+*STEP
+*STATIC
+*CLOAD
+26, 1, 1312.5
+27, 1, 1312.5
+25, 1, 1312.5
+28, 1, 1312.5
+33, 1, 2625
+34, 1, 2625
+35, 1, 2625
+36, 1, 2625
+*END STEP
+"#;
+        let model = parse_model(inp).unwrap();
+        let sl = crate::constraint::face_nodes(&model.elements[1], 1);
+        assert!(sl.contains(&29), "slave face must contain midside 29, got {sl:?}");
+        assert_eq!(sl.len(), 8, "C3D20 S1 is 8 nodes, got {sl:?}");
+        let mpcs = crate::constraint::ties_to_mpcs(&model, 3).unwrap();
+        let si = model.node_index(29).unwrap();
+        assert!(
+            mpcs.iter().any(|m| m.slave == 3 * si),
+            "no MPC on midside 29 ux; {} mpcs",
+            mpcs.len()
+        );
+        let out = solve_native(inp).unwrap();
+        let u13 = out.u[out.model.node_index(13).unwrap()][0];
+        let u29 = out.u[out.model.node_index(29).unwrap()][0];
+        assert!(
+            (u13 - u29).abs() < 1e-8,
+            "midside TIE: u13={u13} u29={u29}"
+        );
+    }
+
+    #[test]
     fn rigid_body_fixed_ref() {
         let inp = r#"
 *HEADING
