@@ -203,6 +203,12 @@ pub fn solve_native(inp: &str) -> Result<analysis::SolveOutput> {
     analysis::solve(model)
 }
 
+/// Hidden CLI entry for `--internal-mkl-probe`: 0 = MKL ok, otherwise skip MKL.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mkl_self_test() -> i32 {
+    sparse_native::mkl_self_test()
+}
+
 pub fn solve_native_with_base(
     inp: &str,
     base: Option<&std::path::Path>,

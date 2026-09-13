@@ -226,6 +226,159 @@ fn is_mkl_companion_name(name: &str) -> bool {
         || n.starts_with("libiomp")
 }
 
+fn is_lib_filename(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.ends_with(".dll") || n.ends_with(".so") || n.contains(".so.") || n.ends_with(".dylib")
+}
+
+fn is_mkl_core_name(name: &str) -> bool {
+    is_lib_filename(name) && name.to_ascii_lowercase().contains("mkl_core")
+}
+
+fn is_mkl_thread_layer_name(name: &str) -> bool {
+    if !is_lib_filename(name) {
+        return false;
+    }
+    let n = name.to_ascii_lowercase();
+    n.contains("mkl_sequential")
+        || n.contains("mkl_intel_thread")
+        || n.contains("mkl_tbb_thread")
+        || n.contains("mkl_gnu_thread")
+}
+
+fn is_mkl_cpu_kernel_name(name: &str) -> bool {
+    if !is_lib_filename(name) {
+        return false;
+    }
+    let n = name.to_ascii_lowercase();
+    let s = n.trim_start_matches("lib");
+    s.starts_with("mkl_avx")
+        || s.starts_with("mkl_def")
+        || s.starts_with("mkl_mc")
+        || s.starts_with("mkl_sse")
+        || s.starts_with("mkl_p4")
+}
+
+fn is_iomp_name(name: &str) -> bool {
+    if !is_lib_filename(name) {
+        return false;
+    }
+    let n = name.to_ascii_lowercase();
+    n.contains("iomp5") || n.starts_with("libiomp")
+}
+
+fn has_file_matching(dirs: &[std::path::PathBuf], pred: impl Fn(&str) -> bool) -> bool {
+    for d in dirs {
+        let Ok(rd) = std::fs::read_dir(d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let Some(s) = name.to_str() else { continue };
+            if pred(s) && e.path().is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn missing_mkl_parts(dirs: &[std::path::PathBuf]) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !has_file_matching(dirs, is_mkl_core_name) {
+        missing.push("mkl_core");
+    }
+    if !has_file_matching(dirs, is_mkl_thread_layer_name) {
+        missing.push("mkl_sequential/mkl_intel_thread");
+    }
+    if !has_file_matching(dirs, is_mkl_cpu_kernel_name) {
+        missing.push("mkl_avx2/mkl_def (CPU kernel)");
+    }
+    missing
+}
+
+fn mkl_source_dirs(rt_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let mut push = |p: std::path::PathBuf| {
+        if p.is_dir() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+    push(rt_dir.to_path_buf());
+    if let Some(d) = exe_dir() {
+        push(d);
+    }
+    if let Ok(d) = std::env::current_dir() {
+        push(d);
+    }
+    for extra in compiler_redist_dirs(rt_dir) {
+        push(extra);
+    }
+    if let Some(parent) = rt_dir.parent() {
+        push(parent.to_path_buf());
+        push(parent.join("bin"));
+        push(parent.join("lib"));
+        push(parent.join("redist/intel64"));
+        if let Some(gp) = parent.parent() {
+            push(gp.join("bin"));
+            push(gp.join("lib"));
+            push(gp.join("compiler/latest/bin"));
+            push(gp.join("compiler/latest/lib"));
+        }
+    }
+    dirs
+}
+
+fn infer_mklroot(rt: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = rt.parent()?.to_path_buf();
+    for _ in 0..3 {
+        let name = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "bin" | "lib" | "intel64" | "intel64_win" | "redist"
+        ) {
+            dir = dir.parent()?.to_path_buf();
+            continue;
+        }
+        break;
+    }
+    Some(dir)
+}
+
+fn choose_mkl_threading(dirs: &[std::path::PathBuf]) -> &'static str {
+    if let Ok(v) = std::env::var("MKL_THREADING_LAYER") {
+        if !v.trim().is_empty() {
+            return "keep";
+        }
+    }
+    let intel = has_file_matching(dirs, |n| n.to_ascii_lowercase().contains("mkl_intel_thread"));
+    let seq = has_file_matching(dirs, |n| n.to_ascii_lowercase().contains("mkl_sequential"));
+    let iomp = has_file_matching(dirs, is_iomp_name);
+    if intel && iomp {
+        "INTEL"
+    } else if seq {
+        "SEQUENTIAL"
+    } else if intel {
+        "INTEL"
+    } else {
+        "SEQUENTIAL"
+    }
+}
+
+fn populate_bundle(dest: &std::path::Path, sources: &[std::path::PathBuf]) {
+    let _ = std::fs::create_dir_all(dest);
+    for src in sources {
+        if src == dest {
+            continue;
+        }
+        copy_mkl_companions(src, dest);
+    }
+}
+
 fn copy_mkl_companions(from: &std::path::Path, to: &std::path::Path) {
     let Ok(rd) = std::fs::read_dir(from) else {
         return;
@@ -333,9 +486,14 @@ fn mkl_dir_inventory(dir: &std::path::Path) -> String {
         "mkl_core.dll",
         "mkl_intel_thread.2.dll",
         "mkl_sequential.2.dll",
+        "mkl_avx2.2.dll",
+        "mkl_def.2.dll",
         "libiomp5md.dll",
         "libmkl_rt.so",
         "libmkl_core.so.2",
+        "libmkl_avx2.so.2",
+        "libmkl_def.so.2",
+        "libiomp5.so",
     ];
     let mut have = Vec::new();
     let mut missing = Vec::new();
@@ -360,6 +518,7 @@ fn mkl_dir_inventory(dir: &std::path::Path) -> String {
 
 use std::sync::Mutex;
 static MKL_DIAG: Mutex<Option<String>> = Mutex::new(None);
+static MKL_BLOCKED: Mutex<Option<String>> = Mutex::new(None);
 
 fn set_mkl_diag(s: impl Into<String>) {
     if let Ok(mut g) = MKL_DIAG.lock() {
@@ -367,8 +526,43 @@ fn set_mkl_diag(s: impl Into<String>) {
     }
 }
 
-fn take_mkl_diag() -> Option<String> {
-    MKL_DIAG.lock().ok().and_then(|mut g| g.take())
+fn peek_mkl_diag() -> Option<String> {
+    MKL_DIAG.lock().ok().and_then(|g| g.clone())
+}
+
+fn mkl_fail_detail() -> String {
+    mkl_blocked_msg()
+        .or_else(peek_mkl_diag)
+        .unwrap_or_default()
+}
+
+fn set_mkl_blocked(s: impl Into<String>) {
+    let s = s.into();
+    set_mkl_diag(s.clone());
+    if let Ok(mut g) = MKL_BLOCKED.lock() {
+        *g = Some(s);
+    }
+}
+
+fn mkl_blocked_msg() -> Option<String> {
+    MKL_BLOCKED.lock().ok().and_then(|g| g.clone())
+}
+
+fn apply_mkl_env_defaults(dirs: &[std::path::PathBuf]) {
+    unsafe {
+        if std::env::var_os("KMP_DUPLICATE_LIB_OK").is_none() {
+            // Mecway / other hosts often already loaded libomp. Without this,
+            // Intel OpenMP prints Error #15 and abort()s — no Rust error.
+            std::env::set_var("KMP_DUPLICATE_LIB_OK", "TRUE");
+        }
+        if std::env::var_os("MKL_INTERFACE_LAYER").is_none() {
+            std::env::set_var("MKL_INTERFACE_LAYER", "LP64");
+        }
+        let layer = choose_mkl_threading(dirs);
+        if layer != "keep" && std::env::var_os("MKL_THREADING_LAYER").is_none() {
+            std::env::set_var("MKL_THREADING_LAYER", layer);
+        }
+    }
 }
 
 /// `pardiso-wrapper` 0.1.2 uses `lazy_static` and looks for `libmkl_rt.dll` in
@@ -401,7 +595,7 @@ fn prepare_mkl_env_inner() {
             "no mkl_rt / libmkl_rt next to axia.exe ({where_}), in cwd, $MKLROOT or PATH. \
              Wrapper looks for {expected}. Intel ships mkl_rt.dll. \
              Copy the MKL redist (mkl_rt.dll, mkl_core.2.dll, mkl_intel_thread.2.dll, \
-             libiomp5md.dll) next to axia.exe, or set MKLROOT."
+             mkl_avx2.2.dll or mkl_def.2.dll, libiomp5md.dll) next to axia.exe, or set MKLROOT."
         ));
         return;
     };
@@ -415,21 +609,51 @@ fn prepare_mkl_env_inner() {
         path_prepend(&extra);
     }
 
+    if std::env::var_os("MKLROOT").is_none() {
+        if let Some(root) = infer_mklroot(&found) {
+            unsafe {
+                std::env::set_var("MKLROOT", &root);
+            }
+        }
+    }
+
+    let sources = mkl_source_dirs(&dir);
+    apply_mkl_env_defaults(&sources);
+
     match ensure_wrapper_named_library(&found) {
         Ok(shim) => {
             if let Some(shim_dir) = shim.parent() {
+                populate_bundle(shim_dir, &sources);
                 path_prepend(shim_dir);
                 set_dll_directory(shim_dir);
                 unsafe {
                     std::env::set_var("MKL_PARDISO_PATH", shim_dir);
                 }
             }
+            let bundle = shim
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| dir.clone());
+            let mut scan = sources.clone();
+            if !scan.contains(&bundle) {
+                scan.insert(0, bundle.clone());
+            }
+            let missing = missing_mkl_parts(&scan);
             let inv = mkl_dir_inventory(&dir);
-            set_mkl_diag(format!(
-                "runtime {} → {} for wrapper; {inv}",
-                found.display(),
-                shim.display()
-            ));
+            if !missing.is_empty() {
+                set_mkl_blocked(format!(
+                    "MKL redist incomplete (missing {}). Calling it would abort the process \
+                     with no Axia error (Intel MKL FATAL ERROR / OpenMP). {inv}. \
+                     Copy the full MKL bin redist next to axia.exe, or use --solver faer.",
+                    missing.join(", ")
+                ));
+            } else {
+                set_mkl_diag(format!(
+                    "runtime {} → {} for wrapper; {inv}",
+                    found.display(),
+                    shim.display()
+                ));
+            }
             if found.file_name() != shim.file_name() {
                 eprintln!(
                     "axia: MKL runtime {} (wrapper expects {expected}; using {})",
@@ -439,7 +663,7 @@ fn prepare_mkl_env_inner() {
             }
         }
         Err(e) => {
-            set_mkl_diag(format!(
+            set_mkl_blocked(format!(
                 "found {} but could not create {expected}: {e}. {}",
                 found.display(),
                 mkl_dir_inventory(&dir)
@@ -491,19 +715,34 @@ fn csr_upper_1based(csr: &Csr) -> Result<(Vec<f64>, Vec<i32>, Vec<i32>)> {
 }
 
 fn run_pardiso<S: PardisoInterface>(csr: &Csr, rhs: &[f64]) -> Result<Vec<f64>> {
+    if csr.n == 0 {
+        return Ok(Vec::new());
+    }
     let n = csr.n as i32;
     let (a, ia, ja) = csr_upper_1based(csr)?;
     let try_type = |mtype: MatrixType| -> Result<Vec<f64>> {
-        let mut b = rhs.to_vec();
-        let mut x = vec![0.0; csr.n];
-        let mut ps = S::new().map_err(|e| FemError(e.to_string()))?;
-        ps.set_matrix_type(mtype);
-        ps.pardisoinit().map_err(|e| FemError(e.to_string()))?;
-        ps.set_message_level(MessageLevel::Off);
-        ps.set_phase(Phase::AnalysisNumFactSolveRefine);
-        ps.pardiso(&a, &ia, &ja, &mut b, &mut x, n, 1)
-            .map_err(|e| FemError(e.to_string()))?;
-        Ok(x)
+        let inner = || -> Result<Vec<f64>> {
+            let mut b = rhs.to_vec();
+            let mut x = vec![0.0; csr.n];
+            let mut ps = S::new().map_err(|e| FemError(e.to_string()))?;
+            ps.set_matrix_type(mtype);
+            ps.pardisoinit().map_err(|e| FemError(e.to_string()))?;
+            // iparm[4]=0: do not read/write perm. Still allocate n slots —
+            // pardiso-wrapper passes perm.as_mut_ptr() from an empty Vec.
+            ps.set_perm(&vec![0i32; csr.n]);
+            ps.set_iparm(4, 0);
+            // iparm[26]=1: matrix checker (bad CSR → error code, not abort).
+            ps.set_iparm(26, 1);
+            ps.set_message_level(MessageLevel::Off);
+            ps.set_phase(Phase::AnalysisNumFactSolveRefine);
+            ps.pardiso(&a, &ia, &ja, &mut b, &mut x, n, 1)
+                .map_err(|e| FemError(e.to_string()))?;
+            Ok(x)
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
+            Ok(r) => r,
+            Err(_) => err("PARDISO panicked (see axia: panic: … on stderr)"),
+        }
     };
     match try_type(MatrixType::RealSymmetricPositiveDefinite) {
         Ok(x) => Ok(x),
@@ -511,17 +750,160 @@ fn run_pardiso<S: PardisoInterface>(csr: &Csr, rhs: &[f64]) -> Result<Vec<f64>> 
     }
 }
 
-fn try_mkl(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>, String)> {
-    prepare_mkl_env();
+fn probe_reexec_ok() -> bool {
+    if std::env::var_os("AXIA_INTERNAL_MKL_PROBE").is_some() {
+        return false;
+    }
+    if std::env::var_os("AXIA_SKIP_MKL_PROBE").is_some() {
+        return false;
+    }
+    if cfg!(test) {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let name = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    name == "axia" || name.starts_with("axia-")
+}
+
+fn run_mkl_subprocess_probe() -> std::result::Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--internal-mkl-probe")
+        .env("AXIA_INTERNAL_MKL_PROBE", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not spawn MKL self-test ({e})"))?;
+
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let t_out = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(ref mut r) = stdout {
+            let _ = std::io::Read::read_to_string(r, &mut s);
+        }
+        s
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(ref mut r) = stderr {
+            let _ = std::io::Read::read_to_string(r, &mut s);
+        }
+        s
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if start.elapsed() > std::time::Duration::from_secs(25) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(
+                        "Intel MKL PARDISO self-test timed out (25s). \
+                         Typical: missing CPU kernel DLL (mkl_avx2/mkl_def) or OpenMP deadlock."
+                            .into(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            Err(e) => return Err(format!("MKL self-test wait: {e}")),
+        }
+    };
+    let out = t_out.join().unwrap_or_default();
+    let err = t_err.join().unwrap_or_default();
+    let log = format!("{out}{err}");
+    let code = status.code();
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+
+    if status.success() {
+        return Ok(());
+    }
+    if code == Some(2) {
+        let mut msg = if log.trim().is_empty() {
+            "Intel MKL PARDISO is not available (self-test exit 2).".to_string()
+        } else {
+            log.trim().to_string()
+        };
+        if !msg.contains("axia:") {
+            msg = format!("axia: {msg}");
+        }
+        return Err(msg);
+    }
+    let how = if let Some(s) = signal {
+        format!("signal {s}")
+    } else if let Some(c) = code {
+        format!("exit {c}")
+    } else {
+        "aborted".to_string()
+    };
+    let mut msg = format!(
+        "Intel MKL PARDISO crashed in a self-test ({how}) before the model was solved. \
+         Typical causes: incomplete MKL redist (need mkl_core + mkl_avx2/mkl_def + threading DLL) \
+         or an OpenMP conflict (libiomp5 vs libomp, e.g. Mecway). \
+         Axia did not abort the job. Copy the full MKL bin folder next to axia.exe, \
+         or use --solver faer."
+    );
+    if !log.trim().is_empty() {
+        msg.push_str(" Output:\n");
+        msg.push_str(log.trim());
+    }
+    Err(msg)
+}
+
+fn ensure_mkl_probe(complain: bool) -> bool {
+    if !probe_reexec_ok() {
+        return true;
+    }
+    static PROBE: std::sync::OnceLock<std::result::Result<(), String>> = std::sync::OnceLock::new();
+    match PROBE.get_or_init(run_mkl_subprocess_probe) {
+        Ok(()) => true,
+        Err(msg) => {
+            set_mkl_blocked(msg.clone());
+            if complain {
+                if msg.trim_start().starts_with("axia:") {
+                    eprintln!("{msg}");
+                } else {
+                    eprintln!("axia: {msg}");
+                }
+            }
+            false
+        }
+    }
+}
+
+fn try_mkl_inprocess(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>, String)> {
     #[cfg(target_arch = "x86_64")]
     {
         if pardiso_wrapper::MKLPardisoSolver::is_available() {
-            let name = "PARDISO (Intel MKL)";
+            announce("PARDISO (Intel MKL)");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
             match run_pardiso::<pardiso_wrapper::MKLPardisoSolver>(csr, rhs) {
-                Ok(x) => return Some((x, name.to_string())),
+                Ok(x) => return Some((x, "PARDISO (Intel MKL)".to_string())),
                 Err(e) => {
                     if complain {
-                        eprintln!("axia: {name} failed ({e})");
+                        eprintln!("axia: PARDISO (Intel MKL) failed ({e})");
                     }
                     return None;
                 }
@@ -530,7 +912,7 @@ fn try_mkl(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>, String)>
             use std::sync::atomic::{AtomicBool, Ordering};
             static HINT: AtomicBool = AtomicBool::new(false);
             if !HINT.swap(true, Ordering::Relaxed) {
-                let extra = take_mkl_diag().unwrap_or_default();
+                let extra = peek_mkl_diag().unwrap_or_default();
                 let probe = find_mkl_runtime()
                     .or_else(|| {
                         exe_dir().and_then(|d| {
@@ -542,9 +924,7 @@ fn try_mkl(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>, String)>
                     })
                     .map(|p| probe_load(&p))
                     .unwrap_or_default();
-                eprintln!(
-                    "axia: Intel MKL PARDISO did not load. {extra} {probe}"
-                );
+                eprintln!("axia: Intel MKL PARDISO did not load. {extra} {probe}");
             }
         }
     }
@@ -556,6 +936,62 @@ fn try_mkl(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>, String)>
         }
     }
     None
+}
+
+fn mkl_is_loaded() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        pardiso_wrapper::MKLPardisoSolver::is_available()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+fn try_mkl(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>, String)> {
+    prepare_mkl_env();
+    if let Some(msg) = mkl_blocked_msg() {
+        if complain {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static HINT: AtomicBool = AtomicBool::new(false);
+            if !HINT.swap(true, Ordering::Relaxed) {
+                eprintln!("axia: {msg}");
+            }
+        }
+        return None;
+    }
+    if !mkl_is_loaded() {
+        return try_mkl_inprocess(csr, rhs, complain);
+    }
+    if !ensure_mkl_probe(complain) {
+        return None;
+    }
+    try_mkl_inprocess(csr, rhs, complain)
+}
+
+fn mkl_probe_csr() -> (Csr, Vec<f64>) {
+    // 2×2 SPD diag(2,2) x = (2,2) → x = (1,1)
+    let csr = Csr {
+        n: 2,
+        indptr: vec![0, 1, 2],
+        indices: vec![0, 1],
+        data: vec![2.0, 2.0],
+    };
+    (csr, vec![2.0, 2.0])
+}
+
+/// 0 = MKL solved a 2×2 system, non-zero = do not use MKL in the parent.
+pub(crate) fn mkl_self_test() -> i32 {
+    let (csr, b) = mkl_probe_csr();
+    match try_mkl(&csr, &b, true) {
+        Some((x, _)) if (x[0] - 1.0).abs() < 1e-6 && (x[1] - 1.0).abs() < 1e-6 => 0,
+        Some((x, _)) => {
+            eprintln!("axia: MKL probe produced unexpected x={x:?}");
+            3
+        }
+        None => 2,
+    }
 }
 
 fn try_panua(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>, String)> {
@@ -693,7 +1129,14 @@ pub fn solve_kff(csr: &Csr, rhs: &[f64]) -> Result<SparseSolve> {
                     announce(&name);
                     Ok(pack(csr, rhs, x, &name))
                 }
-                None => err("PARDISO (Intel MKL) nicht verfügbar oder Faktorisierung fehlgeschlagen."),
+                None => {
+                    let extra = mkl_fail_detail();
+                    if extra.is_empty() {
+                        err("PARDISO (Intel MKL) nicht verfügbar oder Faktorisierung fehlgeschlagen.")
+                    } else {
+                        err(format!("PARDISO (Intel MKL) nicht verfügbar. {extra}"))
+                    }
+                }
             };
         }
         SparseBackend::Panua => {
@@ -808,8 +1251,69 @@ mod tests {
         assert!(is_mkl_companion_name("mkl_intel_thread.2.dll"));
         assert!(is_mkl_companion_name("libiomp5md.dll"));
         assert!(is_mkl_companion_name("libmkl_rt.so.2"));
+        assert!(is_mkl_companion_name("mkl_avx2.2.dll"));
+        assert!(is_mkl_companion_name("mkl_def.2.dll"));
         assert!(!is_mkl_companion_name("axia.exe"));
         assert!(!is_mkl_companion_name("README.md"));
+    }
+
+    #[test]
+    fn classifies_mkl_cpu_core_thread() {
+        assert!(is_mkl_cpu_kernel_name("mkl_avx2.2.dll"));
+        assert!(is_mkl_cpu_kernel_name("mkl_def.2.dll"));
+        assert!(is_mkl_cpu_kernel_name("libmkl_avx512.so.2"));
+        assert!(!is_mkl_cpu_kernel_name("mkl_core.2.dll"));
+        assert!(is_mkl_core_name("mkl_core.2.dll"));
+        assert!(is_mkl_core_name("libmkl_core.so.2"));
+        assert!(is_mkl_thread_layer_name("mkl_sequential.2.dll"));
+        assert!(is_mkl_thread_layer_name("mkl_intel_thread.2.dll"));
+        assert!(is_iomp_name("libiomp5md.dll"));
+        assert!(is_iomp_name("libiomp5.so"));
+    }
+
+    #[test]
+    fn preflight_reports_missing_cpu_kernel() {
+        let tmp = std::env::temp_dir().join(format!(
+            "axia-mkl-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("mkl_rt.dll"), b"fake").unwrap();
+        let missing = missing_mkl_parts(&[tmp.clone()]);
+        assert!(missing.iter().any(|s| s.contains("mkl_core")), "{missing:?}");
+        assert!(missing.iter().any(|s| s.contains("avx2") || s.contains("def")), "{missing:?}");
+        std::fs::write(tmp.join("mkl_core.2.dll"), b"fake").unwrap();
+        std::fs::write(tmp.join("mkl_sequential.2.dll"), b"fake").unwrap();
+        std::fs::write(tmp.join("mkl_avx2.2.dll"), b"fake").unwrap();
+        let missing = missing_mkl_parts(&[tmp.clone()]);
+        assert!(missing.is_empty(), "{missing:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn infer_mklroot_from_bin_dll() {
+        let rt = std::path::PathBuf::from("/opt/intel/oneapi/mkl/latest/bin/mkl_rt.dll");
+        let root = infer_mklroot(&rt).unwrap();
+        assert_eq!(root, std::path::PathBuf::from("/opt/intel/oneapi/mkl/latest"));
+        let rt = std::path::PathBuf::from("/opt/intel/oneapi/mkl/latest/lib/intel64/libmkl_rt.so.2");
+        let root = infer_mklroot(&rt).unwrap();
+        assert_eq!(root, std::path::PathBuf::from("/opt/intel/oneapi/mkl/latest"));
+    }
+
+    #[test]
+    fn mkl_probe_matrix_is_spd_diag() {
+        let (csr, b) = mkl_probe_csr();
+        assert_eq!(csr.n, 2);
+        assert_eq!(csr.indices, vec![0, 1]);
+        assert_eq!(b, vec![2.0, 2.0]);
+        let (a, ia, ja) = csr_upper_1based(&csr).unwrap();
+        assert_eq!(ia, vec![1, 2, 3]);
+        assert_eq!(ja, vec![1, 2]);
+        assert_eq!(a, vec![2.0, 2.0]);
     }
 
     #[test]

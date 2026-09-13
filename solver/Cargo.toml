@@ -1,6 +1,6 @@
 [package]
 name = "axia-fem"
-version = "1.9.6"
+version = "1.9.7"
 edition = "2021"
 description = "FEM solver with CalculiX INP/FRD compatibility; PARDISO/faer/rivrs selectable sparse backends"
 license = "MIT"
@@ -46,5 +46,5 @@ faer = "0.24"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true

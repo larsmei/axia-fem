@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use axia_fem::{
-    parse_model, parse_model_with_base, parse_sparse_backend, set_sparse_backend, solve_native,
-    solve_native_with_base, Model, SolveOutput,
+    mkl_self_test, parse_model, parse_model_with_base, parse_sparse_backend, set_sparse_backend,
+    solve_native, solve_native_with_base, Model, SolveOutput,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -447,6 +447,18 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("axia: panic: {info}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }));
+    if env::args().any(|a| a == "--internal-mkl-probe")
+        || env::var_os("AXIA_INTERNAL_MKL_PROBE").is_some()
+    {
+        unsafe {
+            env::set_var("AXIA_INTERNAL_MKL_PROBE", "1");
+        }
+        process::exit(mkl_self_test());
+    }
     if let Err(e) = run() {
         eprintln!("axia: {e}");
         process::exit(1);
