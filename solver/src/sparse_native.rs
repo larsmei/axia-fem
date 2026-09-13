@@ -2,6 +2,7 @@
 
 use pardiso_wrapper::{MessageLevel, MatrixType, PardisoInterface, Phase};
 
+use crate::backend::SparseBackend;
 use crate::error::{err, FemError, Result};
 use crate::linalg::Csr;
 
@@ -24,10 +25,13 @@ fn residual(csr: &Csr, x: &[f64], b: &[f64]) -> f64 {
 }
 
 fn announce(name: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if !DONE.swap(true, Ordering::Relaxed) {
-        eprintln!("axia: sparse solver: {name}");
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+    if let Ok(mut g) = LAST.lock() {
+        if g.as_deref() != Some(name) {
+            eprintln!("axia: sparse solver: {name}");
+            *g = Some(name.to_string());
+        }
     }
 }
 
@@ -507,18 +511,22 @@ fn run_pardiso<S: PardisoInterface>(csr: &Csr, rhs: &[f64]) -> Result<Vec<f64>> 
     }
 }
 
-fn try_pardiso(csr: &Csr, rhs: &[f64]) -> Option<(Vec<f64>, String)> {
+fn try_mkl(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>, String)> {
     prepare_mkl_env();
     #[cfg(target_arch = "x86_64")]
     {
         if pardiso_wrapper::MKLPardisoSolver::is_available() {
             let name = "PARDISO (Intel MKL)";
-            announce(name);
             match run_pardiso::<pardiso_wrapper::MKLPardisoSolver>(csr, rhs) {
                 Ok(x) => return Some((x, name.to_string())),
-                Err(e) => eprintln!("axia: {name} failed ({e}), falling back"),
+                Err(e) => {
+                    if complain {
+                        eprintln!("axia: {name} failed ({e})");
+                    }
+                    return None;
+                }
             }
-        } else {
+        } else if complain {
             use std::sync::atomic::{AtomicBool, Ordering};
             static HINT: AtomicBool = AtomicBool::new(false);
             if !HINT.swap(true, Ordering::Relaxed) {
@@ -535,19 +543,34 @@ fn try_pardiso(csr: &Csr, rhs: &[f64]) -> Option<(Vec<f64>, String)> {
                     .map(|p| probe_load(&p))
                     .unwrap_or_default();
                 eprintln!(
-                    "axia: Intel MKL PARDISO did not load. {extra} {probe} \
-                     Falling back to rivrs-sparse."
+                    "axia: Intel MKL PARDISO did not load. {extra} {probe}"
                 );
             }
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (csr, rhs);
+        if complain {
+            eprintln!("axia: Intel MKL PARDISO is only available on x86_64.");
+        }
+    }
+    None
+}
+
+fn try_panua(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>, String)> {
     if pardiso_wrapper::PanuaPardisoSolver::is_available() {
         let name = "PARDISO (Panua)";
-        announce(name);
         match run_pardiso::<pardiso_wrapper::PanuaPardisoSolver>(csr, rhs) {
             Ok(x) => return Some((x, name.to_string())),
-            Err(e) => eprintln!("axia: {name} failed ({e}), falling back"),
+            Err(e) => {
+                if complain {
+                    eprintln!("axia: {name} failed ({e})");
+                }
+            }
         }
+    } else if complain {
+        eprintln!("axia: Panua PARDISO is not on the loader path.");
     }
     None
 }
@@ -561,7 +584,73 @@ fn csr_to_faer(csr: &Csr) -> Result<faer::sparse::SparseColMat<usize, f64>> {
         }
     }
     SparseColMat::try_new_from_triplets(csr.n, csr.n, &trips)
-        .map_err(|e| FemError(format!("rivrs-sparse: Matrixaufbau fehlgeschlagen ({e})")))
+        .map_err(|e| FemError(format!("Sparse-Matrixaufbau fehlgeschlagen ({e})")))
+}
+
+fn extract_col(x: &faer::Mat<f64>, n: usize) -> Vec<f64> {
+    (0..n).map(|i| x[(i, 0)]).collect()
+}
+
+/// faer supernodal \(LL^\top\) (CHOLMOD-class, SPD). Pure Rust.
+fn try_faer_llt(csr: &Csr, rhs: &[f64]) -> Result<Vec<f64>> {
+    use faer::linalg::solvers::Solve;
+    use faer::sparse::linalg::solvers::{Llt, SymbolicLlt};
+    use faer::{Mat, Side};
+
+    let mat = csr_to_faer(csr)?;
+    let n = csr.n;
+    let mut last = String::new();
+    for side in [Side::Lower, Side::Upper] {
+        match SymbolicLlt::<usize>::try_new(mat.symbolic(), side) {
+            Ok(sym) => match Llt::try_new_with_symbolic(sym, mat.as_ref(), side) {
+                Ok(llt) => {
+                    let mut x = Mat::<f64>::from_fn(n, 1, |i, _| rhs[i]);
+                    llt.solve_in_place(&mut x);
+                    return Ok(extract_col(&x, n));
+                }
+                Err(e) => last = format!("{side:?} numeric: {e}"),
+            },
+            Err(e) => last = format!("{side:?} symbolic: {e}"),
+        }
+    }
+    err(format!("faer LLT: {last}"))
+}
+
+/// faer supernodal \(LU\) for indefinite \(K\) (contact, some Newton steps).
+fn try_faer_lu(csr: &Csr, rhs: &[f64]) -> Result<Vec<f64>> {
+    use faer::linalg::solvers::Solve;
+    use faer::sparse::linalg::solvers::{Lu, SymbolicLu};
+    use faer::Mat;
+
+    let mat = csr_to_faer(csr)?;
+    let n = csr.n;
+    let sym = SymbolicLu::<usize>::try_new(mat.symbolic())
+        .map_err(|e| FemError(format!("faer LU (symbolic): {e}")))?;
+    let lu = Lu::try_new_with_symbolic(sym, mat.as_ref())
+        .map_err(|e| FemError(format!("faer LU: {e}")))?;
+    let mut x = Mat::<f64>::from_fn(n, 1, |i, _| rhs[i]);
+    lu.solve_in_place(&mut x);
+    Ok(extract_col(&x, n))
+}
+
+fn try_faer(csr: &Csr, rhs: &[f64]) -> Result<(Vec<f64>, &'static str)> {
+    match try_faer_llt(csr, rhs) {
+        Ok(x) => Ok((x, "faer (supernodal LLT)")),
+        Err(llt_e) => match try_faer_lu(csr, rhs) {
+            Ok(x) => Ok((x, "faer (supernodal LU)")),
+            Err(lu_e) => err(format!("{llt_e}; {lu_e}")),
+        },
+    }
+}
+
+fn pack(csr: &Csr, rhs: &[f64], x: Vec<f64>, name: &str) -> SparseSolve {
+    let residual = residual(csr, &x, rhs);
+    SparseSolve {
+        x,
+        name: name.to_string(),
+        iters: 1,
+        residual,
+    }
 }
 
 fn try_rivrs(csr: &Csr, rhs: &[f64]) -> Result<Vec<f64>> {
@@ -592,30 +681,79 @@ fn try_rivrs(csr: &Csr, rhs: &[f64]) -> Result<Vec<f64>> {
 }
 
 pub fn solve_kff(csr: &Csr, rhs: &[f64]) -> Result<SparseSolve> {
-    if let Some((x, name)) = try_pardiso(csr, rhs) {
-        let residual = residual(csr, &x, rhs);
-        return Ok(SparseSolve {
-            x,
-            name,
-            iters: 1,
-            residual,
-        });
+    crate::backend::apply_env_solver();
+    let want = crate::backend::sparse_backend();
+    match want {
+        SparseBackend::Cholesky | SparseBackend::Pcg => {
+            return err("intern: dense/PCG laufen über linalg, nicht sparse_native");
+        }
+        SparseBackend::Mkl => {
+            return match try_mkl(csr, rhs, true) {
+                Some((x, name)) => {
+                    announce(&name);
+                    Ok(pack(csr, rhs, x, &name))
+                }
+                None => err("PARDISO (Intel MKL) nicht verfügbar oder Faktorisierung fehlgeschlagen."),
+            };
+        }
+        SparseBackend::Panua => {
+            return match try_panua(csr, rhs, true) {
+                Some((x, name)) => {
+                    announce(&name);
+                    Ok(pack(csr, rhs, x, &name))
+                }
+                None => err("PARDISO (Panua) nicht verfügbar oder Faktorisierung fehlgeschlagen."),
+            };
+        }
+        SparseBackend::Pardiso => {
+            if let Some((x, name)) = try_mkl(csr, rhs, true).or_else(|| try_panua(csr, rhs, true)) {
+                announce(&name);
+                return Ok(pack(csr, rhs, x, &name));
+            }
+            return err("PARDISO (MKL/Panua) nicht verfügbar.");
+        }
+        SparseBackend::Faer => {
+            let (x, name) = try_faer(csr, rhs)?;
+            announce(name);
+            return Ok(pack(csr, rhs, x, name));
+        }
+        SparseBackend::Rivrs => {
+            let name = "rivrs-sparse (LDLT)";
+            announce(name);
+            let x = try_rivrs(csr, rhs)?;
+            return Ok(pack(csr, rhs, x, name));
+        }
+        SparseBackend::Auto => {}
     }
 
-    let name = "rivrs-sparse (LDLT)";
-    announce(name);
+    if let Some((x, name)) = try_mkl(csr, rhs, true).or_else(|| try_panua(csr, rhs, false)) {
+        announce(&name);
+        return Ok(pack(csr, rhs, x, &name));
+    }
+
+    // SPD: faer supernodal LLT (PARDISO-class, no extra libs).
+    // Indefinite (contact, some Newton): rivrs APTP LDLT, then faer LU.
+    match try_faer_llt(csr, rhs) {
+        Ok(x) => {
+            announce("faer (supernodal LLT)");
+            return Ok(pack(csr, rhs, x, "faer (supernodal LLT)"));
+        }
+        Err(_) => {}
+    }
+
     match try_rivrs(csr, rhs) {
         Ok(x) => {
-            let residual = residual(csr, &x, rhs);
-            Ok(SparseSolve {
-                x,
-                name: name.to_string(),
-                iters: 1,
-                residual,
-            })
+            announce("rivrs-sparse (LDLT)");
+            return Ok(pack(csr, rhs, x, "rivrs-sparse (LDLT)"));
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            eprintln!("axia: rivrs-sparse failed ({e}), trying faer LU");
+        }
     }
+
+    let x = try_faer_lu(csr, rhs)?;
+    announce("faer (supernodal LU)");
+    Ok(pack(csr, rhs, x, "faer (supernodal LU)"))
 }
 
 #[cfg(test)]

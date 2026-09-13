@@ -1,5 +1,6 @@
 mod analysis;
 mod axisym;
+mod backend;
 mod beam;
 mod constraint;
 mod contact;
@@ -30,6 +31,9 @@ use wasm_bindgen::prelude::*;
 use crate::error::Result;
 
 pub use analysis::SolveOutput;
+pub use backend::{
+    parse_sparse_backend, set_sparse_backend, sparse_backend, with_sparse_backend, SparseBackend,
+};
 pub use model::{ElemKind, Model};
 
 fn mesh_json(model: &Model) -> Value {
@@ -432,10 +436,48 @@ EALL, GRAV, -9.81, 0, 1, 0
         assert!(out.dat.contains("displacements"));
         #[cfg(not(target_arch = "wasm32"))]
         assert!(
-            out.solver.contains("PARDISO") || out.solver.contains("rivrs-sparse"),
+            out.solver.contains("PARDISO")
+                || out.solver.contains("rivrs-sparse")
+                || out.solver.contains("faer")
+                || out.solver.contains("Cholesky")
+                || out.solver.contains("PCG"),
             "native backend expected, got {}",
             out.solver
         );
+    }
+
+    #[test]
+    fn sparse_backends_agree_on_c3d8_patch() {
+        for b in [
+            SparseBackend::Faer,
+            SparseBackend::Rivrs,
+            SparseBackend::Cholesky,
+        ] {
+            let out = with_sparse_backend(b, || solve_native(&cube_tension()).expect("solve"));
+            let tag = match b {
+                SparseBackend::Faer => "faer",
+                SparseBackend::Rivrs => "rivrs",
+                SparseBackend::Cholesky => "Cholesky",
+                _ => "",
+            };
+            assert!(
+                out.solver.to_ascii_lowercase().contains(&tag.to_ascii_lowercase()),
+                "backend {b:?} reported {}",
+                out.solver
+            );
+            let mut ux_loaded = Vec::new();
+            for (i, &id) in out.model.node_ids.iter().enumerate() {
+                if id == 2 || id == 3 || id == 6 || id == 7 {
+                    ux_loaded.push(out.u[i][0]);
+                }
+            }
+            let mean: f64 = ux_loaded.iter().sum::<f64>() / ux_loaded.len() as f64;
+            assert!(
+                (mean - 0.01).abs() < 1e-6,
+                "backend {b:?} ux={mean}, solver={}",
+                out.solver
+            );
+        }
     }
 
     fn beam_2d() -> String {

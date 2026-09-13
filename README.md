@@ -9,7 +9,7 @@ Zwei Frontends, ein Solver:
 
 **Repo:** [larsmei/axia-fem](https://github.com/larsmei/axia-fem) · **Releases:** [latest](https://github.com/larsmei/axia-fem/releases)
 
-**1.9.3** — Mecway/CalculiX: `*ELEMENT` ohne `ELSET=` bekommt Material/Dicke/`*MASS` über spätere `*ELSET`-Mitgliedschaft; MASS/DASHPOT/GAP brauchen kein Kontinuum-`*MATERIAL`; GRAV auf `*MASS` als \(F=mg\). **1.9.2** — Windows-MKL: `mkl_rt.dll` **neben `axia.exe`** (Shim `libmkl_rt.dll` im selben Ordner, nicht in `%TEMP%`). **1.9.1** — FRD long-ASCII wie ccx (Spalte 74, Fortran `E-02`, ` -1`/` -2`/` -3`), Windows-MKL findet `mkl_rt.dll` unter `$MKLROOT/bin`, Viewer Jet-Farbverlauf / Mecway-Colorbar. **1.9** — fehlende Elemente: CAX3/CAX6, C3D10T (B-bar), MASS, ROTARYI, DASHPOTA, GAPUNI, Aliase B21/B22 und C3D20RI. **1.8** — `*STATIC, RIKS` (Crisfield-Bogenlänge, Snap-Through). **1.7.1** — Viewer zeichnet T3D2/T3D3/SPRINGA (Fachwerk NLGEOM). **1.7** — Coulomb-`*FRICTION`, `NLGEOM`+`*PLASTIC` auf Kontinuum. **1.6** — `*CONTACT PAIR` Node-to-Surface, Penalty, reibungsfrei. **1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
+**1.9.4** — Sparse-Solver per `--solver` / `AXIA_SOLVER`: **faer** (reines Rust, supernodales \(LL^\top\)/\(LU\), keine extra Library, PARDISO-Klasse für SPD). `auto` = MKL → Panua → faer → rivrs-sparse. **1.9.3** — Mecway/CalculiX: `*ELEMENT` ohne `ELSET=` bekommt Material/Dicke/`*MASS` über spätere `*ELSET`-Mitgliedschaft; MASS/DASHPOT/GAP brauchen kein Kontinuum-`*MATERIAL`; GRAV auf `*MASS` als \(F=mg\). **1.9.2** — Windows-MKL: `mkl_rt.dll` **neben `axia.exe`** (Shim `libmkl_rt.dll` im selben Ordner, nicht in `%TEMP%`). **1.9.1** — FRD long-ASCII wie ccx (Spalte 74, Fortran `E-02`, ` -1`/` -2`/` -3`), Windows-MKL findet `mkl_rt.dll` unter `$MKLROOT/bin`, Viewer Jet-Farbverlauf / Mecway-Colorbar. **1.9** — fehlende Elemente: CAX3/CAX6, C3D10T (B-bar), MASS, ROTARYI, DASHPOTA, GAPUNI, Aliase B21/B22 und C3D20RI. **1.8** — `*STATIC, RIKS` (Crisfield-Bogenlänge, Snap-Through). **1.7.1** — Viewer zeichnet T3D2/T3D3/SPRINGA (Fachwerk NLGEOM). **1.7** — Coulomb-`*FRICTION`, `NLGEOM`+`*PLASTIC` auf Kontinuum. **1.6** — `*CONTACT PAIR` Node-to-Surface, Penalty, reibungsfrei. **1.5** — `*PLASTIC` J2 für Kontinuum (C3D*), PEEQ im FRD. **1.4** — `*STEP, NLGEOM` für Kontinuum (C3D8/20/4/10/6/15), Total-Lagrange St. Venant–Kirchhoff. **1.3** — mehrere `*STEP`, `*CONTROLS`. **1.2** — C3D15, CAX, Membran, Kontinuum-Beulen, Wärme+. **1.1** — Wärme, Dynamik, NLGEOM/`*PLASTIC` (T3D2).
 
 ## CLI
 
@@ -23,6 +23,7 @@ axia examples/patch_c3d8          # → examples/patch_c3d8.frd / .dat
 axia examples/cantilever_b32.inp
 axia --check model.inp            # nur parsen
 axia --json job.inp               # Statistik als JSON
+axia --solver faer job.inp        # reines Rust, keine extra Library
 cat deck.inp | axia - --stdout > out.frd
 ```
 
@@ -72,15 +73,30 @@ cargo build --release --bin axia
 
 ### Sparse-Solver (nativ)
 
-Reihenfolge beim nativen `axia`-Binary:
+Auswahl per CLI `--solver` / `-s` oder Umgebungsvariable `AXIA_SOLVER`:
 
-1. **PARDISO (Intel MKL)** — wenn die MKL-Runtime im Library-Pfad liegt (`PATH` / `LD_LIBRARY_PATH`, `MKLROOT` oder `MKL_PARDISO_PATH`)
-2. **PARDISO (Panua)** — wenn `libpardiso` im Pfad liegt (`PARDISO_PATH`)
-3. **rivrs-sparse** (LDLT, in das Binary einkompiliert) — Fallback, keine extra Library nötig
+| Name | Was | Extra-Library |
+|---|---|---|
+| `auto` (Standard) | MKL-PARDISO → Panua-PARDISO → **faer** → rivrs-sparse → dens/PCG | nur für PARDISO |
+| `mkl` | Intel MKL PARDISO | `mkl_rt` (+ Kern-DLLs) |
+| `panua` | Panua PARDISO | `libpardiso` |
+| `pardiso` | MKL oder Panua, ohne Rust-Fallback | wie oben |
+| `faer` | supernodales \(LL^\top\), sonst \(LU\) | **keine** — reines Rust |
+| `rivrs` | rivrs-sparse \(LDL^\top\) (APTP, METIS/AMD) | **keine** (METIS ist optional einkompiliert) |
+| `cholesky` | dichte In-Crate-Cholesky | — (\(n\le 900\)) |
+| `pcg` | vorkonditioniertes CG | — |
 
-Beim Start steht auf stderr z. B. `axia: sparse solver: rivrs-sparse (LDLT)`. Die JSON-Statistik enthält dasselbe Feld `solver`.
+`faer` ist der nächste reine-Rust-Solver an PARDISO: supernodale Cholesky-Faktorisierung (wie CHOLMOD), AMD-Ordering, parallele BLAS-3-Kerne, bereits Abhängigkeit von Axia. Für SPD-Steifigkeitsmatrizen (linear-statisch nach Randbedingungen) ist das der richtige Algorithmus. Bei indefiniter \(K\) (selten) fällt faer intern auf supernodales \(LU\) zurück.
 
-Die Browser-WASM-Variante verwendet weiterhin die eingebaute Cholesky-/PCG-Kette (kein PARDISO im Browser).
+```bash
+axia --solver faer job.inp
+axia --solver rivrs job.inp
+AXIA_SOLVER=faer axia job
+```
+
+Beim Start steht auf stderr z. B. `axia: sparse solver: faer (supernodal LLT)`. Die JSON-Statistik enthält dasselbe Feld `solver`.
+
+Die Browser-WASM-Variante verwendet weiterhin die eingebaute Cholesky-/PCG-Kette (kein PARDISO / faer im Browser).
 
 #### Intel MKL unter Windows
 
@@ -112,7 +128,7 @@ call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
 axia job
 ```
 
-Wenn PARDISO nicht lädt, schreibt Axia auf stderr, welche DLLs gefunden wurden und den Win32-Fehler von `LoadLibrary` (126 = abhängige DLL fehlt). Danach Fallback auf rivrs-sparse.
+Wenn PARDISO nicht lädt, schreibt Axia auf stderr, welche DLLs gefunden wurden und den Win32-Fehler von `LoadLibrary` (126 = abhängige DLL fehlt). Danach Fallback auf **faer** (und nur wenn das scheitert auf rivrs-sparse), sofern `--solver auto`.
 
 #### FRD (CalculiX / Mecway / cgx)
 
@@ -160,7 +176,7 @@ GitHub Actions (`.github/workflows/release.yml`) baut bei einem Tag `v*` zusätz
   - `NLGEOM` + `*PLASTIC` auf Kontinuum: J2 auf Green–Lagrange / PK2
 - `*CONTACT PAIR` — Penalty Node-to-Surface, `*FRICTION` Coulomb (small sliding)
 - Sparse-Assembly (Triplet → CSR)
-- Native Sparse-Solver: **PARDISO** (Intel MKL oder Panua, dynamisch geladen) mit **rivrs-sparse** als Fallback; WASM: dichte Cholesky / PCG
+- Native Sparse-Solver: **PARDISO** (Intel MKL / Panua), **faer** (reines Rust, supernodal), **rivrs-sparse**; wählbar mit `--solver` / `AXIA_SOLVER`
 - Der jeweils verwendete Solver wird beim Aufruf ausgegeben (`axia: sparse solver: …`) und steht in der Statistik
 - FRD- und DAT-Export (ccx/Mecway/cgx long-ASCII, Spalte 74)
 - 3D-Viewer (Three.js): undeformiert / deformiert, Jet-Farbverlauf (von Mises, |u|, ux/uy/uz, Sij), Mecway-Colorbar, Achsenkreuz

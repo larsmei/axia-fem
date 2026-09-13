@@ -200,10 +200,55 @@ fn residual_of(a: &Csr, x: &[f64], b: &[f64]) -> f64 {
 
 /// Factor and solve K_ff x = rhs.
 ///
-/// Native builds: PARDISO (MKL, then Panua) if the shared library is on the
-/// loader path, otherwise rivrs-sparse. WASM keeps the in-crate Cholesky/PCG.
+/// Native: `--solver` / `AXIA_SOLVER` selects PARDISO, faer, rivrs-sparse,
+/// dense Cholesky or PCG. Default `auto` is MKL → Panua → faer → rivrs.
+/// WASM keeps the in-crate Cholesky/PCG chain.
 pub fn solve_kff(n: usize, trips: Vec<(usize, usize, f64)>, rhs: &[f64]) -> Result<SparseResult> {
+    crate::backend::apply_env_solver();
+    let want = crate::backend::sparse_backend();
     let csr = csr_from_triplets(n, trips);
+
+    const DENSE_LIMIT: usize = 900;
+
+    let dense = |csr: &Csr, forced: bool| -> Result<SparseResult> {
+        if n > DENSE_LIMIT && forced {
+            return err(format!(
+                "dense Cholesky: n={n} > {DENSE_LIMIT}. Wähle --solver faer|rivrs|pcg."
+            ));
+        }
+        if n > DENSE_LIMIT {
+            return err("intern: dense Cholesky nur für kleine Systeme");
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!("axia: sparse solver: dense Cholesky");
+        let mut a = csr.to_dense();
+        let x = chol_solve(&mut a, n, rhs)?;
+        let residual = residual_of(csr, &x, rhs);
+        Ok(SparseResult {
+            x,
+            name: "Cholesky".into(),
+            iters: 1,
+            residual,
+        })
+    };
+    let iterative = |csr: &Csr| -> Result<SparseResult> {
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!("axia: sparse solver: PCG");
+        let (x, info) = pcg(csr, rhs, 1e-8, (4 * n).max(200))?;
+        Ok(SparseResult {
+            x,
+            name: "PCG".into(),
+            iters: info.iters,
+            residual: info.residual,
+        })
+    };
+
+    if want == crate::backend::SparseBackend::Cholesky {
+        return dense(&csr, true);
+    }
+    if want == crate::backend::SparseBackend::Pcg {
+        return iterative(&csr);
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -217,33 +262,17 @@ pub fn solve_kff(n: usize, trips: Vec<(usize, usize, f64)>, rhs: &[f64]) -> Resu
                 });
             }
             Err(e) => {
-                eprintln!("axia: rivrs-sparse failed ({e}), falling back to in-crate solver");
+                if want != crate::backend::SparseBackend::Auto {
+                    return Err(e);
+                }
+                eprintln!("axia: sparse solver failed ({e}), falling back to in-crate solver");
             }
         }
     }
 
-    const DENSE_LIMIT: usize = 900;
     if n <= DENSE_LIMIT {
-        #[cfg(not(target_arch = "wasm32"))]
-        eprintln!("axia: sparse solver: dense Cholesky (fallback)");
-        let mut dense = csr.to_dense();
-        let x = chol_solve(&mut dense, n, rhs)?;
-        let residual = residual_of(&csr, &x, rhs);
-        Ok(SparseResult {
-            x,
-            name: "Cholesky".into(),
-            iters: 1,
-            residual,
-        })
+        dense(&csr, false)
     } else {
-        #[cfg(not(target_arch = "wasm32"))]
-        eprintln!("axia: sparse solver: PCG (fallback)");
-        let (x, info) = pcg(&csr, rhs, 1e-8, (4 * n).max(200))?;
-        Ok(SparseResult {
-            x,
-            name: "PCG".into(),
-            iters: info.iters,
-            residual: info.residual,
-        })
+        iterative(&csr)
     }
 }

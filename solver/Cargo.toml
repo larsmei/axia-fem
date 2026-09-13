@@ -1,8 +1,8 @@
 [package]
 name = "axia-fem"
-version = "1.9.3"
+version = "1.9.4"
 edition = "2021"
-description = "FEM solver with CalculiX INP/FRD compatibility (linear, frequency, buckle, heat, dynamic, NLGEOM, J2, contact, Riks, CAX3/6, C3D10T, MASS/GAP/DASHPOT; Mecway ELSET; ccx FRD, MKL PARDISO)"
+description = "FEM solver with CalculiX INP/FRD compatibility; PARDISO/faer/rivrs selectable sparse backends"
 license = "MIT"
 authors = ["Lars Meindl"]
 repository = "https://github.com/larsmei/axia-fem"
@@ -30,8 +30,8 @@ serde_json = "1.0"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "=0.2.128"
 
-# Native sparse backends. PARDISO is loaded at runtime from the library path
-# (MKL or Panua). rivrs-sparse is the compiled-in fallback.
+# Native sparse backends. PARDISO is loaded at runtime (MKL / Panua).
+# faer (already here) is the pure-Rust supernodal fallback; rivrs-sparse is LDLT.
 [target.'cfg(all(not(target_arch = "wasm32"), target_arch = "x86_64"))'.dependencies]
 pardiso-wrapper = { version = "0.1.2", features = ["mkl", "panua"] }
 

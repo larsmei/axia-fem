@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use axia_fem::{
-    parse_model, parse_model_with_base, solve_native, solve_native_with_base, Model, SolveOutput,
+    parse_model, parse_model_with_base, parse_sparse_backend, set_sparse_backend, solve_native,
+    solve_native_with_base, Model, SolveOutput,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -29,6 +30,7 @@ struct Args {
     no_frd: bool,
     no_dat: bool,
     stdout_frd: bool,
+    solver: Option<String>,
 }
 
 fn print_help() {
@@ -37,8 +39,16 @@ fn print_help() {
         "\
 Axia FEM {VERSION} — FEM solver (CalculiX INP / FRD / DAT)
 
-Native sparse backends: PARDISO (MKL / Panua) if the library is on the
-loader path, otherwise rivrs-sparse. The chosen solver is printed on stderr.
+Native sparse backends (see --solver):
+    auto       PARDISO (MKL, then Panua) if present, else faer, else rivrs-sparse
+    mkl        Intel MKL PARDISO only
+    panua      Panua PARDISO only
+    pardiso    MKL or Panua, no pure-Rust fallback
+    faer       supernodal Cholesky/LU — no extra libraries
+    rivrs      rivrs-sparse LDLT
+    cholesky   dense in-crate Cholesky (small systems)
+    pcg        in-crate conjugate gradients
+The chosen solver is printed on stderr and in --json (`solver`).
 
 USAGE:
     {exe} [OPTIONS] <JOB>
@@ -58,6 +68,8 @@ OPTIONS:
         --stdout          Write FRD to stdout (implies --quiet --no-dat)
         --json            Print solve statistics as JSON
         --check           Parse and report the mesh, do not solve
+    -s, --solver <NAME>   Sparse backend: auto|mkl|panua|pardiso|faer|rivrs|cholesky|pcg
+                          (also env AXIA_SOLVER)
     -q, --quiet           Suppress the summary
     -v, --verbose         Extra diagnostics
     -h, --help            Show this help
@@ -66,6 +78,7 @@ OPTIONS:
 EXAMPLES:
     {exe} cantilever              # cantilever.inp → cantilever.frd / .dat
     {exe} model.inp
+    {exe} --solver faer job.inp
     {exe} -i deck.inp -o /tmp/run
     {exe} --check model.inp
     cat model.inp | {exe} - --json
@@ -87,6 +100,7 @@ fn parse_args() -> Result<Args, String> {
         no_frd: false,
         no_dat: false,
         stdout_frd: false,
+        solver: None,
     };
     let mut raw = env::args().skip(1);
     while let Some(a) = raw.next() {
@@ -109,6 +123,12 @@ fn parse_args() -> Result<Args, String> {
             "--dat" => args.dat = Some(PathBuf::from(need(&mut raw, &a)?)),
             "--json" => args.json = true,
             "--check" => args.check = true,
+            "-s" | "--solver" => {
+                args.solver = Some(need(&mut raw, &a)?);
+            }
+            s if s.starts_with("--solver=") => {
+                args.solver = Some(s.trim_start_matches("--solver=").to_string());
+            }
             "-q" | "--quiet" => args.quiet = true,
             "-v" | "--verbose" => args.verbose = true,
             "--no-frd" => args.no_frd = true,
@@ -342,6 +362,10 @@ fn write_file(path: &Path, contents: &str) -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+    if let Some(name) = &args.solver {
+        let b = parse_sparse_backend(name).map_err(|e| e.to_string())?;
+        set_sparse_backend(b);
+    }
     let (inp, input_path) = resolve_input(&args)?;
     let stem = stem_from(&args, input_path.as_deref());
 
