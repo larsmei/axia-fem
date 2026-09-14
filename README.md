@@ -17,7 +17,6 @@ Fertige Binaries am Release. Archiv enthält `axia` / `axia.exe`, `README`, `LIC
 | Plattform | Datei |
 |---|---|
 | Windows x64 | [axia-1.11.0-windows-x64.zip](https://github.com/larsmei/axia-fem/releases/download/v1.11.0/axia-1.11.0-windows-x64.zip) |
-| Windows ARM64 | [axia-1.11.0-windows-arm64.zip](https://github.com/larsmei/axia-fem/releases/download/v1.11.0/axia-1.11.0-windows-arm64.zip) |
 | Linux x64 (glibc) | [axia-1.11.0-linux-x64.tar.gz](https://github.com/larsmei/axia-fem/releases/download/v1.11.0/axia-1.11.0-linux-x64.tar.gz) |
 | Linux x64 (musl, statisch) | [axia-1.11.0-linux-x64-musl.tar.gz](https://github.com/larsmei/axia-fem/releases/download/v1.11.0/axia-1.11.0-linux-x64-musl.tar.gz) |
 | Linux ARM64 | [axia-1.11.0-linux-arm64.tar.gz](https://github.com/larsmei/axia-fem/releases/download/v1.11.0/axia-1.11.0-linux-arm64.tar.gz) |
