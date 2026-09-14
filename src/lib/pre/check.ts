@@ -1,6 +1,6 @@
 import { resolveNodes } from "./export-inp";
 import { meshQuality } from "./mesh";
-import type { Issue, Load, Material, Mesh, Restraint, Shape } from "./types";
+import type { Dim, Issue, Load, Material, Mesh, Restraint, Shape } from "./types";
 
 export function checkModel(opts: {
   shapes: Shape[];
@@ -8,8 +8,11 @@ export function checkModel(opts: {
   materials: Material[];
   restraints: Restraint[];
   loads: Load[];
+  dim?: Dim;
 }): Issue[] {
   const { shapes, mesh, materials, restraints, loads } = opts;
+  const dim = opts.dim ?? "2d";
+  const solid = dim === "3d" || !!mesh?.elements.some((e) => e.type.startsWith("C3D"));
   const issues: Issue[] = [];
   if (!shapes.length) issues.push({ level: "error", code: "geo", message: "Keine Geometrie." });
   if (!mesh || !mesh.elements.length) {
@@ -20,7 +23,7 @@ export function checkModel(opts: {
       issues.push({
         level: "warn",
         code: "quality",
-        message: `${q.nBad} Elemente mit spitzem Winkel (<12°) oder Aspekt > 8. min∠ ${q.minAngle.toFixed(1)}°.`,
+        message: `${q.nBad} Elemente mit spitzem Winkel (<12°) oder Aspekt > 12. min∠ ${q.minAngle.toFixed(1)}°.`,
       });
     }
     if (mesh.nodes.length > 2500) {
@@ -38,19 +41,28 @@ export function checkModel(opts: {
     else {
       if (!(m.E > 0)) issues.push({ level: "error", code: "mat", message: `${m.name}: E muss > 0 sein.` });
       if (!(m.nu > 0 && m.nu < 0.5)) issues.push({ level: "error", code: "mat", message: `${m.name}: ν zwischen 0 und 0,5.` });
-      if (!(m.thickness > 0)) issues.push({ level: "error", code: "mat", message: `${m.name}: Dicke muss > 0 sein.` });
+      if (!solid && !(m.thickness > 0)) issues.push({ level: "error", code: "mat", message: `${m.name}: Dicke muss > 0 sein.` });
     }
   }
   if (mesh) {
     const fixed = new Set<number>();
+    let hasUx = false,
+      hasUy = false,
+      hasUz = false;
     for (const r of restraints) {
       const ids = resolveNodes(mesh, shapes, r.target);
-      if (!ids.length) issues.push({ level: "error", code: "bc", message: "Lager ohne Knoten — Kante nach Vernetzung prüfen." });
-      if (!r.ux && !r.uy) issues.push({ level: "warn", code: "bc", message: "Lager ohne gesperrten DOF." });
+      if (!ids.length) issues.push({ level: "error", code: "bc", message: "Lager ohne Knoten — Fläche nach Vernetzung prüfen." });
+      if (!r.ux && !r.uy && !(solid && r.uz)) issues.push({ level: "warn", code: "bc", message: "Lager ohne gesperrten DOF." });
       ids.forEach((id) => fixed.add(id));
+      if (r.ux) hasUx = true;
+      if (r.uy) hasUy = true;
+      if (r.uz) hasUz = true;
     }
     if (!restraints.length) issues.push({ level: "error", code: "bc", message: "Keine Lager — Mechanismus." });
-    const hasLoad = loads.some((l) => l.kind === "gravity" || (l.kind === "force" && (l.fx || l.fy)));
+    else if (solid && !(hasUx && hasUy && hasUz)) {
+      issues.push({ level: "warn", code: "bc", message: "3D: Ux, Uy und Uz sollten irgendwo gesperrt sein." });
+    }
+    const hasLoad = loads.some((l) => l.kind === "gravity" || (l.kind === "force" && (l.fx || l.fy || l.fz)));
     if (!hasLoad) issues.push({ level: "warn", code: "load", message: "Keine Last." });
     for (const l of loads) {
       if (l.kind === "force") {

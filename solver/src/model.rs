@@ -513,6 +513,41 @@ impl BeamSection {
         }
     }
 
+    /// Thin-walled box: outer a×b, wall thicknesses t_bottom, t_top, t_left, t_right.
+    pub fn box_sec(
+        width: f64,
+        height: f64,
+        t_bot: f64,
+        t_top: f64,
+        t_left: f64,
+        t_right: f64,
+        n1: [f64; 3],
+    ) -> Self {
+        let a = width.abs().max(1e-16);
+        let b = height.abs().max(1e-16);
+        let tb = t_bot.abs().clamp(1e-16, b * 0.49);
+        let tt = t_top.abs().clamp(1e-16, b * 0.49);
+        let tl = t_left.abs().clamp(1e-16, a * 0.49);
+        let tr = t_right.abs().clamp(1e-16, a * 0.49);
+        let ai = (a - tl - tr).max(0.0);
+        let bi = (b - tb - tt).max(0.0);
+        let area = (a * b - ai * bi).max(1e-16);
+        let i11 = (a * b * b * b - ai * bi * bi * bi) / 12.0;
+        let i22 = (b * a * a * a - bi * ai * ai * ai) / 12.0;
+        Self {
+            a,
+            b,
+            n1,
+            area,
+            i11: i11.abs().max(1e-30),
+            i12: 0.0,
+            i22: i22.abs().max(1e-30),
+            jtor: torsion_rect(a, b) - torsion_rect(ai.max(1e-16), bi.max(1e-16)),
+            k11: 0.5,
+            k22: 0.5,
+        }
+    }
+
     pub fn general(area: f64, i11: f64, i12: f64, i22: f64, jtor: f64, n1: [f64; 3]) -> Self {
         let a = area.abs().max(1e-16);
         // Viewer fallback: square of equal area
@@ -572,6 +607,14 @@ pub enum Dload {
         dir: [f64; 3],
         mag: f64,
     },
+    /// `*DLOAD, CENTRIF`: ω² and two points on the rotation axis.
+    /// `elems` empty → all elements.
+    Centrif {
+        omega2: f64,
+        p1: [f64; 3],
+        p2: [f64; 3],
+        elems: Vec<i32>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -598,6 +641,7 @@ pub struct Tie {
 pub struct RigidBody {
     pub nset: String,
     pub ref_node: i32,
+    pub rot_node: Option<i32>,
 }
 
 #[derive(Clone, Debug)]
@@ -612,6 +656,9 @@ pub struct Coupling {
 pub struct Transform {
     pub nset: String,
     pub axes: [[f64; 3]; 3],
+    pub cylindrical: bool,
+    pub origin: [f64; 3],
+    pub axis: [f64; 3],
 }
 
 #[derive(Clone, Debug)]
@@ -994,9 +1041,22 @@ impl Model {
     fn expand_transforms(&mut self) {
         let mut map = HashMap::new();
         let nsets = self.nsets.clone();
+        let id_to_idx: HashMap<i32, usize> = self
+            .node_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
         for t in &self.transforms {
             if let Some(nodes) = nsets.get(&t.nset) {
                 for &id in nodes {
+                    if t.cylindrical {
+                        if let Some(&i) = id_to_idx.get(&id) {
+                            let p = self.coords[i];
+                            map.insert(id, cylindrical_axes(t.origin, t.axis, p));
+                            continue;
+                        }
+                    }
                     map.insert(id, t.axes);
                 }
             }
@@ -1028,18 +1088,34 @@ impl Model {
         if let Ok(id) = name.parse::<i32>() {
             return Ok(vec![id]);
         }
-        self.nsets.get(name).cloned().ok_or_else(|| {
-            crate::error::FemError(format!("Unbekanntes Knotenset {name}"))
-        })
+        if let Some(v) = self.nsets.get(name) {
+            return Ok(v.clone());
+        }
+        let up = name.to_ascii_uppercase();
+        if let Some(v) = self.nsets.get(&up) {
+            return Ok(v.clone());
+        }
+        if up == "NALL" || up == "ALL" {
+            return Ok(self.node_ids.clone());
+        }
+        crate::error::err(format!("Unbekanntes Knotenset {name}"))
     }
 
     pub fn expand_elset(&self, name: &str) -> crate::error::Result<Vec<i32>> {
         if let Ok(id) = name.parse::<i32>() {
             return Ok(vec![id]);
         }
-        self.elsets.get(name).cloned().ok_or_else(|| {
-            crate::error::FemError(format!("Unbekanntes Elementset {name}"))
-        })
+        if let Some(v) = self.elsets.get(name) {
+            return Ok(v.clone());
+        }
+        let up = name.to_ascii_uppercase();
+        if let Some(v) = self.elsets.get(&up) {
+            return Ok(v.clone());
+        }
+        if up == "EALL" || up == "ALL" {
+            return Ok(self.elements.iter().map(|e| e.id).collect());
+        }
+        crate::error::err(format!("Unbekanntes Elementset {name}"))
     }
 
     pub fn material_for(&self, el: &Element) -> crate::error::Result<Material> {
@@ -1191,4 +1267,43 @@ impl Model {
             .map(|i| i + 1)
             .unwrap_or(0)
     }
+}
+
+fn cylindrical_axes(origin: [f64; 3], axis: [f64; 3], p: [f64; 3]) -> [[f64; 3]; 3] {
+    let al = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    let e3 = if al < 1e-18 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [axis[0] / al, axis[1] / al, axis[2] / al]
+    };
+    let r = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+    let proj = r[0] * e3[0] + r[1] * e3[1] + r[2] * e3[2];
+    let mut e1 = [r[0] - proj * e3[0], r[1] - proj * e3[1], r[2] - proj * e3[2]];
+    let n1 = (e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]).sqrt();
+    if n1 < 1e-12 {
+        let helper = if e3[2].abs() < 0.9 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [1.0, 0.0, 0.0]
+        };
+        e1 = [
+            helper[1] * e3[2] - helper[2] * e3[1],
+            helper[2] * e3[0] - helper[0] * e3[2],
+            helper[0] * e3[1] - helper[1] * e3[0],
+        ];
+        let n = (e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]).sqrt().max(1e-30);
+        e1 = [e1[0] / n, e1[1] / n, e1[2] / n];
+    } else {
+        e1 = [e1[0] / n1, e1[1] / n1, e1[2] / n1];
+    }
+    let e2 = [
+        e3[1] * e1[2] - e3[2] * e1[1],
+        e3[2] * e1[0] - e3[0] * e1[2],
+        e3[0] * e1[1] - e3[1] * e1[0],
+    ];
+    [
+        [e1[0], e2[0], e3[0]],
+        [e1[1], e2[1], e3[1]],
+        [e1[2], e2[2], e3[2]],
+    ]
 }

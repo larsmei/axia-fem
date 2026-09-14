@@ -241,6 +241,30 @@ pub fn cax4_body_force(xyz: &[[f64; 3]], br: f64, bz: f64, reduced: bool) -> Res
     Ok(fe)
 }
 
+pub fn cax8_body_force(xyz: &[[f64; 3]], br: f64, bz: f64, reduced: bool) -> Result<Vec<f64>> {
+    if xyz.len() < 8 {
+        return err("CAX8 braucht 8 Knoten.");
+    }
+    let mut xy = [[0.0; 2]; 8];
+    for i in 0..8 {
+        xy[i] = [xyz[i][0], xyz[i][1]];
+    }
+    let mut fe = vec![0.0; 16];
+    for (xi, eta, w0) in cax8_gauss(reduced) {
+        let (_, det, nshp) = quad8_dndx(&xy, xi, eta)?;
+        if det <= 0.0 {
+            continue;
+        }
+        let r = radius(&xy, &nshp, 8);
+        let w = two_pi() * r.max(1e-16) * det * w0;
+        for a in 0..8 {
+            fe[2 * a] += nshp[a] * br * w;
+            fe[2 * a + 1] += nshp[a] * bz * w;
+        }
+    }
+    Ok(fe)
+}
+
 pub fn cax_edge_pressure(xyz: &[[f64; 3]], nn: usize, face: i32, p: f64) -> Result<Vec<f64>> {
     // Faces 1-4: edges of the r-z quad. Traction in the outward in-plane normal, 2π r.
     if !(1..=4).contains(&face) {

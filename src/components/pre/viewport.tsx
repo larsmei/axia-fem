@@ -1,471 +1,719 @@
 import { useCallback, useEffect, useRef } from "react";
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { resolveNodes } from "@/lib/pre/export-inp";
-import { dist, hitShape, modelBounds, nearestNode, shapeHoles, shapeOutline, snapPt } from "@/lib/pre/geometry";
+import { dist, modelBounds3, nearestNode3, shapeFaces, snapPt } from "@/lib/pre/geometry";
 import { usePre } from "@/lib/pre/store";
-import type { Vec2 } from "@/lib/pre/types";
+import type { FaceName, Mesh, MeshNode, Shape, Vec2, Vec3 } from "@/lib/pre/types";
 
-const BG = "#f4f5f7";
-const GRID = "#e4e4e7";
-const MAJOR = "#d4d4d8";
-const INK = "#18181c";
-const MUTED = "#71717a";
-const FILL = "rgba(24,24,28,0.07)";
-const SEL = "#09090b";
-const MESH = "#8b8b94";
-const DANGER = "#d4786a";
+const BG = 0xf4f5f7;
+const STEEL = 0x8b929c;
+const STEEL_SEL = 0x3f4450;
+const WIRE = 0x2a2a32;
+const FACE_HIT = 0x18181c;
+const DRAFT = 0x18181c;
 
-type Cam = { x: number; y: number; k: number };
+const HEX_FACES = [
+  [0, 1, 2, 3],
+  [4, 5, 6, 7],
+  [0, 1, 5, 4],
+  [1, 2, 6, 5],
+  [2, 3, 7, 6],
+  [3, 0, 4, 7],
+];
+const WEDGE_FACES = [
+  [0, 1, 2],
+  [3, 4, 5],
+  [0, 1, 4, 3],
+  [1, 2, 5, 4],
+  [2, 0, 3, 5],
+];
+const TET_FACES = [
+  [0, 1, 2],
+  [0, 3, 1],
+  [0, 2, 3],
+  [1, 3, 2],
+];
+
+function to3(p: { x: number; y: number; z?: number }): THREE.Vector3 {
+  return new THREE.Vector3(p.x, p.z ?? 0, p.y);
+}
+
+function from3(v: THREE.Vector3): Vec3 {
+  return { x: v.x, y: v.z, z: v.y };
+}
+
+function disposeObj(o: THREE.Object3D) {
+  o.traverse((c) => {
+    if (c instanceof THREE.Mesh || c instanceof THREE.LineSegments || c instanceof THREE.Line || c instanceof THREE.Points) {
+      c.geometry.dispose();
+      const m = c.material;
+      if (Array.isArray(m)) m.forEach((x) => x.dispose());
+      else m.dispose();
+    }
+  });
+}
+
+function makeQuadGeo(corners: Vec3[]): THREE.BufferGeometry {
+  const a = to3(corners[0]),
+    b = to3(corners[1]),
+    c = to3(corners[2]),
+    d = to3(corners[3]);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute(
+      [a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, a.x, a.y, a.z, c.x, c.y, c.z, d.x, d.y, d.z],
+      3,
+    ),
+  );
+  g.computeVertexNormals();
+  return g;
+}
+
+function meshToGeometry(mesh: Mesh, filter?: (n: MeshNode) => boolean): { solid: THREE.BufferGeometry; edges: THREE.BufferGeometry } {
+  const byId = new Map(mesh.nodes.map((n) => [n.id, n]));
+  const pos: number[] = [];
+  const edgeSet = new Set<string>();
+  const pushTri = (a: MeshNode, b: MeshNode, c: MeshNode) => {
+    const pa = to3(a),
+      pb = to3(b),
+      pc = to3(c);
+    pos.push(pa.x, pa.y, pa.z, pb.x, pb.y, pb.z, pc.x, pc.y, pc.z);
+  };
+  const addEdge = (a: MeshNode, b: MeshNode) => {
+    const lo = Math.min(a.id, b.id);
+    const hi = Math.max(a.id, b.id);
+    edgeSet.add(`${lo}-${hi}`);
+  };
+  const emitFace = (ids: number[]) => {
+    const pts = ids.map((id) => byId.get(id)).filter((n): n is MeshNode => !!n);
+    if (filter && pts.some((p) => !filter(p))) return;
+    if (pts.length < 3) return;
+    if (pts.length === 3) {
+      pushTri(pts[0], pts[1], pts[2]);
+      addEdge(pts[0], pts[1]);
+      addEdge(pts[1], pts[2]);
+      addEdge(pts[2], pts[0]);
+      return;
+    }
+    pushTri(pts[0], pts[1], pts[2]);
+    pushTri(pts[0], pts[2], pts[3]);
+    for (let i = 0; i < 4; i++) addEdge(pts[i], pts[(i + 1) % 4]);
+  };
+  for (const el of mesh.elements) {
+    if ((el.type === "C3D8" || el.type === "CPS4") && el.nodes.length >= (el.type === "C3D8" ? 8 : 4)) {
+      if (el.type === "C3D8") for (const f of HEX_FACES) emitFace(f.map((i) => el.nodes[i]));
+      else emitFace(el.nodes.slice(0, 4));
+    } else if (el.type === "C3D6" && el.nodes.length >= 6) {
+      for (const f of WEDGE_FACES) emitFace(f.map((i) => el.nodes[i]));
+    } else if (el.type === "C3D4" && el.nodes.length >= 4) {
+      for (const f of TET_FACES) emitFace(f.map((i) => el.nodes[i]));
+    } else if (el.nodes.length >= 3) {
+      emitFace(el.nodes.slice(0, 3));
+    }
+  }
+  const solid = new THREE.BufferGeometry();
+  solid.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  solid.computeVertexNormals();
+  const epos: number[] = [];
+  for (const key of edgeSet) {
+    const [a, b] = key.split("-").map(Number);
+    const na = byId.get(a),
+      nb = byId.get(b);
+    if (!na || !nb) continue;
+    const pa = to3(na),
+      pb = to3(nb);
+    epos.push(pa.x, pa.y, pa.z, pb.x, pb.y, pb.z);
+  }
+  const edges = new THREE.BufferGeometry();
+  edges.setAttribute("position", new THREE.Float32BufferAttribute(epos, 3));
+  return { solid, edges };
+}
+
+function solidGeometry(shape: Shape): THREE.BufferGeometry {
+  if (shape.kind === "box") {
+    const g = new THREE.BoxGeometry(shape.w, shape.d, shape.h);
+    g.translate(shape.x + shape.w / 2, shape.z + shape.d / 2, shape.y + shape.h / 2);
+    return g;
+  }
+  if (shape.kind === "rect") {
+    const d = Math.max(shape.depth, 0.4);
+    const g = new THREE.BoxGeometry(shape.w, d, shape.h);
+    g.translate(shape.x + shape.w / 2, d / 2, shape.y + shape.h / 2);
+    return g;
+  }
+  if (shape.kind === "sphere") {
+    const g = new THREE.SphereGeometry(shape.r, 32, 20);
+    g.translate(shape.cx, shape.cz, shape.cy);
+    return g;
+  }
+  if (shape.kind === "cylinder") {
+    const g = new THREE.CylinderGeometry(shape.r, shape.r, shape.height, 32);
+    if (shape.axis === "z") {
+      /* three Y is FEM Z */
+    } else if (shape.axis === "y") {
+      g.rotateX(Math.PI / 2);
+    } else {
+      g.rotateZ(Math.PI / 2);
+    }
+    g.translate(shape.cx, shape.cz, shape.cy);
+    return g;
+  }
+  if (shape.kind === "circle") {
+    const d = Math.max(shape.depth, 0.4);
+    const g = new THREE.CylinderGeometry(shape.r, shape.r, d, 32);
+    g.translate(shape.cx, d / 2, shape.cy);
+    return g;
+  }
+  const sh = new THREE.Shape();
+  shape.points.forEach((p, i) => {
+    if (i === 0) sh.moveTo(p.x, p.y);
+    else sh.lineTo(p.x, p.y);
+  });
+  sh.closePath();
+  for (const h of shape.holes ?? []) {
+    const hole = new THREE.Path();
+    hole.absarc(h.cx, h.cy, h.r, 0, Math.PI * 2, true);
+    sh.holes.push(hole);
+  }
+  const g = new THREE.ExtrudeGeometry(sh, { depth: Math.max(shape.depth, 0.4), bevelEnabled: false });
+  g.rotateX(-Math.PI / 2);
+  return g;
+}
 
 export function PreViewport() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
-  const cam = useRef<Cam>({ x: 50, y: 20, k: 6 });
-  const drag = useRef<
-    | { mode: "pan"; lx: number; ly: number }
-    | { mode: "draw"; }
-    | { mode: "box"; ax: number; ay: number; bx: number; by: number }
-    | null
-  >(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const st = useRef<{
+    renderer?: THREE.WebGLRenderer;
+    scene?: THREE.Scene;
+    camera?: THREE.PerspectiveCamera;
+    controls?: OrbitControls;
+    world?: THREE.Group;
+    picks?: THREE.Group;
+    draft?: THREE.Object3D;
+    axesScene?: THREE.Scene;
+    axesCam?: THREE.PerspectiveCamera;
+    ray?: THREE.Raycaster;
+    plane?: THREE.Plane;
+    raf?: number;
+  }>({});
   const shapes = usePre((s) => s.shapes);
   const mesh = usePre((s) => s.mesh);
   const tool = usePre((s) => s.tool);
-  const draft = usePre((s) => s.draft);
+  const dim = usePre((s) => s.dim);
   const selectedShapeId = usePre((s) => s.selectedShapeId);
+  const selectedFace = usePre((s) => s.selectedFace);
   const selectedNodeIds = usePre((s) => s.selectedNodeIds);
   const restraints = usePre((s) => s.restraints);
   const loads = usePre((s) => s.loads);
-  const issues = usePre((s) => s.issues);
+  const draft = usePre((s) => s.draft);
 
-  const world = useCallback((cx: number, cy: number, w: number, h: number): Vec2 => {
-    const c = cam.current;
-    return { x: (cx - w / 2) / c.k + c.x, y: (h / 2 - cy) / c.k + c.y };
-  }, []);
-
-  const screen = (p: Vec2, w: number, h: number) => {
-    const c = cam.current;
-    return { x: (p.x - c.x) * c.k + w / 2, y: h / 2 - (p.y - c.y) * c.k };
-  };
-
-  const fit = useCallback(() => {
-    const el = wrapRef.current;
-    if (!el) return;
-    const w = el.clientWidth;
-    const h = el.clientHeight;
-    const b = modelBounds(usePre.getState().shapes);
-    const k = Math.min(w / Math.max(b.w, 1), h / Math.max(b.h, 1)) * 0.86;
-    cam.current = { x: b.x + b.w / 2, y: b.y + b.h / 2, k: Math.max(2, Math.min(48, k)) };
+  const fit = useCallback((mode: "iso" | "top" | "keep" = "iso") => {
+    const { camera, controls } = st.current;
+    if (!camera || !controls) return;
+    const b = modelBounds3(usePre.getState().shapes);
+    const cx = b.x + b.w / 2;
+    const cy = b.y + b.h / 2;
+    const cz = b.z + b.d / 2;
+    const span = Math.max(b.w, b.h, b.d, 30);
+    camera.near = Math.max(0.05, span / 400);
+    camera.far = span * 50;
+    camera.updateProjectionMatrix();
+    const t = to3({ x: cx, y: cy, z: cz });
+    controls.target.copy(t);
+    if (mode === "top") {
+      camera.up.set(0, 0, -1);
+      camera.position.set(t.x, t.y + span * 1.8, t.z);
+    } else {
+      camera.up.set(0, 1, 0);
+      camera.position.set(t.x + span * 0.95, t.y + span * 0.75, t.z + span * 1.15);
+    }
+    controls.update();
   }, []);
 
   useEffect(() => {
-    fit();
-  }, [fit, shapes.length]);
-
-  const paint = useCallback(() => {
     const canvas = canvasRef.current;
     const wrap = wrapRef.current;
     if (!canvas || !wrap) return;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = wrap.clientWidth;
-    const h = wrap.clientHeight;
-    if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
-      canvas.width = Math.floor(w * dpr);
-      canvas.height = Math.floor(h * dpr);
-      canvas.style.width = `${w}px`;
-      canvas.style.height = `${h}px`;
-    }
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = BG;
-    ctx.fillRect(0, 0, w, h);
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: "high-performance" });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setClearColor(BG, 1);
+    renderer.autoClear = false;
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 8000);
+    camera.up.set(0, 1, 0);
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.PAN,
+      RIGHT: THREE.MOUSE.ROTATE,
+    };
+    controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+    scene.add(new THREE.AmbientLight(0xffffff, 0.92));
+    const key = new THREE.DirectionalLight(0xffffff, 0.5);
+    key.position.set(0.4, 1, 0.35);
+    scene.add(key);
+    const fill = new THREE.DirectionalLight(0xffffff, 0.22);
+    fill.position.set(-0.6, 0.2, -0.5);
+    scene.add(fill);
 
-    const c = cam.current;
-    const step = c.k > 14 ? 1 : c.k > 6 ? 5 : 10;
-    const major = step * 10;
-    const w0 = world(0, h, w, h);
-    const w1 = world(w, 0, w, h);
-    ctx.lineWidth = 1;
-    const x0 = Math.floor(w0.x / step) * step;
-    const y0 = Math.floor(w0.y / step) * step;
-    for (let x = x0; x <= w1.x + step; x += step) {
-      const s = screen({ x, y: 0 }, w, h);
-      ctx.strokeStyle = Math.abs(x % major) < 1e-6 ? MAJOR : GRID;
-      ctx.beginPath();
-      ctx.moveTo(Math.round(s.x) + 0.5, 0);
-      ctx.lineTo(Math.round(s.x) + 0.5, h);
-      ctx.stroke();
-    }
-    for (let y = y0; y <= w1.y + step; y += step) {
-      const s = screen({ x: 0, y }, w, h);
-      ctx.strokeStyle = Math.abs(y % major) < 1e-6 ? MAJOR : GRID;
-      ctx.beginPath();
-      ctx.moveTo(0, Math.round(s.y) + 0.5);
-      ctx.lineTo(w, Math.round(s.y) + 0.5);
-      ctx.stroke();
-    }
+    const grid = new THREE.GridHelper(200, 20, 0xc5cad1, 0xdce0e5);
+    scene.add(grid);
+    const axes = new THREE.AxesHelper(24);
+    axes.setColors(new THREE.Color(0x18181c), new THREE.Color(0x52525b), new THREE.Color(0x71717a));
+    scene.add(axes);
 
-    const ox = screen({ x: 0, y: 0 }, w, h);
-    ctx.strokeStyle = INK;
-    ctx.lineWidth = 1.25;
-    ctx.beginPath();
-    ctx.moveTo(ox.x, ox.y);
-    ctx.lineTo(ox.x + 28, ox.y);
-    ctx.moveTo(ox.x, ox.y);
-    ctx.lineTo(ox.x, ox.y - 28);
-    ctx.stroke();
-    ctx.fillStyle = MUTED;
-    ctx.font = "11px IBM Plex Sans, sans-serif";
-    ctx.fillText("x", ox.x + 32, ox.y + 4);
-    ctx.fillText("y", ox.x - 4, ox.y - 32);
+    const world = new THREE.Group();
+    const picks = new THREE.Group();
+    scene.add(world);
+    scene.add(picks);
 
-    const st = usePre.getState();
-    for (const sh of st.shapes) {
-      const ring = shapeOutline(sh);
-      pathRing(ctx, ring, w, h, screen);
-      ctx.fillStyle = sh.id === st.selectedShapeId ? "rgba(24,24,28,0.12)" : FILL;
-      ctx.fill();
-      for (const hole of shapeHoles(sh)) {
-        ctx.beginPath();
-        const n = 32;
-        for (let i = 0; i <= n; i++) {
-          const a = (i / n) * Math.PI * 2;
-          const p = screen({ x: hole.cx + hole.r * Math.cos(a), y: hole.cy + hole.r * Math.sin(a) }, w, h);
-          if (i === 0) ctx.moveTo(p.x, p.y);
-          else ctx.lineTo(p.x, p.y);
-        }
-        ctx.fillStyle = BG;
-        ctx.fill();
-      }
-    }
+    const axesScene = new THREE.Scene();
+    const triad = new THREE.Group();
+    const axisLine = (to: [number, number, number]) => {
+      const g = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(...to)]);
+      return new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0x1a1a1a }));
+    };
+    triad.add(axisLine([1, 0, 0]), axisLine([0, 1, 0]), axisLine([0, 0, 1]));
+    const makeLbl = (t: string, p: [number, number, number]) => {
+      const c = document.createElement("canvas");
+      c.width = 64;
+      c.height = 64;
+      const ctx = c.getContext("2d")!;
+      ctx.fillStyle = "#18181c";
+      ctx.font = "28px IBM Plex Sans, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(t, 32, 32);
+      const tex = new THREE.CanvasTexture(c);
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false }));
+      sp.position.set(...p);
+      sp.scale.setScalar(0.45);
+      return sp;
+    };
+    triad.add(makeLbl("X", [1.25, 0, 0]), makeLbl("Z", [0, 1.25, 0]), makeLbl("Y", [0, 0, 1.25]));
+    axesScene.add(triad);
+    const axesCam = new THREE.PerspectiveCamera(50, 1, 0.1, 10);
 
-    if (st.mesh) {
-      const byId = new Map(st.mesh.nodes.map((n) => [n.id, n]));
-      ctx.strokeStyle = MESH;
-      ctx.lineWidth = 0.8;
-      ctx.beginPath();
-      for (const el of st.mesh.elements) {
-        const pts = el.nodes.map((id) => byId.get(id)).filter(Boolean);
-        if (pts.length < 3) continue;
-        const p0 = screen(pts[0]!, w, h);
-        ctx.moveTo(p0.x, p0.y);
-        for (let i = 1; i < pts.length; i++) {
-          const p = screen(pts[i]!, w, h);
-          ctx.lineTo(p.x, p.y);
-        }
-        ctx.closePath();
-      }
-      ctx.stroke();
-      if (c.k > 10) {
-        ctx.fillStyle = INK;
-        for (const n of st.mesh.nodes) {
-          const p = screen(n, w, h);
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, st.selectedNodeIds.includes(n.id) ? 3.5 : 1.6, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }
-    }
+    st.current = {
+      renderer,
+      scene,
+      camera,
+      controls,
+      world,
+      picks,
+      axesScene,
+      axesCam,
+      ray: new THREE.Raycaster(),
+      plane: new THREE.Plane(new THREE.Vector3(0, 1, 0), 0),
+    };
 
-    for (const sh of st.shapes) {
-      const ring = shapeOutline(sh);
-      pathRing(ctx, ring, w, h, screen);
-      ctx.strokeStyle = sh.id === st.selectedShapeId ? SEL : INK;
-      ctx.lineWidth = sh.id === st.selectedShapeId ? 2.2 : 1.2;
-      ctx.stroke();
-    }
+    const resize = () => {
+      const w = wrap.clientWidth || 1;
+      const h = wrap.clientHeight || 1;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    };
+    resize();
+    const ro = new ResizeObserver(resize);
+    ro.observe(wrap);
 
-    if (st.mesh) {
-      ctx.fillStyle = INK;
-      for (const r of st.restraints) {
-        const ids = resolveNodes(st.mesh, st.shapes, r.target);
-        for (const id of ids) {
-          const n = st.mesh.nodes.find((nd) => nd.id === id);
-          if (!n) continue;
-          const p = screen(n, w, h);
-          drawSupport(ctx, p.x, p.y, r.ux, r.uy);
-        }
-      }
-      ctx.strokeStyle = INK;
-      ctx.fillStyle = INK;
-      for (const ld of st.loads) {
-        if (ld.kind !== "force") continue;
-        const ids = resolveNodes(st.mesh, st.shapes, ld.target);
-        for (const id of ids) {
-          const n = st.mesh.nodes.find((nd) => nd.id === id);
-          if (!n) continue;
-          const p = screen(n, w, h);
-          const mag = Math.hypot(ld.fx, ld.fy) || 1;
-          const len = 18;
-          drawArrow(ctx, p.x, p.y, (ld.fx / mag) * len, -(ld.fy / mag) * len);
-        }
-      }
-    }
+    const loop = () => {
+      controls.update();
+      const w = wrap.clientWidth || 1;
+      const h = wrap.clientHeight || 1;
+      renderer.setViewport(0, 0, w, h);
+      renderer.setScissorTest(false);
+      renderer.clear();
+      renderer.render(scene, camera);
+      axesCam.up.copy(camera.up);
+      axesCam.position.copy(camera.position).sub(controls.target);
+      if (axesCam.position.lengthSq() < 1e-12) axesCam.position.set(0.7, 0.45, 0.7);
+      axesCam.position.setLength(2.4);
+      axesCam.lookAt(0, 0, 0);
+      const aw = 72,
+        ah = 72;
+      renderer.clearDepth();
+      renderer.setScissorTest(true);
+      renderer.setScissor(w - aw - 10, 10, aw, ah);
+      renderer.setViewport(w - aw - 10, 10, aw, ah);
+      renderer.render(axesScene, axesCam);
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, w, h);
+      st.current.raf = requestAnimationFrame(loop);
+    };
+    loop();
+    fit(usePre.getState().dim === "2d" ? "top" : "iso");
 
-    if (st.draft?.tool === "rect") {
-      const a = screen(st.draft.a, w, h);
-      const b = screen(st.draft.b, w, h);
-      ctx.strokeStyle = SEL;
-      ctx.setLineDash([4, 3]);
-      ctx.strokeRect(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x), Math.abs(b.y - a.y));
-      ctx.setLineDash([]);
-      dimLabel(ctx, st.draft.a, st.draft.b, w, h, screen);
-    }
-    if (st.draft?.tool === "circle" || st.draft?.tool === "hole") {
-      const o = screen(st.draft.c, w, h);
-      ctx.strokeStyle = SEL;
-      ctx.setLineDash([4, 3]);
-      ctx.beginPath();
-      ctx.arc(o.x, o.y, st.draft.r * c.k, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-    if (st.draft?.tool === "polygon") {
-      const pts = st.draft.points;
-      if (pts.length) {
-        ctx.strokeStyle = SEL;
-        ctx.setLineDash([4, 3]);
-        ctx.beginPath();
-        pts.forEach((p, i) => {
-          const s = screen(p, w, h);
-          if (i === 0) ctx.moveTo(s.x, s.y);
-          else ctx.lineTo(s.x, s.y);
-        });
-        ctx.stroke();
-        ctx.setLineDash([]);
-        for (const p of pts) {
-          const s = screen(p, w, h);
-          ctx.fillStyle = SEL;
-          ctx.beginPath();
-          ctx.arc(s.x, s.y, 3, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }
-    }
-
-    ctx.fillStyle = MUTED;
-    ctx.font = "11px IBM Plex Mono, ui-monospace, monospace";
-    ctx.fillText(`${step} mm`, 12, h - 12);
-
-    void issues;
-  }, [draft, loads, mesh, restraints, selectedNodeIds, selectedShapeId, shapes, tool, world]);
+    return () => {
+      cancelAnimationFrame(st.current.raf ?? 0);
+      ro.disconnect();
+      controls.dispose();
+      renderer.dispose();
+      disposeObj(world);
+      disposeObj(picks);
+      st.current = {};
+    };
+  }, [fit]);
 
   useEffect(() => {
-    let raf = 0;
-    const loop = () => {
-      paint();
-      raf = requestAnimationFrame(loop);
-    };
-    raf = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf);
-  }, [paint]);
+    const { world, picks } = st.current;
+    if (!world || !picks) return;
+    while (world.children.length) {
+      const c = world.children[0];
+      world.remove(c);
+      disposeObj(c);
+    }
+    while (picks.children.length) {
+      const c = picks.children[0];
+      picks.remove(c);
+      disposeObj(c);
+    }
+
+    const state = usePre.getState();
+    const matFor = (sel: boolean, opacity = 0.92) =>
+      new THREE.MeshLambertMaterial({
+        color: sel ? STEEL_SEL : STEEL,
+        transparent: opacity < 0.99,
+        opacity,
+        side: THREE.DoubleSide,
+      });
+
+    if (state.mesh && state.mesh.elements.length) {
+      const { solid, edges } = meshToGeometry(state.mesh);
+      const meshObj = new THREE.Mesh(solid, matFor(false, 0.96));
+      const wire = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: WIRE, transparent: true, opacity: 0.45 }));
+      world.add(meshObj, wire);
+      if (state.selectedNodeIds.length) {
+        const sel = new THREE.BufferGeometry();
+        const pts: number[] = [];
+        const set = new Set(state.selectedNodeIds);
+        for (const n of state.mesh.nodes) {
+          if (!set.has(n.id)) continue;
+          const p = to3(n);
+          pts.push(p.x, p.y, p.z);
+        }
+        sel.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
+        world.add(new THREE.Points(sel, new THREE.PointsMaterial({ color: 0x09090b, size: 7, sizeAttenuation: false })));
+      }
+    } else {
+      for (const sh of state.shapes) {
+        const geo = solidGeometry(sh);
+        const m = new THREE.Mesh(geo, matFor(sh.id === state.selectedShapeId, 0.88));
+        world.add(m);
+        world.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: WIRE, opacity: 0.55, transparent: true })));
+      }
+    }
+
+    for (const sh of state.shapes) {
+      for (const f of shapeFaces(sh)) {
+        const g = makeQuadGeo(f.corners);
+        const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, transparent: true, opacity: 0 }));
+        m.userData = { shapeId: sh.id, face: f.face };
+        picks.add(m);
+        if (state.selectedFace?.shapeId === sh.id && state.selectedFace.face === f.face) {
+          const hl = new THREE.Mesh(
+            g.clone(),
+            new THREE.MeshBasicMaterial({ color: FACE_HIT, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false }),
+          );
+          world.add(hl);
+        }
+      }
+      if (sh.kind === "cylinder" || sh.kind === "sphere") {
+        const geo = solidGeometry(sh);
+        const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide }));
+        m.userData = { shapeId: sh.id, face: "lateral" };
+        picks.add(m);
+      }
+    }
+
+    if (state.mesh) {
+      for (const ld of state.loads) {
+        if (ld.kind !== "force") continue;
+        const ids = resolveNodes(state.mesh, state.shapes, ld.target);
+        if (!ids.length) continue;
+        let cx = 0,
+          cy = 0,
+          cz = 0;
+        let n = 0;
+        for (const id of ids) {
+          const nd = state.mesh.nodes.find((x) => x.id === id);
+          if (!nd) continue;
+          cx += nd.x;
+          cy += nd.y;
+          cz += nd.z ?? 0;
+          n++;
+        }
+        if (!n) continue;
+        cx /= n;
+        cy /= n;
+        cz /= n;
+        const mag = Math.hypot(ld.fx, ld.fy, ld.fz) || 1;
+        const dir = to3({ x: ld.fx / mag, y: ld.fy / mag, z: ld.fz / mag });
+        if (dir.lengthSq() < 1e-12) continue;
+        const origin = to3({ x: cx, y: cy, z: cz });
+        world.add(new THREE.ArrowHelper(dir.normalize(), origin, 16, 0x18181c, 5, 3));
+      }
+      const pinIds: MeshNode[] = [];
+      const seen = new Set<number>();
+      for (const r of state.restraints) {
+        const ids = resolveNodes(state.mesh, state.shapes, r.target);
+        const step = Math.max(1, Math.floor(ids.length / 48));
+        for (let i = 0; i < ids.length; i += step) {
+          if (seen.has(ids[i])) continue;
+          seen.add(ids[i]);
+          const nd = state.mesh.nodes.find((x) => x.id === ids[i]);
+          if (nd) pinIds.push(nd);
+        }
+      }
+      if (pinIds.length) {
+        const pin = new THREE.InstancedMesh(
+          new THREE.ConeGeometry(1.6, 4.2, 6),
+          new THREE.MeshLambertMaterial({ color: 0x18181c }),
+          pinIds.length,
+        );
+        const dummy = new THREE.Object3D();
+        pinIds.forEach((nd, i) => {
+          const p = to3(nd);
+          dummy.position.set(p.x, p.y - 2, p.z);
+          dummy.rotation.set(Math.PI, 0, 0);
+          dummy.updateMatrix();
+          pin.setMatrixAt(i, dummy.matrix);
+        });
+        pin.instanceMatrix.needsUpdate = true;
+        world.add(pin);
+      }
+    }
+
+    const d = state.draft;
+    if (d?.tool === "box" || d?.tool === "rect") {
+      const x0 = Math.min(d.a.x, d.b.x),
+        y0 = Math.min(d.a.y, d.b.y);
+      const w = Math.abs(d.b.x - d.a.x) || 0.01,
+        h = Math.abs(d.b.y - d.a.y) || 0.01;
+      const depth = state.dim === "3d" ? state.defaultDepth : 0.4;
+      const g = new THREE.BoxGeometry(w, depth, h);
+      g.translate(x0 + w / 2, depth / 2, y0 + h / 2);
+      world.add(
+        new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: DRAFT, transparent: true, opacity: 0.18, depthWrite: false })),
+      );
+      world.add(new THREE.LineSegments(new THREE.EdgesGeometry(g), new THREE.LineBasicMaterial({ color: DRAFT })));
+    }
+    if (d?.tool === "cylinder" || d?.tool === "circle" || d?.tool === "sphere" || d?.tool === "hole") {
+      const r = Math.max(d.r, 0.01);
+      const depth = d.tool === "sphere" ? r * 2 : state.dim === "3d" ? state.defaultDepth : 0.4;
+      const g =
+        d.tool === "sphere"
+          ? new THREE.SphereGeometry(r, 24, 16)
+          : new THREE.CylinderGeometry(r, r, depth, 28);
+      if (d.tool === "sphere") g.translate(d.c.x, r, d.c.y);
+      else g.translate(d.c.x, depth / 2, d.c.y);
+      world.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: DRAFT, transparent: true, opacity: 0.16, depthWrite: false })));
+      world.add(new THREE.LineSegments(new THREE.EdgesGeometry(g), new THREE.LineBasicMaterial({ color: DRAFT })));
+    }
+    if (d?.tool === "polygon" && d.points.length) {
+      const pts = d.points.map((p) => to3({ x: p.x, y: p.y, z: 0 }));
+      const g = new THREE.BufferGeometry().setFromPoints(pts);
+      world.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: DRAFT })));
+    }
+  }, [shapes, mesh, selectedShapeId, selectedFace, selectedNodeIds, restraints, loads, draft, dim]);
+
+  useEffect(() => {
+    const { controls } = st.current;
+    if (!controls) return;
+    const draw = tool === "rect" || tool === "circle" || tool === "polygon" || tool === "hole" || tool === "box" || tool === "cylinder" || tool === "sphere";
+    controls.mouseButtons.LEFT = draw ? (-1 as THREE.MOUSE) : THREE.MOUSE.ROTATE;
+  }, [tool]);
+
+  useEffect(() => {
+    fit(dim === "2d" ? "top" : "iso");
+  }, [dim, shapes.length, fit]);
+
+  const hitPlane = (e: React.PointerEvent): Vec2 | null => {
+    const { camera, ray, plane, renderer } = st.current;
+    const canvas = canvasRef.current;
+    if (!camera || !ray || !plane || !canvas || !renderer) return null;
+    const r = canvas.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    ray.setFromCamera(ndc, camera);
+    const out = new THREE.Vector3();
+    if (!ray.ray.intersectPlane(plane, out)) return null;
+    const p = from3(out);
+    return snapPt({ x: p.x, y: p.y }, 1);
+  };
+
+  const hitPick = (e: React.PointerEvent): { shapeId: string; face?: FaceName } | null => {
+    const { camera, ray, picks } = st.current;
+    const canvas = canvasRef.current;
+    if (!camera || !ray || !picks || !canvas) return null;
+    const r = canvas.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    ray.setFromCamera(ndc, camera);
+    const hits = ray.intersectObjects(picks.children, false);
+    const h = hits[0];
+    if (!h?.object.userData?.shapeId) return null;
+    return { shapeId: h.object.userData.shapeId, face: h.object.userData.face };
+  };
+
+  const onDown = (e: React.PointerEvent) => {
+    if (e.button === 1 || e.button === 2) return;
+    const pre = usePre.getState();
+    const wp = hitPlane(e);
+    if (pre.tool === "box" || pre.tool === "rect") {
+      if (!wp) return;
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+      pre.setDraft({ tool: pre.tool, a: wp, b: wp });
+      return;
+    }
+    if (pre.tool === "cylinder" || pre.tool === "circle" || pre.tool === "sphere" || pre.tool === "hole") {
+      if (!wp) return;
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+      pre.setDraft({ tool: pre.tool, c: wp, r: 0 });
+      return;
+    }
+    if (pre.tool === "polygon") {
+      if (!wp) return;
+      const d = pre.draft?.tool === "polygon" ? pre.draft.points : [];
+      if (d.length >= 3 && dist(wp, d[0]) < 3) {
+        pre.addPolygon(d);
+        pre.setDraft(null);
+        pre.setTool("select");
+        return;
+      }
+      pre.setDraft({ tool: "polygon", points: [...d, wp] });
+      return;
+    }
+    if (pre.tool === "node" && pre.mesh && st.current.camera && st.current.ray) {
+      const canvas = canvasRef.current!;
+      const r = canvas.getBoundingClientRect();
+      const ndc = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+      st.current.ray.setFromCamera(ndc, st.current.camera);
+      const origin = from3(st.current.ray.ray.origin);
+      const dirV = from3(st.current.ray.ray.direction);
+      const distCam = st.current.camera.position.distanceTo(st.current.controls?.target ?? new THREE.Vector3());
+      const n = nearestNode3(pre.mesh, origin, dirV, Math.max(1.5, distCam * 0.02));
+      if (n) pre.toggleNode(n.id, e.shiftKey);
+      return;
+    }
+    const hit = hitPick(e);
+    if (hit) {
+      if (pre.tool === "face" && hit.face) {
+        pre.selectFace({ shapeId: hit.shapeId, face: hit.face });
+      } else {
+        pre.selectShape(hit.shapeId);
+        if (hit.face) pre.selectFace({ shapeId: hit.shapeId, face: hit.face });
+      }
+    } else {
+      pre.selectShape(null);
+      pre.selectFace(null);
+    }
+  };
+
+  const onMove = (e: React.PointerEvent) => {
+    const pre = usePre.getState();
+    const wp = hitPlane(e);
+    if (!wp || !pre.draft) return;
+    if (pre.draft.tool === "rect" || pre.draft.tool === "box") pre.setDraft({ tool: pre.draft.tool, a: pre.draft.a, b: wp });
+    if (pre.draft.tool === "circle" || pre.draft.tool === "cylinder" || pre.draft.tool === "sphere" || pre.draft.tool === "hole") {
+      pre.setDraft({ tool: pre.draft.tool, c: pre.draft.c, r: dist(pre.draft.c, wp) });
+    }
+  };
+
+  const onUp = () => {
+    const pre = usePre.getState();
+    const d = pre.draft;
+    if (d?.tool === "rect" || d?.tool === "box") {
+      const x = Math.min(d.a.x, d.b.x);
+      const y = Math.min(d.a.y, d.b.y);
+      const w = Math.abs(d.b.x - d.a.x);
+      const h = Math.abs(d.b.y - d.a.y);
+      if (d.tool === "box" || pre.dim === "3d") pre.addBox(x, y, 0, w, h, pre.defaultDepth);
+      else pre.addRect(x, y, w, h);
+      pre.setDraft(null);
+      pre.setTool("select");
+    }
+    if (d?.tool === "circle" || d?.tool === "cylinder") {
+      if (d.tool === "cylinder" || pre.dim === "3d") pre.addCylinder(d.c.x, d.c.y, pre.defaultDepth / 2, d.r, pre.defaultDepth, "z");
+      else pre.addCircle(d.c.x, d.c.y, d.r);
+      pre.setDraft(null);
+      pre.setTool("select");
+    }
+    if (d?.tool === "sphere") {
+      pre.addSphere(d.c.x, d.c.y, d.r, d.r);
+      pre.setDraft(null);
+      pre.setTool("select");
+    }
+    if (d?.tool === "hole") {
+      pre.addHole(d.c.x, d.c.y, d.r);
+      pre.setDraft(null);
+      pre.setTool("select");
+    }
+  };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT")) return;
-      const st = usePre.getState();
+      const pre = usePre.getState();
       if (e.key === "Escape") {
-        st.setDraft(null);
-        st.setTool("select");
+        pre.setDraft(null);
+        pre.setTool("select");
       }
-      if (e.key === "Delete" || e.key === "Backspace") st.deleteSelected();
+      if (e.key === "Delete" || e.key === "Backspace") pre.deleteSelected();
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
-        if (e.shiftKey) st.redo();
-        else st.undo();
+        if (e.shiftKey) pre.redo();
+        else pre.undo();
       }
-      if (e.key === "Enter" && st.draft?.tool === "polygon") {
-        st.addPolygon(st.draft.points);
-        st.setDraft(null);
+      if (e.key === "Enter" && pre.draft?.tool === "polygon") {
+        pre.addPolygon(pre.draft.points);
+        pre.setDraft(null);
       }
-      if (e.key === "f") fit();
+      if (e.key === "f" || e.key === "F") fit("iso");
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [fit]);
-
-  const onWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const rect = wrapRef.current!.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
-    const w = rect.width;
-    const h = rect.height;
-    const before = world(mx, my, w, h);
-    const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-    cam.current.k = Math.max(0.4, Math.min(80, cam.current.k * factor));
-    const after = world(mx, my, w, h);
-    cam.current.x += before.x - after.x;
-    cam.current.y += before.y - after.y;
-  };
-
-  const pos = (e: React.PointerEvent) => {
-    const rect = wrapRef.current!.getBoundingClientRect();
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top, w: rect.width, h: rect.height };
-  };
-
-  const onDown = (e: React.PointerEvent) => {
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    const p = pos(e);
-    const wp = snapPt(world(p.x, p.y, p.w, p.h), 1);
-    const st = usePre.getState();
-    if (e.button === 1 || e.buttons === 4 || st.tool === "select" && e.altKey) {
-      drag.current = { mode: "pan", lx: p.x, ly: p.y };
-      return;
-    }
-    if (st.tool === "rect") {
-      st.setDraft({ tool: "rect", a: wp, b: wp });
-      drag.current = { mode: "draw" };
-      return;
-    }
-    if (st.tool === "circle") {
-      st.setDraft({ tool: "circle", c: wp, r: 0 });
-      drag.current = { mode: "draw" };
-      return;
-    }
-    if (st.tool === "hole") {
-      st.setDraft({ tool: "hole", c: wp, r: 0 });
-      drag.current = { mode: "draw" };
-      return;
-    }
-    if (st.tool === "polygon") {
-      const d = st.draft?.tool === "polygon" ? st.draft.points : [];
-      if (d.length >= 3 && dist(wp, d[0]) * cam.current.k < 10) {
-        st.addPolygon(d);
-        st.setDraft(null);
-        st.setTool("select");
-        return;
-      }
-      st.setDraft({ tool: "polygon", points: [...d, wp] });
-      return;
-    }
-    if (st.tool === "node" && st.mesh) {
-      const n = nearestNode(st.mesh, world(p.x, p.y, p.w, p.h), 12 / cam.current.k);
-      if (n) st.toggleNode(n.id, e.shiftKey);
-      return;
-    }
-    const hit = hitShape(st.shapes, world(p.x, p.y, p.w, p.h), 6 / cam.current.k);
-    st.selectShape(hit?.id ?? null);
-    if (!hit && e.button === 0) drag.current = { mode: "pan", lx: p.x, ly: p.y };
-  };
-
-  const onMove = (e: React.PointerEvent) => {
-    const p = pos(e);
-    const wp = snapPt(world(p.x, p.y, p.w, p.h), 1);
-    const d = drag.current;
-    if (d?.mode === "pan") {
-      cam.current.x -= (p.x - d.lx) / cam.current.k;
-      cam.current.y += (p.y - d.ly) / cam.current.k;
-      drag.current = { mode: "pan", lx: p.x, ly: p.y };
-      return;
-    }
-    const st = usePre.getState();
-    if (st.draft?.tool === "rect") st.setDraft({ tool: "rect", a: st.draft.a, b: wp });
-    if (st.draft?.tool === "circle") st.setDraft({ tool: "circle", c: st.draft.c, r: dist(st.draft.c, wp) });
-    if (st.draft?.tool === "hole") st.setDraft({ tool: "hole", c: st.draft.c, r: dist(st.draft.c, wp) });
-  };
-
-  const onUp = () => {
-    const st = usePre.getState();
-    const d = st.draft;
-    if (d?.tool === "rect") {
-      st.addRect(d.a.x, d.a.y, d.b.x - d.a.x, d.b.y - d.a.y);
-      st.setDraft(null);
-      st.setTool("select");
-    }
-    if (d?.tool === "circle") {
-      st.addCircle(d.c.x, d.c.y, d.r);
-      st.setDraft(null);
-      st.setTool("select");
-    }
-    if (d?.tool === "hole") {
-      st.addHole(d.c.x, d.c.y, d.r);
-      st.setDraft(null);
-      st.setTool("select");
-    }
-    drag.current = null;
-  };
 
   return (
     <div ref={wrapRef} className="relative h-full min-h-0 w-full bg-viewport">
       <canvas
         ref={canvasRef}
         className="block h-full w-full touch-none"
-        onWheel={onWheel}
         onPointerDown={onDown}
         onPointerMove={onMove}
         onPointerUp={onUp}
         onPointerCancel={onUp}
+        onContextMenu={(e) => e.preventDefault()}
       />
-      <button
-        type="button"
-        onClick={fit}
-        className="absolute right-3 top-3 h-8 rounded-md border border-border bg-bg/90 px-2.5 text-xs text-muted hover:text-fg"
-      >
-        Einpassen
-      </button>
+      <div className="absolute right-3 top-3 flex gap-1">
+        <button
+          type="button"
+          onClick={() => fit("iso")}
+          className="h-8 rounded-md border border-border bg-bg/90 px-2.5 text-xs text-muted hover:text-fg"
+        >
+          Iso
+        </button>
+        <button
+          type="button"
+          onClick={() => fit("top")}
+          className="h-8 rounded-md border border-border bg-bg/90 px-2.5 text-xs text-muted hover:text-fg"
+        >
+          Oben
+        </button>
+        <button
+          type="button"
+          onClick={() => fit(dim === "2d" ? "top" : "iso")}
+          className="h-8 rounded-md border border-border bg-bg/90 px-2.5 text-xs text-muted hover:text-fg"
+        >
+          Einpassen
+        </button>
+      </div>
     </div>
   );
-}
-
-function pathRing(
-  ctx: CanvasRenderingContext2D,
-  ring: Vec2[],
-  w: number,
-  h: number,
-  screen: (p: Vec2, w: number, h: number) => { x: number; y: number },
-) {
-  ctx.beginPath();
-  ring.forEach((p, i) => {
-    const s = screen(p, w, h);
-    if (i === 0) ctx.moveTo(s.x, s.y);
-    else ctx.lineTo(s.x, s.y);
-  });
-  ctx.closePath();
-}
-
-function drawSupport(ctx: CanvasRenderingContext2D, x: number, y: number, ux: boolean, uy: boolean) {
-  ctx.beginPath();
-  if (uy) {
-    ctx.moveTo(x, y);
-    ctx.lineTo(x - 6, y + 10);
-    ctx.lineTo(x + 6, y + 10);
-    ctx.closePath();
-    ctx.fill();
-  } else if (ux) {
-    ctx.moveTo(x, y);
-    ctx.lineTo(x - 10, y - 6);
-    ctx.lineTo(x - 10, y + 6);
-    ctx.closePath();
-    ctx.fill();
-  }
-}
-
-function drawArrow(ctx: CanvasRenderingContext2D, x: number, y: number, dx: number, dy: number) {
-  ctx.beginPath();
-  ctx.moveTo(x, y);
-  ctx.lineTo(x + dx, y + dy);
-  ctx.stroke();
-  const a = Math.atan2(dy, dx);
-  ctx.beginPath();
-  ctx.moveTo(x + dx, y + dy);
-  ctx.lineTo(x + dx - 7 * Math.cos(a - 0.4), y + dy - 7 * Math.sin(a - 0.4));
-  ctx.lineTo(x + dx - 7 * Math.cos(a + 0.4), y + dy - 7 * Math.sin(a + 0.4));
-  ctx.closePath();
-  ctx.fill();
-}
-
-function dimLabel(
-  ctx: CanvasRenderingContext2D,
-  a: Vec2,
-  b: Vec2,
-  w: number,
-  h: number,
-  screen: (p: Vec2, w: number, h: number) => { x: number; y: number },
-) {
-  const mid = screen({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, w, h);
-  ctx.fillStyle = INK;
-  ctx.font = "11px IBM Plex Mono, ui-monospace, monospace";
-  ctx.fillText(`${Math.abs(b.x - a.x).toFixed(0)} × ${Math.abs(b.y - a.y).toFixed(0)} mm`, mid.x + 8, mid.y - 8);
-  void DANGER;
 }

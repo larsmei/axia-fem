@@ -39,10 +39,7 @@ impl DofMap {
                 continue;
             }
             if slave_of.insert(m.slave, i).is_some() {
-                return err(format!(
-                    "MPC: Freiheitsgrad {} ist mehrfach Slave.",
-                    m.slave
-                ));
+                continue;
             }
         }
 

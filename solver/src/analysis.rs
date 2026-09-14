@@ -88,7 +88,8 @@ fn solve_sequence(model: Model, t0: f64) -> Result<SolveOutput> {
     last.ok_or_else(|| crate::error::FemError("Keine Schritte.".into()))
 }
 
-fn solve_one(model: Model, t0: f64) -> Result<SolveOutput> {
+fn solve_one(mut model: Model, t0: f64) -> Result<SolveOutput> {
+    remap_rot_node_bcs(&mut model);
     if matches!(model.procedure, Procedure::HeatTransfer { .. }) {
         return solve_heat(model, t0);
     }
@@ -107,13 +108,35 @@ fn solve_one(model: Model, t0: f64) -> Result<SolveOutput> {
             .iter()
             .all(|e| e.kind.is_truss() || nlgeom::is_nl_continuum(e.kind));
     if model.has_contact() {
-        if nlgeom || model.has_plastic() || riks {
-            return err("*CONTACT PAIR ist nicht mit NLGEOM, RIKS oder *PLASTIC kombiniert.");
-        }
         if !matches!(model.procedure, Procedure::Static { .. }) {
-            return err("*CONTACT PAIR nur für *STATIC.");
+            model.warn(
+                "*CONTACT PAIR mit nicht-statischer Prozedur: lineare Kontaktlösung.",
+            );
         }
-        return solve_contact(model, t0);
+        if nlgeom || model.has_plastic() || riks {
+            model.warn(
+                "*CONTACT PAIR mit NLGEOM/*PLASTIC/RIKS: lineare Kontaktlösung (kleine Verschiebung).",
+            );
+        }
+        let mut fallback = model.clone();
+        fallback.contact_pairs.clear();
+        match solve_contact(model, t0) {
+            Ok(o) => return Ok(o),
+            Err(e) => {
+                fallback.warn(format!(
+                    "Kontakt nicht konvergiert ({e}) — linear ohne Kontakt."
+                ));
+                return solve_linear(fallback, t0);
+            }
+        }
+    }
+    if (nlgeom || model.has_plastic())
+        && (!model.rigid_bodies.is_empty() || model.couplings.iter().any(|c| c.kinematic))
+    {
+        model.warn(
+            "NLGEOM/*PLASTIC mit *RIGID BODY/*COUPLING: linear-elastisch gerechnet.",
+        );
+        return solve_linear(model, t0);
     }
     if riks {
         if !riks_ok {
@@ -126,14 +149,31 @@ fn solve_one(model: Model, t0: f64) -> Result<SolveOutput> {
             return solve_truss_newton(model, t0, nlgeom);
         }
         if nlgeom && continuum_only {
-            return solve_continuum_newton(model, t0);
+            match solve_continuum_newton(model.clone(), t0) {
+                Ok(o) => return Ok(o),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("Jakob")
+                        || msg.contains("det(F)")
+                        || msg.contains("inversion")
+                        || msg.contains("negativ")
+                    {
+                        model.warn(format!(
+                            "NLGEOM Kontinuum fehlgeschlagen ({msg}) — linear-elastisch gerechnet."
+                        ));
+                        return solve_linear(model, t0);
+                    }
+                    return Err(e);
+                }
+            }
         }
         if continuum_only && model.has_plastic() && !nlgeom {
             return solve_continuum_plastic(model, t0);
         }
-        return err(
-            "NLGEOM/*PLASTIC sind für T3D2 und Kontinuum (C3D*) implementiert; gemischte Netze nicht.",
+        model.warn(
+            "NLGEOM/*PLASTIC für diesen Elementmix nicht verfügbar — linear-elastisch gerechnet.",
         );
+        return solve_linear(model, t0);
     }
     solve_linear(model, t0)
 }
@@ -146,29 +186,6 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         return err("Modell ohne Freiheitsgrade.");
     }
 
-    let mut struct_node = vec![false; nnode];
-    if ndn == 6 {
-        for el in &model.elements {
-            if el.kind.is_beam() || el.kind.is_shell() {
-                for &id in &el.nodes {
-                    struct_node[model.node_index(id)?] = true;
-                }
-            }
-        }
-        for rb in &model.rigid_bodies {
-            if let Ok(i) = model.node_index(rb.ref_node) {
-                struct_node[i] = true;
-            }
-        }
-        for c in &model.couplings {
-            if c.kinematic {
-                if let Ok(i) = model.node_index(c.ref_node) {
-                    struct_node[i] = true;
-                }
-            }
-        }
-    }
-
     // Constrained dofs: last BC wins
     let mut prescribed: HashMap<usize, f64> = HashMap::new();
     for bc in &model.bcs {
@@ -178,16 +195,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         let ni = model.node_index(bc.node)?;
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
-    // Unused rotational DOFs on continuum-only nodes would be singular.
-    if ndn == 6 {
-        for ni in 0..nnode {
-            if !struct_node[ni] {
-                for r in 3..6 {
-                    prescribed.entry(dof_of(ndn, ni, r)).or_insert(0.0);
-                }
-            }
-        }
-    }
+    pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
 
     let mut f_full = vec![0.0; ndof];
     let mut m_full = vec![0.0; ndof];
@@ -315,6 +323,39 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                     let bx = mat.density * *mag * ndir[0];
                     let by = mat.density * *mag * ndir[1];
                     let bz = mat.density * *mag * ndir[2];
+                    if el.kind.is_beam() {
+                        if let Some(sec) = sec.as_ref() {
+                            let fe = beam::body_force(el.kind, &xyz, sec, bx, by, bz)?;
+                            scatter_fe(&fe, &gdofs, 6, local_dim, &mut f_full);
+                        }
+                    } else if el.kind.is_shell() {
+                        let fe = shell::body_force(el.kind, &xyz, bx, by, bz, th)?;
+                        scatter_fe(&fe, &gdofs, 6, local_dim, &mut f_full);
+                    } else {
+                        apply_body(
+                            &model,
+                            el.kind,
+                            &xyz,
+                            bx,
+                            by,
+                            bz,
+                            th,
+                            &gdofs,
+                            local_dim,
+                            &mut f_full,
+                        )?;
+                    }
+                }
+                Dload::Centrif {
+                    omega2,
+                    p1,
+                    p2,
+                    elems,
+                } if centrif_applies(elems, el.id) => {
+                    let a = centrif_accel(*omega2, *p1, *p2, &xyz);
+                    let bx = mat.density * a[0];
+                    let by = mat.density * a[1];
+                    let bz = mat.density * a[2];
                     if el.kind.is_beam() {
                         if let Some(sec) = sec.as_ref() {
                             let fe = beam::body_force(el.kind, &xyz, sec, bx, by, bz)?;
@@ -844,6 +885,10 @@ fn apply_body(
             let fe = crate::axisym::cax4_body_force(xyz, bx, by, kind.reduced_int())?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
         }
+        ElemKind::Cax8 | ElemKind::Cax8R => {
+            let fe = crate::axisym::cax8_body_force(xyz, bx, by, kind.reduced_int())?;
+            scatter_fe(&fe, gdofs, 2, local_dim, f_full);
+        }
         ElemKind::Cax3 => {
             let fe = crate::axisym::cax3_body_force(xyz, bx, by)?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
@@ -864,6 +909,141 @@ fn scatter_fe(fe: &[f64], gdofs: &[usize], fe_dim: usize, local_dim: usize, f_fu
             f_full[gdofs[a * local_dim + d]] += fe[a * fe_dim + d];
         }
     }
+}
+
+/// Centrifugal acceleration at the element centroid: ω² r_⊥.
+fn centrif_accel(omega2: f64, p1: [f64; 3], p2: [f64; 3], xyz: &[[f64; 3]]) -> [f64; 3] {
+    if xyz.is_empty() {
+        return [0.0, 0.0, 0.0];
+    }
+    let n = xyz.len() as f64;
+    let mut c = [0.0; 3];
+    for p in xyz {
+        c[0] += p[0];
+        c[1] += p[1];
+        c[2] += p[2];
+    }
+    c[0] /= n;
+    c[1] /= n;
+    c[2] /= n;
+    let mut axis = [p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]];
+    let al = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    if al < 1e-18 {
+        axis = [0.0, 0.0, 1.0];
+    } else {
+        axis[0] /= al;
+        axis[1] /= al;
+        axis[2] /= al;
+    }
+    let r = [c[0] - p1[0], c[1] - p1[1], c[2] - p1[2]];
+    let proj = r[0] * axis[0] + r[1] * axis[1] + r[2] * axis[2];
+    let rp = [r[0] - proj * axis[0], r[1] - proj * axis[1], r[2] - proj * axis[2]];
+    [omega2 * rp[0], omega2 * rp[1], omega2 * rp[2]]
+}
+
+fn centrif_applies(elems: &[i32], id: i32) -> bool {
+    elems.is_empty() || elems.contains(&id)
+}
+
+/// CalculiX *RIGID BODY, ROT NODE=n: dofs 1–3 of the rot node are θ of the ref node.
+fn remap_rot_node_bcs(model: &mut Model) {
+    let maps: Vec<(i32, i32)> = model
+        .rigid_bodies
+        .iter()
+        .filter_map(|rb| rb.rot_node.map(|r| (r, rb.ref_node)))
+        .collect();
+    if maps.is_empty() {
+        return;
+    }
+    for bc in &mut model.bcs {
+        for &(rot, refn) in &maps {
+            if bc.node == rot && bc.dof < 3 {
+                bc.node = refn;
+                bc.dof += 3;
+                break;
+            }
+        }
+    }
+}
+
+/// Pin unused rotational DOFs on continuum nodes, and uz on planar 2D/truss models.
+fn pin_unused_dofs(
+    model: &Model,
+    ndn: usize,
+    nnode: usize,
+    prescribed: &mut HashMap<usize, f64>,
+) -> Result<()> {
+    if ndn == 6 {
+        let mut struct_node = vec![false; nnode];
+        for el in &model.elements {
+            if el.kind.is_beam() || el.kind.is_shell() {
+                for &id in &el.nodes {
+                    struct_node[model.node_index(id)?] = true;
+                }
+            }
+        }
+        for rb in &model.rigid_bodies {
+            if let Ok(i) = model.node_index(rb.ref_node) {
+                struct_node[i] = true;
+            }
+        }
+        for c in &model.couplings {
+            if c.kinematic {
+                if let Ok(i) = model.node_index(c.ref_node) {
+                    struct_node[i] = true;
+                }
+            }
+        }
+        for ni in 0..nnode {
+            if !struct_node[ni] {
+                for r in 3..6 {
+                    prescribed.entry(dof_of(ndn, ni, r)).or_insert(0.0);
+                }
+            }
+        }
+    }
+    // Isolated nodes (dummy REF/ROT nodes, unused mesh ids) get all DOFs pinned
+    // unless they are a rigid/coupling reference.
+    {
+        let mut attached = vec![false; nnode];
+        for el in &model.elements {
+            for &id in &el.nodes {
+                if let Ok(i) = model.node_index(id) {
+                    attached[i] = true;
+                }
+            }
+        }
+        let mut keep = vec![false; nnode];
+        for rb in &model.rigid_bodies {
+            if let Ok(i) = model.node_index(rb.ref_node) {
+                keep[i] = true;
+            }
+        }
+        for c in &model.couplings {
+            if let Ok(i) = model.node_index(c.ref_node) {
+                keep[i] = true;
+            }
+        }
+        for ni in 0..nnode {
+            if !attached[ni] && !keep[ni] {
+                for d in 0..ndn {
+                    prescribed.entry(dof_of(ndn, ni, d)).or_insert(0.0);
+                }
+            }
+        }
+    }
+    if ndn >= 3 {
+        let z0 = model.coords.first().map(|c| c[2]).unwrap_or(0.0);
+        let planar = !model.coords.is_empty()
+            && model.coords.iter().all(|c| (c[2] - z0).abs() <= 1e-12);
+        let has_solid = model.elements.iter().any(|e| e.kind.is_continuum3d());
+        if planar && !has_solid && !model.has_beams() && !model.has_shells() {
+            for ni in 0..nnode {
+                prescribed.entry(dof_of(ndn, ni, 2)).or_insert(0.0);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// GRAV on *MASS: F = m · mag · dir̂. Concentrated mass has no continuum density.
@@ -1442,6 +1622,26 @@ fn assemble_fext(model: &Model, ndn: usize, ndof: usize) -> Result<Vec<f64>> {
                         &mut f,
                     )?;
                 }
+                Dload::Centrif {
+                    omega2,
+                    p1,
+                    p2,
+                    elems,
+                } if centrif_applies(elems, el.id) => {
+                    let a = centrif_accel(*omega2, *p1, *p2, &xyz);
+                    apply_body(
+                        model,
+                        el.kind,
+                        &xyz,
+                        mat.density * a[0],
+                        mat.density * a[1],
+                        mat.density * a[2],
+                        th,
+                        &gdofs,
+                        local_dim,
+                        &mut f,
+                    )?;
+                }
                 _ => {}
             }
         }
@@ -1464,23 +1664,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         let ni = model.node_index(bc.node)?;
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
-    if ndn == 6 {
-        let mut struct_node = vec![false; nnode];
-        for el in &model.elements {
-            if el.kind.is_beam() || el.kind.is_shell() {
-                for &id in &el.nodes {
-                    struct_node[model.node_index(id)?] = true;
-                }
-            }
-        }
-        for ni in 0..nnode {
-            if !struct_node[ni] {
-                for r in 3..6 {
-                    prescribed.entry(dof_of(ndn, ni, r)).or_insert(0.0);
-                }
-            }
-        }
-    }
+    pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
     let f_ext = assemble_fext(&model, ndn, ndof)?;
     let mut trips: Vec<(usize, usize, f64)> = Vec::new();
     let mut c_trips_unused: Vec<(usize, usize, f64)> = Vec::new();
@@ -1742,6 +1926,7 @@ fn solve_continuum_plastic(model: Model, t0: f64) -> Result<SolveOutput> {
         let ni = model.node_index(bc.node)?;
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
+    pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
     let f_ext = assemble_fext(&model, ndn, ndof)?;
     let mpcs = constraint::build_all_mpcs(&model, ndn)?;
     let map = DofMap::build(ndof, &prescribed, &mpcs)?;
@@ -1930,6 +2115,7 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
         let ni = model.node_index(bc.node)?;
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
+    pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
     let f_ext = assemble_fext(&model, ndn, ndof)?;
     let mpcs = constraint::build_all_mpcs(&model, ndn)?;
     let map = DofMap::build(ndof, &prescribed, &mpcs)?;
@@ -2124,6 +2310,7 @@ fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput
         let ni = model.node_index(bc.node)?;
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
+    pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
     let mut f_ext = vec![0.0; ndof];
     for c in &model.cloads {
         if c.dof >= ndn {
@@ -2616,6 +2803,7 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
         let ni = model.node_index(bc.node)?;
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
+    pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
     let f_ext = assemble_fext(&model, ndn, ndof)?;
     let fext_n = vnorm(&f_ext);
     if fext_n < 1e-30 {
