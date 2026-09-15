@@ -650,7 +650,8 @@ pub fn element_nodal_stress(
             })?;
             beam::nodal_stress(kind, xyz, ue, e, nu, sec)
         }
-        ElemKind::Hex20 | ElemKind::Hex20R => quadratic::hex20_nodal_stress(xyz, ue, e, nu),
+        ElemKind::Hex20 => quadratic::hex20_nodal_stress(xyz, ue, e, nu, false),
+        ElemKind::Hex20R => quadratic::hex20_nodal_stress(xyz, ue, e, nu, true),
         ElemKind::Tet10 => quadratic::tet10_nodal_stress(xyz, ue, e, nu),
         ElemKind::Quad8Ps | ElemKind::Quad8Pe | ElemKind::Quad8RPs | ElemKind::Quad8RPe => {
             quadratic::quad8_nodal_stress(xyz, ue, e, nu, kind.is_plane_strain())

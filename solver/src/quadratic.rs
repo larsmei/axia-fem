@@ -140,22 +140,70 @@ pub fn hex20_stiffness(xyz: &[[f64; 3]], e: f64, nu: f64, reduced: bool) -> Resu
     Ok((ke, vol))
 }
 
-pub fn hex20_nodal_stress(xyz: &[[f64; 3]], ue: &[f64], e: f64, nu: f64) -> Result<Vec<[f64; 6]>> {
+pub fn hex20_nodal_stress(
+    xyz: &[[f64; 3]],
+    ue: &[f64],
+    e: f64,
+    nu: f64,
+    reduced: bool,
+) -> Result<Vec<[f64; 6]>> {
+    // Gauss-point stresses, then Lagrange extrapolation to the 20 nodes.
+    // Evaluating B at ξ=±1 on a serendipity hex wildly overshoots peaks
+    // (bolted-joint vmMax was ~2.4× CalculiX).
     let d = d_iso_3d(e, nu)?;
     let n = 60usize;
-    let mut out = vec![[0.0; 6]; 20];
-    for a in 0..20 {
-        let xi = HEX20_XI[a][0];
-        let eta = HEX20_XI[a][1];
-        let zeta = HEX20_XI[a][2];
+    let gps = hex_gauss(reduced);
+    let mut gsig = Vec::with_capacity(gps.len());
+    for &(xi, eta, zeta, _) in &gps {
         let (dndx, _, _) = hex20_dndx(xyz, xi, eta, zeta)?;
         let mut b = vec![0.0; 6 * n];
         fill_b3(&mut b, 20, &dndx);
         let s = sigma_from_b(&b, 6, n, &d, ue);
-        out[a].copy_from_slice(&s);
+        let mut six = [0.0; 6];
+        six.copy_from_slice(&s);
+        gsig.push(six);
+    }
+    let pts: Vec<f64> = if reduced {
+        vec![-G2, G2]
+    } else {
+        G3.to_vec()
+    };
+    let n1 = pts.len();
+    let mut out = vec![[0.0; 6]; 20];
+    for a in 0..20 {
+        let lx = lagrange1d(&pts, HEX20_XI[a][0]);
+        let ly = lagrange1d(&pts, HEX20_XI[a][1]);
+        let lz = lagrange1d(&pts, HEX20_XI[a][2]);
+        let mut idx = 0usize;
+        for i in 0..n1 {
+            for j in 0..n1 {
+                for k in 0..n1 {
+                    let w = lx[i] * ly[j] * lz[k];
+                    for c in 0..6 {
+                        out[a][c] += w * gsig[idx][c];
+                    }
+                    idx += 1;
+                }
+            }
+        }
     }
     Ok(out)
 }
+
+fn lagrange1d(pts: &[f64], x: f64) -> Vec<f64> {
+    let n = pts.len();
+    let mut w = vec![1.0; n];
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            w[i] *= (x - pts[j]) / (pts[i] - pts[j]);
+        }
+    }
+    w
+}
+
 
 pub fn hex20_body_force(xyz: &[[f64; 3]], bx: f64, by: f64, bz: f64, reduced: bool) -> Result<Vec<f64>> {
     let mut fe = vec![0.0; 60];

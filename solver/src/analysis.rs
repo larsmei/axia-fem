@@ -1514,6 +1514,7 @@ fn add_cloads(model: &Model, ndn: usize, t: f64, f: &mut [f64]) -> Result<()> {
         let s = if c.amplitude.is_empty() && pretension_dummy.contains(&c.node) {
             // Ramp pretension with step time so DIRECT cutbacks actually
             // reduce the bolt load. Named amplitudes still follow their cards.
+            // AMPLITUDE=STEP full-at-inc-1 stalls Newton on this bolted joint.
             (t / period).clamp(0.0, 1.0)
         } else {
             model.amp_value(&c.amplitude, t)
@@ -2033,6 +2034,127 @@ fn assemble_fext_u(
     Ok(f)
 }
 
+struct ElasticFields {
+    u: Vec<[f64; 3]>,
+    ur: Vec<[f64; 3]>,
+    rf: Vec<[f64; 3]>,
+    rm: Vec<[f64; 3]>,
+    stress: Vec<[f64; 6]>,
+    strain: Vec<[f64; 6]>,
+    vm: Vec<f64>,
+    stress_gp: Vec<(i32, usize, [f64; 6])>,
+}
+
+fn recover_elastic_fields(
+    model: &Model,
+    u_in: &[f64],
+    f_int: &[f64],
+    f_ext: &[f64],
+    ndn: usize,
+    nnode: usize,
+    ndof: usize,
+) -> Result<ElasticFields> {
+    let mut u_full = u_in.to_vec();
+    constraint::dofs_to_global(&mut u_full, ndn, &model.node_ids, &model.node_transform);
+    let mut rf_full = vec![0.0; ndof];
+    for d in 0..ndof {
+        let fi = f_int.get(d).copied().unwrap_or(0.0);
+        let fe = f_ext.get(d).copied().unwrap_or(0.0);
+        rf_full[d] = fi - fe;
+    }
+    constraint::dofs_to_global(&mut rf_full, ndn, &model.node_ids, &model.node_transform);
+
+    let mut u = vec![[0.0; 3]; nnode];
+    let mut ur = vec![[0.0; 3]; nnode];
+    let mut rf = vec![[0.0; 3]; nnode];
+    let rm = vec![[0.0; 3]; nnode];
+    for ni in 0..nnode {
+        for d in 0..3.min(ndn) {
+            u[ni][d] = u_full.get(dof_of(ndn, ni, d)).copied().unwrap_or(0.0);
+            rf[ni][d] = rf_full.get(dof_of(ndn, ni, d)).copied().unwrap_or(0.0);
+        }
+        if ndn >= 6 {
+            for d in 0..3 {
+                ur[ni][d] = u_full.get(dof_of(ndn, ni, 3 + d)).copied().unwrap_or(0.0);
+            }
+        }
+    }
+    let mut acc = vec![[0.0; 6]; nnode];
+    let mut cnt = vec![0.0; nnode];
+    let mut stress_gp = Vec::new();
+    for el in &model.elements {
+        if !el.kind.needs_material() {
+            continue;
+        }
+        let xyz = elem_xyz(model, &el.nodes)?;
+        let mat = model.material_for(el)?;
+        let nn = el.kind.nnodes();
+        let local_dim = el.kind.ndof_per_node();
+        let th = model.thickness_for(el);
+        let sec = if el.kind.is_beam() {
+            Some(model.beam_section_for(el)?)
+        } else {
+            None
+        };
+        let mut ue = vec![0.0; nn * local_dim];
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for d in 0..local_dim {
+                ue[a * local_dim + d] = u_full.get(dof_of(ndn, ni, d)).copied().unwrap_or(0.0);
+            }
+        }
+        let sn = element_nodal_stress(el.kind, &xyz, &ue, mat.e, mat.nu, sec.as_ref(), th)?;
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for c in 0..6 {
+                acc[ni][c] += sn[a][c];
+            }
+            cnt[ni] += 1.0;
+        }
+        let mut mean = [0.0; 6];
+        for a in 0..nn {
+            for c in 0..6 {
+                mean[c] += sn[a][c] / nn as f64;
+            }
+        }
+        stress_gp.push((el.id, 1usize, mean));
+    }
+    let mut stress = vec![[0.0; 6]; nnode];
+    let mut strain = vec![[0.0; 6]; nnode];
+    let mut vm = vec![0.0; nnode];
+    for i in 0..nnode {
+        if cnt[i] > 0.0 {
+            for c in 0..6 {
+                stress[i][c] = acc[i][c] / cnt[i];
+            }
+        }
+        vm[i] = von_mises(&stress[i]);
+        let mat = model.materials.values().next().copied().unwrap_or_default();
+        let e = mat.e;
+        let nu = mat.nu;
+        let tr = stress[i][0] + stress[i][1] + stress[i][2];
+        if e.abs() > 0.0 {
+            strain[i][0] = ((1.0 + nu) * stress[i][0] - nu * tr) / e;
+            strain[i][1] = ((1.0 + nu) * stress[i][1] - nu * tr) / e;
+            strain[i][2] = ((1.0 + nu) * stress[i][2] - nu * tr) / e;
+            let g2 = e / (1.0 + nu);
+            strain[i][3] = stress[i][3] / g2;
+            strain[i][4] = stress[i][4] / g2;
+            strain[i][5] = stress[i][5] / g2;
+        }
+    }
+    Ok(ElasticFields {
+        u,
+        ur,
+        rf,
+        rm,
+        stress,
+        strain,
+        vm,
+        stress_gp,
+    })
+}
+
 fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     let ndn = model.ndof_node();
     let nnode = model.node_ids.len();
@@ -2171,6 +2293,8 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         nl_eprint(&format!("pretension kdd(Schur)={kdd:.4e}"));
     }
     let ninc_run = ninc;
+    let mut frd_frames: Vec<frd::FrdFrame> = Vec::with_capacity(ninc_run);
+    let mut last_fields: Option<ElasticFields> = None;
     for inc in 1..=ninc_run {
         let t = (inc as f64 / ninc as f64) * model.static_period;
         f_ext = assemble_fext(&model, ndn, ndof, t)?;
@@ -2299,7 +2423,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                 break;
             }
             if it + 1 == newton_limit {
-                if pretension && residual < (5e-2 * fref).max(100.0) {
+                if pretension && residual < (5e-2 * fref).max(400.0) {
                     inc_ok = true;
                     break;
                 }
@@ -2397,6 +2521,19 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                 "Newton (Kontakt) konvergierte nicht (r={residual:.3e}, {n_active} aktiv, {iters} Iterationen)."
             ));
         }
+        let fields = recover_elastic_fields(
+            &model, &u_full, &last_fint, &f_ext, ndn, nnode, ndof,
+        )?;
+        frd_frames.push(frd::FrdFrame {
+            time: t,
+            iinc: inc as i32,
+            u: fields.u.clone(),
+            stress: fields.stress.clone(),
+            rf: fields.rf.clone(),
+            strain: fields.strain.clone(),
+            peeq: Vec::new(),
+        });
+        last_fields = Some(fields);
     }
     if solver.is_empty() {
         solver = "Newton (contact)".into();
@@ -2406,93 +2543,19 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         );
     }
 
-    constraint::dofs_to_global(&mut u_full, ndn, &model.node_ids, &model.node_transform);
-    let mut rf_full = vec![0.0; ndof];
-    for d in 0..ndof {
-        rf_full[d] = last_fint[d] - f_ext[d];
-    }
-    constraint::dofs_to_global(&mut rf_full, ndn, &model.node_ids, &model.node_transform);
-
-    let mut u = vec![[0.0; 3]; nnode];
-    let mut ur = vec![[0.0; 3]; nnode];
-    let mut rf = vec![[0.0; 3]; nnode];
-    let rm = vec![[0.0; 3]; nnode];
-    for ni in 0..nnode {
-        for d in 0..3.min(ndn) {
-            u[ni][d] = u_full[dof_of(ndn, ni, d)];
-            rf[ni][d] = rf_full[dof_of(ndn, ni, d)];
-        }
-        if ndn >= 6 {
-            for d in 0..3 {
-                ur[ni][d] = u_full[dof_of(ndn, ni, 3 + d)];
-            }
-        }
-    }
-    let mut acc = vec![[0.0; 6]; nnode];
-    let mut cnt = vec![0.0; nnode];
-    let mut stress_gp = Vec::new();
-    for el in &model.elements {
-        if !el.kind.needs_material() {
-            continue;
-        }
-        let xyz = elem_xyz(&model, &el.nodes)?;
-        let mat = model.material_for(el)?;
-        let nn = el.kind.nnodes();
-        let local_dim = el.kind.ndof_per_node();
-        let th = model.thickness_for(el);
-        let sec = if el.kind.is_beam() {
-            Some(model.beam_section_for(el)?)
-        } else {
-            None
-        };
-        let mut ue = vec![0.0; nn * local_dim];
-        for a in 0..nn {
-            let ni = model.node_index(el.nodes[a])?;
-            for d in 0..local_dim {
-                ue[a * local_dim + d] = u_full[dof_of(ndn, ni, d)];
-            }
-        }
-        let sn = element_nodal_stress(el.kind, &xyz, &ue, mat.e, mat.nu, sec.as_ref(), th)?;
-        for a in 0..nn {
-            let ni = model.node_index(el.nodes[a])?;
-            for c in 0..6 {
-                acc[ni][c] += sn[a][c];
-            }
-            cnt[ni] += 1.0;
-        }
-        let mut mean = [0.0; 6];
-        for a in 0..nn {
-            for c in 0..6 {
-                mean[c] += sn[a][c] / nn as f64;
-            }
-        }
-        stress_gp.push((el.id, 1usize, mean));
-    }
-    let mut stress = vec![[0.0; 6]; nnode];
-    let mut strain = vec![[0.0; 6]; nnode];
-    let mut vm = vec![0.0; nnode];
-    for i in 0..nnode {
-        if cnt[i] > 0.0 {
-            for c in 0..6 {
-                stress[i][c] = acc[i][c] / cnt[i];
-            }
-        }
-        vm[i] = von_mises(&stress[i]);
-        let mat = model.materials.values().next().copied().unwrap_or_default();
-        let e = mat.e;
-        let nu = mat.nu;
-        let tr = stress[i][0] + stress[i][1] + stress[i][2];
-        if e.abs() > 0.0 {
-            strain[i][0] = ((1.0 + nu) * stress[i][0] - nu * tr) / e;
-            strain[i][1] = ((1.0 + nu) * stress[i][1] - nu * tr) / e;
-            strain[i][2] = ((1.0 + nu) * stress[i][2] - nu * tr) / e;
-            let g2 = e / (1.0 + nu);
-            strain[i][3] = stress[i][3] / g2;
-            strain[i][4] = stress[i][4] / g2;
-            strain[i][5] = stress[i][5] / g2;
-        }
-    }
-    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &[]);
+    let ElasticFields {
+        u,
+        ur,
+        rf,
+        rm,
+        stress,
+        strain,
+        vm,
+        stress_gp,
+    } = last_fields.ok_or_else(|| {
+        crate::error::FemError("Kontakt: kein konvergiertes Inkrement.".into())
+    })?;
+    let frd_s = frd::write_frd_frames(&model, &frd_frames);
     let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
     let procedure = model.procedure.name().to_string();
     let nsteps = model.steps.len().max(1);
@@ -2519,7 +2582,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         buckles: vec![],
         nsteps,
         lambda: 1.0,
-        ninc: 1,
+        ninc: ninc_run,
         peeq: Vec::new(),
     })
 }

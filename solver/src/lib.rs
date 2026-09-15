@@ -4055,5 +4055,43 @@ SL, MA
             uy294 < -2e-4,
             "free corner 294 uy={uy294}, CalculiX ≈ -1.67e-3 m"
         );
+        assert_eq!(
+            out.ninc, 10,
+            "DIRECT 0.1,1 must report 10 increments, got {}",
+            out.ninc
+        );
+        let disp_n = out
+            .frd
+            .lines()
+            .filter(|l| l.starts_with("  100CL") && l.contains("DISP"))
+            .count();
+        let stress_n = out
+            .frd
+            .lines()
+            .filter(|l| l.starts_with("  100CL") && l.contains("STRESS"))
+            .count();
+        assert_eq!(disp_n, 10, "FRD must contain DISP for each increment");
+        assert_eq!(stress_n, 10, "FRD must contain STRESS for each increment");
+        assert!(
+            out.frd.contains(" 1.00000E-01") && out.frd.contains(" 1.00000E+00"),
+            "FRD increment times must include t=0.1 and t=1.0"
+        );
+        // CalculiX 2.22: vmMax ≈ 0.72 GPa at shank node 430. Node-evaluated
+        // C3D20 B-matrix used to report ~1.8 GPa.
+        let i430 = out.model.node_index(430).unwrap();
+        let vm430 = out.von_mises[i430];
+        assert!(
+            vm430 > 2.0e8 && vm430 < 1.2e9,
+            "node 430 von Mises={vm430} Pa (CalculiX ≈ 7.21e8)"
+        );
+        let vm_max = out
+            .von_mises
+            .iter()
+            .copied()
+            .fold(0.0_f64, |a, x| a.max(x));
+        assert!(
+            vm_max < 1.4e9,
+            "vmMax={vm_max} Pa should stay near CalculiX 0.72 GPa, not a 1.8 GPa spike"
+        );
     }
 }

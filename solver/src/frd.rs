@@ -114,6 +114,16 @@ fn frd_nodes(kind: ElemKind, nodes: &[i32]) -> Vec<i32> {
     }
 }
 
+pub struct FrdFrame {
+    pub time: f64,
+    pub iinc: i32,
+    pub u: Vec<[f64; 3]>,
+    pub stress: Vec<[f64; 6]>,
+    pub rf: Vec<[f64; 3]>,
+    pub strain: Vec<[f64; 6]>,
+    pub peeq: Vec<f64>,
+}
+
 pub fn write_frd(
     model: &Model,
     u: &[[f64; 3]],
@@ -122,6 +132,21 @@ pub fn write_frd(
     strain: &[[f64; 6]],
     peeq: &[f64],
 ) -> String {
+    write_frd_frames(
+        model,
+        &[FrdFrame {
+            time: 1.0,
+            iinc: 1,
+            u: u.to_vec(),
+            stress: stress.to_vec(),
+            rf: rf.to_vec(),
+            strain: strain.to_vec(),
+            peeq: peeq.to_vec(),
+        }],
+    )
+}
+
+pub fn write_frd_frames(model: &Model, frames: &[FrdFrame]) -> String {
     let mut o = String::with_capacity(1 << 16);
     let heading = if model.heading.is_empty() {
         "Axia"
@@ -134,7 +159,7 @@ pub fn write_frd(
     o.push_str("    1UTIME              18:00:00\n");
     o.push_str("    1UHOST              axia\n");
     o.push_str("    1UPGM               Axia FEM\n");
-    o.push_str("    1UVERSION           1.15.0\n");
+    o.push_str("    1UVERSION           1.16.0\n");
     o.push_str("    1UCODE              CalculiX-compatible Axia FEM\n");
 
     let nn = model.node_ids.len() as i32;
@@ -167,12 +192,42 @@ pub fn write_frd(
     }
     o.push_str(" -3\n");
 
-    o.push_str(&line_1pstep(1, 1, 1));
-
     let heat = matches!(model.procedure, Procedure::HeatTransfer { .. });
+    let frames: &[FrdFrame] = if frames.is_empty() {
+        // mesh-only fallback (should not happen)
+        &[]
+    } else {
+        frames
+    };
+    for (k, fr) in frames.iter().enumerate() {
+        let iinc = if fr.iinc > 0 { fr.iinc } else { (k as i32) + 1 };
+        o.push_str(&line_1pstep((k as i32) + 1, iinc, 1));
+        write_frame_datasets(&mut o, model, fr, nn, heat);
+    }
+    o.push_str(" 9999\n");
+    o
+}
+
+fn write_frame_datasets(
+    o: &mut String,
+    model: &Model,
+    fr: &FrdFrame,
+    nn: i32,
+    heat: bool,
+) {
+    let u = &fr.u;
+    let rf = &fr.rf;
+    let stress = &fr.stress;
+    let strain = &fr.strain;
+    let peeq = &fr.peeq;
+    let t = if fr.time.is_finite() && fr.time != 0.0 {
+        fr.time
+    } else {
+        1.0
+    };
     if heat || model.output_nt {
         write_result_block(
-            &mut o,
+            o,
             201,
             nn,
             "NDTEMP",
@@ -181,10 +236,11 @@ pub fn write_frd(
             false,
             &model.node_ids,
             &u.iter().map(|v| vec![v[0]]).collect::<Vec<_>>(),
+            t,
         );
         if model.output_rf {
             write_result_block(
-                &mut o,
+                o,
                 202,
                 nn,
                 "RFL",
@@ -193,12 +249,13 @@ pub fn write_frd(
                 false,
                 &model.node_ids,
                 &rf.iter().map(|v| vec![v[0]]).collect::<Vec<_>>(),
+                t,
             );
         }
     }
     if !heat && model.output_u {
         write_result_block(
-            &mut o,
+            o,
             101,
             nn,
             "DISP",
@@ -212,11 +269,12 @@ pub fn write_frd(
             true,
             &model.node_ids,
             &u.iter().map(|v| vec![v[0], v[1], v[2]]).collect::<Vec<_>>(),
+            t,
         );
     }
     if !heat && model.output_rf {
         write_result_block(
-            &mut o,
+            o,
             102,
             nn,
             "FORC",
@@ -232,11 +290,12 @@ pub fn write_frd(
             &rf.iter()
                 .map(|v| vec![v[0], v[1], v[2]])
                 .collect::<Vec<_>>(),
+            t,
         );
     }
     if !heat && model.output_s {
         write_result_block(
-            &mut o,
+            o,
             103,
             nn,
             "STRESS",
@@ -255,11 +314,12 @@ pub fn write_frd(
                 .iter()
                 .map(|v| vec![v[0], v[1], v[2], v[3], v[4], v[5]])
                 .collect::<Vec<_>>(),
+            t,
         );
     }
     if !heat && model.output_e {
         write_result_block(
-            &mut o,
+            o,
             104,
             nn,
             "TOSTRAIN",
@@ -278,11 +338,12 @@ pub fn write_frd(
                 .iter()
                 .map(|v| vec![v[0], v[1], v[2], v[3], v[4], v[5]])
                 .collect::<Vec<_>>(),
+            t,
         );
     }
     if !heat && peeq.len() == model.node_ids.len() && peeq.iter().any(|v| *v > 0.0) {
         write_result_block(
-            &mut o,
+            o,
             108,
             nn,
             "PEEQ",
@@ -291,10 +352,9 @@ pub fn write_frd(
             false,
             &model.node_ids,
             &peeq.iter().map(|v| vec![*v]).collect::<Vec<_>>(),
+            t,
         );
     }
-    o.push_str(" 9999\n");
-    o
 }
 
 fn write_result_block(
@@ -307,8 +367,9 @@ fn write_result_block(
     last_is_all: bool,
     ids: &[i32],
     values: &[Vec<f64>],
+    time: f64,
 ) {
-    o.push_str(&line_100cl(kode, 1.0, nout, name));
+    o.push_str(&line_100cl(kode, time, nout, name));
     o.push_str(&format!(" -4  {name:<8}{ncomp_header:5}    1\n"));
     for (i, (cname, typ, a, b)) in comps.iter().enumerate() {
         if last_is_all && i == comps.len() - 1 {
@@ -672,5 +733,67 @@ Flacheisen
         let n_mesh: i32 = c3[24..36].trim().parse().unwrap();
         let n_point = model.elements.iter().filter(|e| e.kind.is_point()).count() as i32;
         assert_eq!(n_mesh, model.elements.len() as i32 - n_point);
+    }
+
+    #[test]
+    fn write_frd_frames_emits_increment_times() {
+        let inp = r#"
+*HEADING
+inc
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+5, 0, 0, 1
+6, 1, 0, 1
+7, 1, 1, 1
+8, 0, 1, 1
+*ELEMENT, TYPE=C3D8
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=S
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=S
+*BOUNDARY
+1, 1, 3
+*STEP
+*STATIC, DIRECT
+0.1, 1
+*CLOAD
+2, 1, 1
+*END STEP
+"#;
+        let model = crate::inp::parse(inp).unwrap();
+        let n = model.node_ids.len();
+        let z3 = vec![[0.0; 3]; n];
+        let z6 = vec![[0.0; 6]; n];
+        let frames: Vec<FrdFrame> = (1..=10)
+            .map(|i| FrdFrame {
+                time: i as f64 * 0.1,
+                iinc: i,
+                u: z3.clone(),
+                stress: z6.clone(),
+                rf: z3.clone(),
+                strain: z6.clone(),
+                peeq: vec![],
+            })
+            .collect();
+        let frd = write_frd_frames(&model, &frames);
+        let psteps: Vec<_> = frd.lines().filter(|l| l.starts_with("    1PSTEP")).collect();
+        assert_eq!(psteps.len(), 10, "one 1PSTEP per increment");
+        let disp: Vec<_> = frd
+            .lines()
+            .filter(|l| l.starts_with("  100CL") && l.contains("DISP"))
+            .collect();
+        assert_eq!(disp.len(), 10);
+        assert!(disp[0].contains(" 1.00000E-01"), "{}", disp[0]);
+        assert!(disp[9].contains(" 1.00000E+00"), "{}", disp[9]);
+        let stress: Vec<_> = frd
+            .lines()
+            .filter(|l| l.starts_with("  100CL") && l.contains("STRESS"))
+            .collect();
+        assert_eq!(stress.len(), 10);
+        assert!(frd.contains(" 9999"));
     }
 }

@@ -455,9 +455,9 @@ fn add_pair(
         let p = (kn_n * (-hit.gap)).max(0.0);
         let mut ft = vscale(gt, kt);
         let ft_n = vnorm(ft);
-        // Until pretension has closed the joint, μp ≈ 0 and Coulomb slip
-        // drops the tangential tangent — the plates become a mechanism.
-        // Keep stick while pressure is still negligible.
+        // Stick while pretension is active: Coulomb slip on the overlap
+        // stalls Newton (r stuck, no line-search descent). Frictionless
+        // pairs (μ=0) already returned above, so the bolt head can slide.
         let can_slip = !pret && ft_n > mu * p + 1e-12 && gt_n > 1e-16;
         let slip = can_slip;
         if slip {
