@@ -655,14 +655,14 @@ fn probe_load(path: &std::path::Path) -> String {
 
 #[cfg(not(windows))]
 fn probe_load(path: &std::path::Path) -> String {
-    use std::ffi::CString;
+    use std::ffi::{c_char, CStr, CString};
     let Ok(c) = CString::new(path.to_string_lossy().as_bytes()) else {
         return format!("found {} (path not a C string)", path.display());
     };
     extern "C" {
-        fn dlopen(filename: *const i8, flags: i32) -> *mut std::ffi::c_void;
+        fn dlopen(filename: *const c_char, flags: i32) -> *mut std::ffi::c_void;
         fn dlclose(handle: *mut std::ffi::c_void) -> i32;
-        fn dlerror() -> *const i8;
+        fn dlerror() -> *const c_char;
     }
     const RTLD_NOW: i32 = 2;
     unsafe {
@@ -673,7 +673,7 @@ fn probe_load(path: &std::path::Path) -> String {
             let msg = if e.is_null() {
                 "unknown error".into()
             } else {
-                std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned()
+                CStr::from_ptr(e).to_string_lossy().into_owned()
             };
             format!("dlopen({}) failed: {msg}", path.display())
         } else {
