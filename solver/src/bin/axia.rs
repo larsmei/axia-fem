@@ -41,7 +41,7 @@ Axia FEM {VERSION} — FEM solver (CalculiX INP / FRD / DAT)
 
 Native sparse backends (see --solver):
     auto       PARDISO (MKL, then Panua) if present, else faer, else rivrs-sparse
-    mkl        Intel MKL PARDISO only
+    mkl        Intel MKL PARDISO only (needs libmkl_rt; prints setup hints if missing)
     panua      Panua PARDISO only
     pardiso    MKL or Panua, no pure-Rust fallback
     faer       supernodal Cholesky/LU — no extra libraries

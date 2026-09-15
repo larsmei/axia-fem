@@ -68,15 +68,19 @@ fn mkl_candidate_names() -> &'static [&'static str] {
 
 fn mkl_subdirs() -> &'static [&'static str] {
     &[
-        "", // DLLs dropped next to axia.exe / in cwd
+        "", // libraries dropped next to axia / in cwd
         "bin",
         "bin/intel64",
         "redist/intel64",
         "redist/intel64/msmpi",
         "lib",
+        "lib64",
         "lib/intel64",
+        "lib/intel64_lin",
         "lib/intel64_win",
         "lib/intel64/lib",
+        "lib/x86_64-linux-gnu",
+        "lib/aarch64-linux-gnu",
     ]
 }
 
@@ -100,29 +104,69 @@ fn path_prepend(dir: &std::path::Path) {
     unsafe {
         std::env::set_var(key, joined);
     }
+    // macOS SIP often strips DYLD_LIBRARY_PATH from children; fallback is honoured more often.
+    if cfg!(target_os = "macos") {
+        let fb = match std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH") {
+            Some(old) => {
+                let mut v = vec![std::ffi::OsString::from(&dir_s)];
+                v.push(old);
+                std::env::join_paths(v).unwrap_or_else(|_| std::ffi::OsString::from(&dir_s))
+            }
+            None => std::ffi::OsString::from(&dir_s),
+        };
+        unsafe {
+            std::env::set_var("DYLD_FALLBACK_LIBRARY_PATH", fb);
+        }
+    }
 }
 
-fn compiler_redist_dirs(mkl_bin: &std::path::Path) -> Vec<std::path::PathBuf> {
+fn compiler_redist_dirs(mkl_lib_or_bin: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let mut push = |p: std::path::PathBuf| {
         if p.is_dir() && !out.contains(&p) {
             out.push(p);
         }
     };
+    let extra = [
+        "compiler/latest/bin",
+        "compiler/latest/lib",
+        "compiler/latest/lib/intel64",
+        "compiler/latest/linux/compiler/lib/intel64_lin",
+        "compiler/latest/linux/lib",
+        "compiler/latest/mac/compiler/lib",
+        "compiler/latest/windows/redist/intel64_win",
+        "compiler/latest/windows/compiler/lib/intel64_win",
+    ];
     if let Some(oneapi) = std::env::var_os("ONEAPI_ROOT") {
         let root = std::path::PathBuf::from(oneapi);
-        push(root.join("compiler/latest/bin"));
-        push(root.join("compiler/latest/windows/redist/intel64_win"));
-        push(root.join("compiler/latest/lib"));
+        for e in extra {
+            push(root.join(e));
+        }
     }
-    if let Some(mkl_root) = mkl_bin.parent() {
-        push(mkl_root.join("../compiler/latest/bin"));
-        push(mkl_root.join("../../compiler/latest/bin"));
-        push(mkl_root.join("../../compiler/latest/windows/redist/intel64_win"));
-        push(mkl_root.join("../compiler/latest/lib"));
+    // $MKLROOT is …/mkl/latest → ../../compiler/latest/…
+    let mut walk = mkl_lib_or_bin.to_path_buf();
+    for _ in 0..5 {
+        for e in extra {
+            push(walk.join(e));
+        }
+        if let Some(p) = walk.parent() {
+            walk = p.to_path_buf();
+        } else {
+            break;
+        }
     }
+    push(std::path::PathBuf::from(
+        "/opt/intel/oneapi/compiler/latest/lib",
+    ));
+    push(std::path::PathBuf::from(
+        "/opt/intel/oneapi/compiler/latest/linux/compiler/lib/intel64_lin",
+    ));
+    push(std::path::PathBuf::from(
+        "/opt/intel/oneapi/compiler/latest/mac/compiler/lib",
+    ));
     out
 }
+
 
 fn exe_dir() -> Option<std::path::PathBuf> {
     std::env::current_exe()
@@ -135,14 +179,30 @@ pub(crate) fn find_mkl_runtime() -> Option<std::path::PathBuf> {
     find_mkl_runtime_in(mkl_search_roots())
 }
 
+fn push_root(roots: &mut Vec<std::path::PathBuf>, p: std::path::PathBuf) {
+    if !p.as_os_str().is_empty() && !roots.contains(&p) {
+        roots.push(p);
+    }
+}
+
+fn env_path_dirs(key: &str) -> Vec<std::path::PathBuf> {
+    match std::env::var_os(key) {
+        Some(v) => std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect(),
+        None => Vec::new(),
+    }
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}
+
 fn mkl_search_roots() -> Vec<std::path::PathBuf> {
     let mut roots = Vec::new();
-    let mut push = |p: std::path::PathBuf| {
-        if !p.as_os_str().is_empty() && !roots.contains(&p) {
-            roots.push(p);
-        }
-    };
-    // Portable Windows layout: mkl_rt.dll next to axia.exe, even if cwd differs.
+    let mut push = |p: std::path::PathBuf| push_root(&mut roots, p);
+
+    // Portable layout: libraries next to the axia binary, even if cwd differs.
     if let Some(d) = exe_dir() {
         push(d);
     }
@@ -166,10 +226,90 @@ fn mkl_search_roots() -> Vec<std::path::PathBuf> {
         let root = std::path::PathBuf::from(p);
         push(root.join("mkl/latest"));
         push(root.join("mkl"));
+        push(root.clone());
+    }
+    if let Some(p) = std::env::var_os("CONDA_PREFIX") {
+        let root = std::path::PathBuf::from(p);
+        push(root.join("lib"));
+        push(root.join("Library/bin")); // conda-forge on Windows
+        push(root);
     }
     push(std::path::PathBuf::from("/opt/intel/oneapi/mkl/latest"));
+    push(std::path::PathBuf::from("/opt/intel/oneapi/mkl"));
     push(std::path::PathBuf::from("/opt/intel/mkl"));
+    push(std::path::PathBuf::from("/opt/intel/oneapi"));
+    if let Some(h) = home_dir() {
+        push(h.join("intel/oneapi/mkl/latest"));
+        push(h.join("intel/oneapi/mkl"));
+        push(h.join("intel/mkl"));
+        push(h.join("lib"));
+    }
+    // Distro / Homebrew / multiarch
+    push(std::path::PathBuf::from("/usr/lib"));
+    push(std::path::PathBuf::from("/usr/lib64"));
+    push(std::path::PathBuf::from("/usr/local/lib"));
+    push(std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu"));
+    push(std::path::PathBuf::from("/usr/lib/aarch64-linux-gnu"));
+    push(std::path::PathBuf::from("/usr/local/lib/intel64"));
+    // macOS Intel oneAPI 2023 (last macOS MKL) + Homebrew kegs
+    push(std::path::PathBuf::from("/opt/intel/oneapi/mkl/latest/lib"));
+    push(std::path::PathBuf::from("/usr/local/opt/mkl"));
+    push(std::path::PathBuf::from("/usr/local/opt/intel-mkl"));
+    push(std::path::PathBuf::from("/usr/local/opt/oneapi-mkl"));
+    push(std::path::PathBuf::from("/opt/homebrew/opt/mkl"));
+    push(std::path::PathBuf::from("/opt/homebrew/opt/intel-mkl"));
+    push(std::path::PathBuf::from("/opt/homebrew/lib"));
+    push(std::path::PathBuf::from("/usr/local/Cellar"));
+
+    for key in [
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "LIBRARY_PATH",
+        "PATH",
+    ] {
+        for d in env_path_dirs(key) {
+            push(d);
+        }
+    }
+    for d in ldconfig_lib_dirs() {
+        push(d);
+    }
     roots
+}
+
+fn ldconfig_lib_dirs() -> Vec<std::path::PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for bin in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
+        let Ok(o) = std::process::Command::new(bin).arg("-p").output() else {
+            continue;
+        };
+        if !o.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&o.stdout);
+        for line in text.lines() {
+            let l = line.trim();
+            if !(l.contains("mkl_rt") || l.contains("libpardiso")) {
+                continue;
+            }
+            if let Some(idx) = l.rfind(" => ") {
+                let p = std::path::PathBuf::from(l[idx + 4..].trim());
+                if let Some(d) = p.parent() {
+                    if d.is_dir() && !out.contains(&d.to_path_buf()) {
+                        out.push(d.to_path_buf());
+                    }
+                }
+            }
+        }
+        if !out.is_empty() {
+            break;
+        }
+    }
+    out
 }
 
 fn find_mkl_runtime_in(roots: Vec<std::path::PathBuf>) -> Option<std::path::PathBuf> {
@@ -189,26 +329,9 @@ fn find_mkl_runtime_in(roots: Vec<std::path::PathBuf>) -> Option<std::path::Path
             }
         }
     }
-    // PATH / LD_LIBRARY_PATH entries (setvars.bat puts MKL bin here)
-    let path_key = if cfg!(target_os = "windows") {
-        "PATH"
-    } else if cfg!(target_os = "macos") {
-        "DYLD_LIBRARY_PATH"
-    } else {
-        "LD_LIBRARY_PATH"
-    };
-    if let Some(paths) = std::env::var_os(path_key) {
-        for dir in std::env::split_paths(&paths) {
-            for name in names {
-                let p = dir.join(name);
-                if p.is_file() {
-                    return Some(p);
-                }
-            }
-        }
-    }
     None
 }
+
 
 fn is_mkl_companion_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
@@ -224,6 +347,10 @@ fn is_mkl_companion_name(name: &str) -> bool {
         || n.contains("iomp")
         || n.contains("libomp")
         || n.starts_with("libiomp")
+        || n.starts_with("libintlc")
+        || n.starts_with("libimf")
+        || n.starts_with("libsvml")
+        || n.starts_with("libirng")
 }
 
 fn is_lib_filename(name: &str) -> bool {
@@ -331,7 +458,7 @@ fn mkl_source_dirs(rt_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 fn infer_mklroot(rt: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut dir = rt.parent()?.to_path_buf();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let name = dir
             .file_name()
             .and_then(|s| s.to_str())
@@ -339,14 +466,27 @@ fn infer_mklroot(rt: &std::path::Path) -> Option<std::path::PathBuf> {
             .to_ascii_lowercase();
         if matches!(
             name.as_str(),
-            "bin" | "lib" | "intel64" | "intel64_win" | "redist"
+            "bin"
+                | "lib"
+                | "lib64"
+                | "intel64"
+                | "intel64_win"
+                | "intel64_lin"
+                | "redist"
+                | "x86_64-linux-gnu"
+                | "aarch64-linux-gnu"
         ) {
             dir = dir.parent()?.to_path_buf();
             continue;
         }
         break;
     }
-    Some(dir)
+    let s = dir.to_string_lossy().to_ascii_lowercase();
+    if s.contains("mkl") || s.contains("oneapi") {
+        Some(dir)
+    } else {
+        None
+    }
 }
 
 fn choose_mkl_threading(dirs: &[std::path::PathBuf]) -> &'static str {
@@ -375,11 +515,11 @@ fn populate_bundle(dest: &std::path::Path, sources: &[std::path::PathBuf]) {
         if src == dest {
             continue;
         }
-        copy_mkl_companions(src, dest);
+        install_mkl_companions(src, dest);
     }
 }
 
-fn copy_mkl_companions(from: &std::path::Path, to: &std::path::Path) {
+fn install_mkl_companions(from: &std::path::Path, to: &std::path::Path) {
     let Ok(rd) = std::fs::read_dir(from) else {
         return;
     };
@@ -393,41 +533,82 @@ fn copy_mkl_companions(from: &std::path::Path, to: &std::path::Path) {
         if dest.exists() {
             continue;
         }
-        let _ = std::fs::copy(e.path(), dest);
+        unix_link_or_copy(&e.path(), &dest);
     }
 }
 
-/// `mkl_rt` loads `mkl_core` / threading layers from **its own directory**.
-/// The wrapper name (`libmkl_rt.dll`) must therefore live next to those files,
-/// not in a temp folder that only contains the shim.
-fn ensure_wrapper_named_library(found: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
-    let expected = wrapper_lib_name();
-    let name = found.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    if name.eq_ignore_ascii_case(expected) {
-        return Ok(found.to_path_buf());
-    }
-    let dir = found.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "MKL path has no parent")
-    })?;
-    let sibling = dir.join(expected);
-    if sibling.exists() {
-        return Ok(sibling);
-    }
-    if std::fs::hard_link(found, &sibling).is_ok() || std::fs::copy(found, &sibling).is_ok() {
-        return Ok(sibling);
-    }
-    // Directory not writable (typical: Program Files). Copy the runtime plus
-    // every MKL/OpenMP DLL from that folder into a user-writable shim dir so
-    // mkl_rt can still find mkl_core.2.dll next to itself.
-    let shim_dir = std::env::temp_dir().join("axia-mkl-shim");
-    std::fs::create_dir_all(&shim_dir)?;
-    let dest = shim_dir.join(expected);
-    if !dest.exists() {
-        if std::fs::hard_link(found, &dest).is_err() {
-            std::fs::copy(found, &dest)?;
+/// On Unix prefer a symlink so `$ORIGIN` / `@loader_path` of the *target*
+/// still resolve next to the real Intel tree. Fall back to copy.
+fn unix_link_or_copy(from: &std::path::Path, to: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        if std::os::unix::fs::symlink(from, to).is_ok() {
+            return;
         }
     }
-    copy_mkl_companions(dir, &shim_dir);
+    if std::fs::hard_link(from, to).is_ok() {
+        return;
+    }
+    let _ = std::fs::copy(from, to);
+}
+
+fn unix_is_executable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        // pardiso-wrapper uses `which` → rustix access(EXEC_OK). Distro .so/.dylib
+        // are typically mode 644 and invisible to that search.
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+fn chmod_executable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        let mut p = meta.permissions();
+        p.set_mode(p.mode() | 0o755);
+        std::fs::set_permissions(path, p).is_ok() && unix_is_executable(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+fn make_which_visible(path: &std::path::Path) -> bool {
+    unix_is_executable(path) || chmod_executable(path)
+}
+
+/// `mkl_rt` loads `mkl_core` / threading layers from **its own directory**.
+/// The wrapper name (`libmkl_rt.dll` / `libmkl_rt.so` / `libmkl_rt.dylib`)
+/// must therefore live next to those files, not in a temp folder that only
+/// contains the shim.
+///
+/// `pardiso-wrapper` 0.1.2 finds the library with the `which` crate, which on
+/// Unix requires the **execute bit**. Debian/Homebrew installs are 644, so a
+/// correctly named file in `$MKLROOT/lib` is still invisible. Axia then copies
+/// `mkl_rt` into a user-writable shim, `chmod 755`, and symlinks companions
+/// so `$ORIGIN` still works.
+fn ensure_wrapper_named_library(found: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let dest = ensure_named_library(found, wrapper_lib_name())?;
+    if let (Some(src_dir), Some(dst_dir)) = (found.parent(), dest.parent()) {
+        if src_dir != dst_dir {
+            install_mkl_companions(src_dir, dst_dir);
+        }
+    }
     Ok(dest)
 }
 
@@ -474,34 +655,78 @@ fn probe_load(path: &std::path::Path) -> String {
 
 #[cfg(not(windows))]
 fn probe_load(path: &std::path::Path) -> String {
-    format!("found {}", path.display())
+    use std::ffi::CString;
+    let Ok(c) = CString::new(path.to_string_lossy().as_bytes()) else {
+        return format!("found {} (path not a C string)", path.display());
+    };
+    extern "C" {
+        fn dlopen(filename: *const i8, flags: i32) -> *mut std::ffi::c_void;
+        fn dlclose(handle: *mut std::ffi::c_void) -> i32;
+        fn dlerror() -> *const i8;
+    }
+    const RTLD_NOW: i32 = 2;
+    unsafe {
+        dlerror();
+        let h = dlopen(c.as_ptr(), RTLD_NOW);
+        if h.is_null() {
+            let e = dlerror();
+            let msg = if e.is_null() {
+                "unknown error".into()
+            } else {
+                std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned()
+            };
+            format!("dlopen({}) failed: {msg}", path.display())
+        } else {
+            dlclose(h);
+            format!("dlopen({}) ok", path.display())
+        }
+    }
 }
 
 fn mkl_dir_inventory(dir: &std::path::Path) -> String {
-    let markers = [
-        "mkl_rt.dll",
-        "mkl_rt.2.dll",
-        "libmkl_rt.dll",
-        "mkl_core.2.dll",
-        "mkl_core.dll",
-        "mkl_intel_thread.2.dll",
-        "mkl_sequential.2.dll",
-        "mkl_avx2.2.dll",
-        "mkl_def.2.dll",
-        "libiomp5md.dll",
-        "libmkl_rt.so",
-        "libmkl_core.so.2",
-        "libmkl_avx2.so.2",
-        "libmkl_def.so.2",
-        "libiomp5.so",
-    ];
+    let markers: &[&str] = if cfg!(target_os = "windows") {
+        &[
+            "mkl_rt.dll",
+            "mkl_rt.2.dll",
+            "libmkl_rt.dll",
+            "mkl_core.2.dll",
+            "mkl_core.dll",
+            "mkl_intel_thread.2.dll",
+            "mkl_sequential.2.dll",
+            "mkl_avx2.2.dll",
+            "mkl_def.2.dll",
+            "libiomp5md.dll",
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            "libmkl_rt.dylib",
+            "libmkl_core.dylib",
+            "libmkl_intel_thread.dylib",
+            "libmkl_sequential.dylib",
+            "libmkl_avx2.dylib",
+            "libmkl_def.dylib",
+            "libiomp5.dylib",
+        ]
+    } else {
+        &[
+            "libmkl_rt.so",
+            "libmkl_rt.so.2",
+            "libmkl_core.so.2",
+            "libmkl_core.so",
+            "libmkl_intel_thread.so.2",
+            "libmkl_sequential.so.2",
+            "libmkl_avx2.so.2",
+            "libmkl_def.so.2",
+            "libiomp5.so",
+        ]
+    };
     let mut have = Vec::new();
     let mut missing = Vec::new();
     for n in markers {
         if dir.join(n).is_file() {
-            have.push(n);
-        } else if n.ends_with(".dll") {
-            missing.push(n);
+            have.push(*n);
+        } else {
+            missing.push(*n);
         }
     }
     format!(
@@ -531,9 +756,91 @@ fn peek_mkl_diag() -> Option<String> {
 }
 
 fn mkl_fail_detail() -> String {
-    mkl_blocked_msg()
+    let mut s = mkl_blocked_msg()
         .or_else(peek_mkl_diag)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Some(h) = take_setup_hint() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&h);
+    }
+    s
+}
+
+fn take_setup_hint() -> Option<String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static EMITTED: AtomicBool = AtomicBool::new(false);
+    if EMITTED.swap(true, Ordering::Relaxed) {
+        None
+    } else {
+        Some(mkl_setup_hint())
+    }
+}
+
+/// Printed whenever PARDISO/MKL is requested but cannot be loaded.
+pub(crate) fn mkl_setup_hint() -> String {
+    let expected = wrapper_lib_name();
+    let mut s = String::new();
+    if cfg!(not(target_arch = "x86_64")) {
+        s.push_str(
+            "Intel MKL PARDISO gibt es nur für x86_64 (nicht Apple Silicon / ARM64). \
+             Nutze --solver faer (reines Rust, bereits eingebaut).\n\
+             Panua PARDISO: libpardiso auf LD_LIBRARY_PATH / DYLD_LIBRARY_PATH oder PARDISO_PATH.\n",
+        );
+        return s;
+    }
+    s.push_str(&format!(
+        "PARDISO/MKL nicht geladen (gesucht: {expected} neben axia, in cwd, \
+         $MKLROOT, $ONEAPI_ROOT, $CONDA_PREFIX, /opt/intel/oneapi/mkl/latest, \
+         /usr/lib, Homebrew, ldconfig, LD_LIBRARY_PATH / DYLD_LIBRARY_PATH).\n\
+         Einrichtung:\n"
+    ));
+    if cfg!(target_os = "macos") {
+        s.push_str(
+            "  macOS (nur Intel x86_64; Apple Silicon: kein MKL):\n\
+             Intel hat oneMKL für macOS nach 2023.2 eingestellt.\n\
+             Falls 2023 noch installiert:\n\
+               source /opt/intel/oneapi/setvars.sh\n\
+               export MKLROOT=/opt/intel/oneapi/mkl/latest\n\
+             oder die dylibs neben das axia-Binary legen:\n\
+               libmkl_rt.dylib, libmkl_core.dylib,\n\
+               libmkl_sequential.dylib (oder libmkl_intel_thread.dylib + libiomp5.dylib),\n\
+               libmkl_avx2.dylib oder libmkl_def.dylib\n\
+             Download (Archiv): https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-download.html\n",
+        );
+    } else if cfg!(target_os = "windows") {
+        s.push_str(
+            "  Windows: oneAPI MKL installieren, dann\n\
+               call \"%ProgramFiles(x86)%\\Intel\\oneAPI\\setvars.bat\"\n\
+             oder den Inhalt von %MKLROOT%\\bin plus libiomp5md.dll neben axia.exe kopieren.\n",
+        );
+    } else {
+        s.push_str(
+            "  Linux:\n\
+             1) Intel oneAPI MKL (empfohlen):\n\
+                  https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-download.html\n\
+                  source /opt/intel/oneapi/setvars.sh\n\
+                oder:\n\
+                  export MKLROOT=/opt/intel/oneapi/mkl/latest\n\
+                  export LD_LIBRARY_PATH=$MKLROOT/lib:${LD_LIBRARY_PATH}\n\
+             2) Distro-Paket:\n\
+                  Debian/Ubuntu:  sudo apt install intel-mkl   # oder intel-oneapi-mkl\n\
+                  Fedora/RHEL:    sudo dnf install intel-oneapi-mkl\n\
+                  Arch:           pacman -S intel-oneapi-mkl\n\
+             3) Conda:  conda install -c https://software.repos.intel.com/python/conda mkl\n\
+             4) Bibliotheken neben das axia-Binary legen:\n\
+                  libmkl_rt.so, libmkl_core.so.2,\n\
+                  libmkl_sequential.so.2 (oder libmkl_intel_thread.so.2 + libiomp5.so),\n\
+                  libmkl_avx2.so.2 oder libmkl_def.so.2\n",
+        );
+    }
+    s.push_str(
+        "  Panua PARDISO: libpardiso.so / .dylib aus https://panua.ch/pardiso/ entpacken\n\
+           und PARDISO_PATH oder LD_LIBRARY_PATH auf den Ordner setzen.\n\
+         Ohne MKL:  axia --solver faer    (supernodales LLT/LU, keine extra Library)\n",
+    );
+    s
 }
 
 fn set_mkl_blocked(s: impl Into<String>) {
@@ -592,10 +899,8 @@ fn prepare_mkl_env_inner() {
             .map(|d| d.display().to_string())
             .unwrap_or_else(|| "<exe dir unknown>".into());
         set_mkl_diag(format!(
-            "no mkl_rt / libmkl_rt next to axia.exe ({where_}), in cwd, $MKLROOT or PATH. \
-             Wrapper looks for {expected}. Intel ships mkl_rt.dll. \
-             Copy the MKL redist (mkl_rt.dll, mkl_core.2.dll, mkl_intel_thread.2.dll, \
-             mkl_avx2.2.dll or mkl_def.2.dll, libiomp5md.dll) next to axia.exe, or set MKLROOT."
+            "kein {expected} neben axia ({where_}), in cwd, $MKLROOT, $ONEAPI_ROOT, \
+             $CONDA_PREFIX, /opt/intel/oneapi/mkl/latest, /usr/lib, Homebrew oder ldconfig."
         ));
         return;
     };
@@ -641,12 +946,21 @@ fn prepare_mkl_env_inner() {
             let missing = missing_mkl_parts(&scan);
             let inv = mkl_dir_inventory(&dir);
             if !missing.is_empty() {
-                set_mkl_blocked(format!(
+                // Windows: incomplete redist aborts the process (Intel FATAL ERROR).
+                // Unix: kernel libs may live in another ldconfig dir — try anyway
+                // and let the child-process probe catch a real abort().
+                let msg = format!(
                     "MKL redist incomplete (missing {}). Calling it would abort the process \
                      with no Axia error (Intel MKL FATAL ERROR / OpenMP). {inv}. \
-                     Copy the full MKL bin redist next to axia.exe, or use --solver faer.",
+                     Install the full oneMKL package, copy the runtime next to axia, \
+                     or use --solver faer.",
                     missing.join(", ")
-                ));
+                );
+                if cfg!(windows) {
+                    set_mkl_blocked(msg);
+                } else {
+                    set_mkl_diag(msg);
+                }
             } else {
                 set_mkl_diag(format!(
                     "runtime {} → {} for wrapper; {inv}",
@@ -925,6 +1239,9 @@ fn try_mkl_inprocess(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>
                     .map(|p| probe_load(&p))
                     .unwrap_or_default();
                 eprintln!("axia: Intel MKL PARDISO did not load. {extra} {probe}");
+                if let Some(h) = take_setup_hint() {
+                    eprintln!("{h}");
+                }
             }
         }
     }
@@ -933,6 +1250,9 @@ fn try_mkl_inprocess(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>
         let _ = (csr, rhs);
         if complain {
             eprintln!("axia: Intel MKL PARDISO is only available on x86_64.");
+            if let Some(h) = take_setup_hint() {
+                eprintln!("{h}");
+            }
         }
     }
     None
@@ -994,7 +1314,173 @@ pub(crate) fn mkl_self_test() -> i32 {
     }
 }
 
+fn panua_lib_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "libpardiso.dll"
+    } else if cfg!(target_os = "macos") {
+        "libpardiso.dylib"
+    } else {
+        "libpardiso.so"
+    }
+}
+
+fn panua_candidate_names() -> &'static [&'static str] {
+    &[
+        "libpardiso.so",
+        "libpardiso.dylib",
+        "libpardiso.dll",
+        "libpardiso.so.7",
+        "libpardiso.so.6",
+        "libpardiso.so.8",
+        "pardiso.dll",
+        "libpardiso600.so",
+        "libpardiso700.so",
+    ]
+}
+
+fn find_panua_library() -> Option<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    let mut push = |p: std::path::PathBuf| push_root(&mut roots, p);
+    if let Some(d) = exe_dir() {
+        push(d);
+    }
+    if let Ok(d) = std::env::current_dir() {
+        push(d);
+    }
+    if let Some(p) = std::env::var_os("PARDISO_PATH") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.is_file() {
+            if let Some(d) = pb.parent() {
+                push(d.to_path_buf());
+            }
+        } else {
+            push(pb);
+        }
+    }
+    push(std::path::PathBuf::from("/usr/lib"));
+    push(std::path::PathBuf::from("/usr/lib64"));
+    push(std::path::PathBuf::from("/usr/local/lib"));
+    push(std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu"));
+    push(std::path::PathBuf::from("/opt/pardiso"));
+    push(std::path::PathBuf::from("/opt/panua"));
+    if let Some(h) = home_dir() {
+        push(h.join("pardiso"));
+        push(h.join("panua"));
+        push(h.join("lib"));
+    }
+    for key in [
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "LIBRARY_PATH",
+        "PATH",
+    ] {
+        for d in env_path_dirs(key) {
+            push(d);
+        }
+    }
+    for d in ldconfig_lib_dirs() {
+        push(d);
+    }
+    let names = panua_candidate_names();
+    for root in &roots {
+        for name in names {
+            let p = root.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn prepare_panua_env() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if let Some(d) = exe_dir() {
+            path_prepend(&d);
+        }
+        if let Ok(d) = std::env::current_dir() {
+            path_prepend(&d);
+        }
+        let Some(found) = find_panua_library() else {
+            return;
+        };
+        let Ok(shim) = ensure_named_library(found.as_path(), panua_lib_name()) else {
+            if let Some(dir) = found.parent() {
+                path_prepend(dir);
+                unsafe {
+                    std::env::set_var("PARDISO_PATH", dir);
+                }
+            }
+            return;
+        };
+        if let Some(dir) = shim.parent() {
+            path_prepend(dir);
+            unsafe {
+                std::env::set_var("PARDISO_PATH", dir);
+            }
+        }
+    });
+}
+
+fn ensure_named_library(
+    found: &std::path::Path,
+    expected: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    // Reuse the MKL shim logic by temporarily walking the same steps with a
+    // custom expected name. Duplicated from ensure_wrapper_named_library so
+    // Panua gets the Unix +x treatment too.
+    let name = found.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let dir = found.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "library path has no parent")
+    })?;
+    let candidate = if name.eq_ignore_ascii_case(expected) {
+        found.to_path_buf()
+    } else {
+        let sibling = dir.join(expected);
+        if sibling.exists() {
+            sibling
+        } else if std::fs::hard_link(found, &sibling).is_ok()
+            || std::fs::copy(found, &sibling).is_ok()
+        {
+            sibling
+        } else {
+            std::path::PathBuf::new()
+        }
+    };
+    if !candidate.as_os_str().is_empty() && make_which_visible(&candidate) {
+        return Ok(candidate);
+    }
+    let shim_dir = std::env::temp_dir().join(if expected.contains("mkl") {
+        "axia-mkl-shim"
+    } else {
+        "axia-pardiso-shim"
+    });
+    std::fs::create_dir_all(&shim_dir)?;
+    let dest = shim_dir.join(expected);
+    if dest.exists() {
+        let src_len = std::fs::metadata(found).map(|m| m.len()).unwrap_or(0);
+        let dst_len = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        if src_len != dst_len || !unix_is_executable(&dest) {
+            let _ = std::fs::remove_file(&dest);
+        }
+    }
+    if !dest.exists() {
+        std::fs::copy(found, &dest)?;
+    }
+    if !make_which_visible(&dest) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("could not chmod +x {}", dest.display()),
+        ));
+    }
+    Ok(dest)
+}
+
 fn try_panua(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>, String)> {
+    prepare_panua_env();
     if pardiso_wrapper::PanuaPardisoSolver::is_available() {
         let name = "PARDISO (Panua)";
         match run_pardiso::<pardiso_wrapper::PanuaPardisoSolver>(csr, rhs) {
@@ -1006,7 +1492,11 @@ fn try_panua(csr: &Csr, rhs: &[f64], complain: bool) -> Option<(Vec<f64>, String
             }
         }
     } else if complain {
-        eprintln!("axia: Panua PARDISO is not on the loader path.");
+        eprintln!(
+            "axia: Panua PARDISO is not on the loader path (libpardiso.so / .dylib / .dll). \
+             Set PARDISO_PATH to the folder, or put the library next to axia. \
+             Download: https://panua.ch/pardiso/"
+        );
     }
     None
 }
@@ -1153,7 +1643,10 @@ pub fn solve_kff(csr: &Csr, rhs: &[f64]) -> Result<SparseSolve> {
                     announce(&name);
                     Ok(pack(csr, rhs, x, &name))
                 }
-                None => err("PARDISO (Panua) nicht verfügbar oder Faktorisierung fehlgeschlagen."),
+                None => err(format!(
+                    "PARDISO (Panua) nicht verfügbar oder Faktorisierung fehlgeschlagen.\n{}",
+                    mkl_setup_hint()
+                )),
             };
         }
         SparseBackend::Pardiso => {
@@ -1161,7 +1654,10 @@ pub fn solve_kff(csr: &Csr, rhs: &[f64]) -> Result<SparseSolve> {
                 announce(&name);
                 return Ok(pack(csr, rhs, x, &name));
             }
-            return err("PARDISO (MKL/Panua) nicht verfügbar.");
+            return err(format!(
+                "PARDISO (MKL/Panua) nicht verfügbar.\n{}",
+                mkl_fail_detail()
+            ));
         }
         SparseBackend::Faer => {
             let (x, name) = try_faer(csr, rhs)?;
@@ -1278,6 +1774,9 @@ mod tests {
         assert!(is_mkl_companion_name("mkl_intel_thread.2.dll"));
         assert!(is_mkl_companion_name("libiomp5md.dll"));
         assert!(is_mkl_companion_name("libmkl_rt.so.2"));
+        assert!(is_mkl_companion_name("libiomp5.so"));
+        assert!(is_mkl_companion_name("libintlc.so.5"));
+        assert!(is_mkl_companion_name("libmkl_rt.dylib"));
         assert!(is_mkl_companion_name("mkl_avx2.2.dll"));
         assert!(is_mkl_companion_name("mkl_def.2.dll"));
         assert!(!is_mkl_companion_name("axia.exe"));
@@ -1358,6 +1857,68 @@ mod tests {
         let so = lib.join("libmkl_rt.so.2");
         std::fs::write(&so, b"fake-mkl").unwrap();
         let found = find_mkl_runtime_in(vec![tmp.clone()]).expect("should find libmkl_rt.so.2");
+        assert_eq!(found, so);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn infer_mklroot_ignores_distro_multiarch() {
+        let rt = std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu/libmkl_rt.so");
+        assert!(infer_mklroot(&rt).is_none());
+    }
+
+    #[test]
+    fn setup_hint_mentions_faer_and_oneapi() {
+        let h = mkl_setup_hint();
+        assert!(h.contains("faer"), "{h}");
+        if cfg!(target_arch = "x86_64") {
+            assert!(
+                h.contains("oneAPI") || h.contains("oneapi") || h.contains("MKLROOT"),
+                "{h}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_644_library_becomes_executable_for_which() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!(
+            "axia-mkl-chmod-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let so = tmp.join(wrapper_lib_name());
+        std::fs::write(&so, b"fake-mkl").unwrap();
+        let mut p = std::fs::metadata(&so).unwrap().permissions();
+        p.set_mode(0o644);
+        std::fs::set_permissions(&so, p).unwrap();
+        assert!(!unix_is_executable(&so));
+        let shim = ensure_wrapper_named_library(&so).unwrap();
+        assert_eq!(shim.file_name().unwrap(), wrapper_lib_name());
+        assert!(unix_is_executable(&shim), "which needs +x on {}", shim.display());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn finds_so_in_debian_multiarch_layout() {
+        let tmp = std::env::temp_dir().join(format!(
+            "axia-mkl-deb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let lib = tmp.join("lib/x86_64-linux-gnu");
+        std::fs::create_dir_all(&lib).unwrap();
+        let so = lib.join("libmkl_rt.so");
+        std::fs::write(&so, b"fake-mkl").unwrap();
+        let found = find_mkl_runtime_in(vec![tmp.clone()]).expect("debian multiarch");
         assert_eq!(found, so);
         let _ = std::fs::remove_dir_all(&tmp);
     }
