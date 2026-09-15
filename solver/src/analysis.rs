@@ -2246,7 +2246,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     };
     let pretension = !model.pretensions.is_empty();
     let newton_limit = if pretension {
-        model.max_newton.max(80)
+        model.max_newton.max(120)
     } else {
         model.max_newton.max(1)
     };
@@ -2277,7 +2277,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     // Jacobi was ~10× too stiff and under-opened the bolt vs CalculiX.
     let mut kdd = 6e8_f64;
     if pretension && dummy_ind >= 0 {
-        if let Ok(cf0) = contact::assemble(&model, ndn, ndof, &u_full) {
+        if let Ok(cf0) = contact::assemble_stick(&model, ndn, ndof, &u_full, true) {
             let mut all = trips.clone();
             all.extend(cf0.trips);
             let (ff0, _) = map.reduce_inc(&all, &vec![0.0; ndof]);
@@ -2388,9 +2388,14 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
             return err("Kontakt: keine freien DOF.");
         }
         let mut inc_ok = false;
+        // Increment 1: plates coincident, p≈0 ⇒ μp/g_char is a mechanism.
+        // Full stick settles the pressure; later incs use kt ~ μp.
+        let full_stick = pretension && inc == 1;
+        let mut r_prev = f64::MAX;
+        let mut stall = 0usize;
         for it in 0..newton_limit {
             iters += 1;
-            let cf = contact::assemble(&model, ndn, ndof, &u_full)?;
+            let cf = contact::assemble_stick(&model, ndn, ndof, &u_full, full_stick)?;
             n_active = cf.n_active;
             n_slip = cf.n_slip;
             let mut ku = vec![0.0; ndof];
@@ -2418,12 +2423,27 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                 ));
             }
             let pret_ok = pretension && fref > 0.0 && residual < (1e-3 * fref).max(5.0);
+            let r_accept = (5e-2 * fref).max(500.0);
             if residual < model.newton_tol * (1.0 + fref) || pret_ok {
                 inc_ok = true;
                 break;
             }
+            if pretension && residual < r_accept {
+                if (r_prev - residual).abs() <= 1e-3 * residual.max(1.0) {
+                    stall += 1;
+                    if stall >= 8 {
+                        inc_ok = true;
+                        break;
+                    }
+                } else {
+                    stall = 0;
+                }
+            } else {
+                stall = 0;
+            }
+            r_prev = residual;
             if it + 1 == newton_limit {
-                if pretension && residual < (5e-2 * fref).max(400.0) {
+                if pretension && residual < r_accept {
                     inc_ok = true;
                     break;
                 }
@@ -2458,7 +2478,15 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                 let mut best_a = 0.0_f64;
                 let mut best_u = u0.clone();
                 let mut best_r = r0;
-                for &a in &[1.0, 0.5, 0.25, 0.125, 0.05, 0.01] {
+                let umax1 = u0
+                    .iter()
+                    .zip(du_full.iter())
+                    .fold(0.0_f64, |m, (&u, &d)| m.max((u + d).abs()));
+                let mut alphas = vec![1.0, 0.5, 0.25, 0.125, 0.05, 0.01, 1e-3, 1e-4];
+                if umax1 > fly {
+                    alphas.push((0.4 * fly / umax1).max(1e-6));
+                }
+                for &a in &alphas {
                     for i in 0..ndof {
                         u_full[i] = u0[i] + a * du_full[i];
                     }
@@ -2470,7 +2498,8 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                     if umax > fly {
                         continue;
                     }
-                    let Ok(cf_ls) = contact::assemble(&model, ndn, ndof, &u_full) else {
+                    let Ok(cf_ls) = contact::assemble_stick(&model, ndn, ndof, &u_full, full_stick)
+                    else {
                         continue;
                     };
                     if n_active > 8 && cf_ls.n_active == 0 {

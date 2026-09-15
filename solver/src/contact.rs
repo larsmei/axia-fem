@@ -287,12 +287,35 @@ pub fn assemble(
     ndof: usize,
     u: &[f64],
 ) -> Result<ContactForce> {
+    assemble_stick(model, ndn, ndof, u, false)
+}
+
+/// `full_stick`: pretension Coulomb uses kt=kn (needed while p≈0 on
+/// increment 1). Later increments use smooth Coulomb ft = τ gt / s,
+/// τ = μp + kt_floor g_char.
+pub fn assemble_stick(
+    model: &Model,
+    ndn: usize,
+    ndof: usize,
+    u: &[f64],
+    full_stick: bool,
+) -> Result<ContactForce> {
     let mut trips = Vec::new();
     let mut f = vec![0.0; ndof];
     let mut n_active = 0usize;
     let mut n_slip = 0usize;
     for pair in &model.contact_pairs {
-        add_pair(model, pair, ndn, u, &mut trips, &mut f, &mut n_active, &mut n_slip)?;
+        add_pair(
+            model,
+            pair,
+            ndn,
+            u,
+            &mut trips,
+            &mut f,
+            &mut n_active,
+            &mut n_slip,
+            full_stick,
+        )?;
     }
     Ok(ContactForce {
         trips,
@@ -311,6 +334,7 @@ fn add_pair(
     f: &mut [f64],
     n_active: &mut usize,
     n_slip: &mut usize,
+    full_stick: bool,
 ) -> Result<()> {
     let kn = pair.kn.max(0.0);
     if kn == 0.0 {
@@ -378,7 +402,11 @@ fn add_pair(
         // Mecway slopes (2e14 Pa/m) so a micron of overclosure is not giganewtons.
         let kn_n = (kn * hit.area.min(1.0).max(1e-30)).min(1e10);
         let kt = kn_n;
-        let kt_stab = if pret { kn_n } else { 0.0 };
+        // Pretension stabilizer only for frictional approaching contacts
+        // (0 < gap ≤ 1e-9). Frictionless pairs (SI_19 bolt head, μ=0) stay
+        // tangentially free, matching CalculiX *FRICTION-less SURFACE
+        // INTERACTION. Gluing the head with kn was the remaining sandwich.
+        let kt_stab = if pret && mu > 0.0 { kn_n } else { 0.0 };
         let fnod = -kn_n * hit.gap;
         for (a, &id) in nodes.iter().enumerate() {
             let ni = model.node_index(id)?;
@@ -453,29 +481,40 @@ fn add_pair(
         gt = vsub(gt, vscale(hit.n, gn));
         let gt_n = vnorm(gt);
         let p = (kn_n * (-hit.gap)).max(0.0);
-        let mut ft = vscale(gt, kt);
-        let ft_n = vnorm(ft);
-        // Stick while pretension is active: Coulomb slip on the overlap
-        // stalls Newton (r stuck, no line-search descent). Frictionless
-        // pairs (μ=0) already returned above, so the bolt head can slide.
-        let can_slip = !pret && ft_n > mu * p + 1e-12 && gt_n > 1e-16;
-        let slip = can_slip;
-        if slip {
-            *n_slip += 1;
-            let tdir = vscale(gt, 1.0 / gt_n);
-            ft = vscale(tdir, mu * p);
-        }
+        // Smooth Coulomb during pretension (after increment 1):
+        //   ft = τ gt / sqrt(|gt|² + g_char²),  τ = μp + kt_floor g_char
+        // Saturates at τ (far field can slide) with a consistent SPD
+        // tangent (τ/s)(I − t⊗t). g_char is 10 μm so the floor force is
+        // ~100 N/node while the origin slope stays 1e-3 kn for Newton.
+        const G_CHAR: f64 = 1e-5; // 10 μm; floor force ~100 N/node at kn_n=1e10
+        const KT_FLOOR_FRAC: f64 = 1e-3;
+        let (ft, k_t, tdir, slip) = if pret && !full_stick {
+            let tau = mu * p + KT_FLOOR_FRAC * kn_n * G_CHAR;
+            let s = (gt_n * gt_n + G_CHAR * G_CHAR).sqrt();
+            let t = vscale(gt, 1.0 / s);
+            if gt_n > G_CHAR {
+                *n_slip += 1;
+            }
+            (vscale(t, tau), tau / s, t, true)
+        } else {
+            let mut ft = vscale(gt, kt);
+            let ft_n = vnorm(ft);
+            let can_slip = !pret && ft_n > mu * p + 1e-12 && gt_n > 1e-16;
+            if can_slip {
+                *n_slip += 1;
+                let tdir = vscale(gt, 1.0 / gt_n);
+                ft = vscale(tdir, mu * p);
+                (ft, mu * p / gt_n, tdir, true)
+            } else {
+                (ft, kt, [0.0; 3], false)
+            }
+        };
         for (a, &id) in nodes.iter().enumerate() {
             let ni = model.node_index(id)?;
             for d in 0..3 {
                 f[dof_t(ndn, ni, d)] += w[a] * (-ft[d]);
             }
         }
-        let (k_t, tdir) = if slip {
-            (mu * p / gt_n, vscale(gt, 1.0 / gt_n))
-        } else {
-            (kt, [0.0; 3])
-        };
         for (a, &ida) in nodes.iter().enumerate() {
             let ia = model.node_index(ida)?;
             for (b, &idb) in nodes.iter().enumerate() {
