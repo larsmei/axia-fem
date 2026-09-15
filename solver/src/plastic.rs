@@ -316,7 +316,17 @@ pub fn continuum_plastic(
     nu: f64,
     curve: &[(f64, f64)],
     hist: &[GpHist],
-) -> Result<PlasticElem> {
+) -> Result<(PlasticElem, Vec<GpHist>)> {
+    let gp = gps(kind, xyz0)?;
+    let nn = kind.nnodes();
+    let nd = 3 * nn;
+    let mut ke = vec![0.0; nd * nd];
+    let mut fe = vec![0.0; nd];
+    let mut acc_s = [0.0; 6];
+    let mut acc_e = [0.0; 6];
+    let mut acc_p = 0.0;
+    let mut vol = 0.0;
+    let mut hist_out = Vec::with_capacity(gp.len());
     let gp = gps(kind, xyz0)?;
     let nn = kind.nnodes();
     let nd = 3 * nn;
@@ -353,20 +363,24 @@ pub fn continuum_plastic(
         }
         acc_p += hnew.alpha * *w;
         vol += *w;
+        hist_out.push(hnew);
     }
     let inv = if vol.abs() > 0.0 { 1.0 / vol } else { 0.0 };
     for i in 0..6 {
         acc_s[i] *= inv;
         acc_e[i] *= inv;
     }
-    Ok(PlasticElem {
-        ke,
-        fe,
-        stress: acc_s,
-        strain: acc_e,
-        peeq: acc_p * inv,
-        ngp: gp.len(),
-    })
+    Ok((
+        PlasticElem {
+            ke,
+            fe,
+            stress: acc_s,
+            strain: acc_e,
+            peeq: acc_p * inv,
+            ngp: gp.len(),
+        },
+        hist_out,
+    ))
 }
 
 /// Total-Lagrange J2: Green–Lagrange strain, PK2 from the small-strain return map,
@@ -379,7 +393,7 @@ pub fn continuum_plastic_nl(
     nu: f64,
     curve: &[(f64, f64)],
     hist: &[GpHist],
-) -> Result<crate::nlgeom::NlElem> {
+) -> Result<(crate::nlgeom::NlElem, Vec<GpHist>)> {
     let gp = gps(kind, xyz0)?;
     let nn = kind.nnodes();
     let nd = 3 * nn;
@@ -389,6 +403,7 @@ pub fn continuum_plastic_nl(
     let mut acc_e = [0.0; 6];
     let mut acc_p = 0.0;
     let mut vol = 0.0;
+    let mut hist_out = Vec::with_capacity(gp.len());
     for (g, (dndx, w)) in gp.iter().enumerate() {
         let f = crate::nlgeom::deformation_gradient(dndx, ue, nn);
         let egl = crate::nlgeom::green_lagrange(&f);
@@ -420,20 +435,24 @@ pub fn continuum_plastic_nl(
         }
         acc_p += hnew.alpha * *w;
         vol += *w;
+        hist_out.push(hnew);
     }
     let inv = if vol.abs() > 0.0 { 1.0 / vol } else { 0.0 };
     for i in 0..6 {
         acc_s[i] *= inv;
         acc_e[i] *= inv;
     }
-    Ok(crate::nlgeom::NlElem {
-        ke,
-        fe,
-        vol,
-        cauchy: acc_s,
-        gl: acc_e,
-        peeq: acc_p * inv,
-    })
+    Ok((
+        crate::nlgeom::NlElem {
+            ke,
+            fe,
+            vol,
+            cauchy: acc_s,
+            gl: acc_e,
+            peeq: acc_p * inv,
+        },
+        hist_out,
+    ))
 }
 
 #[cfg(test)]

@@ -794,6 +794,9 @@ pub struct AnalysisStep {
     pub n_cload: usize,
     pub n_dload: usize,
     pub n_bc: usize,
+    pub cload_from: usize,
+    pub dload_from: usize,
+    pub bc_from: usize,
 }
 
 impl Default for Procedure {
@@ -878,6 +881,14 @@ pub struct Model {
     pub output_e: bool,
     pub output_nt: bool,
     pub warnings: Vec<String>,
+    /// Displacements at the start of the current step (multi-step NLGEOM).
+    pub u_start: Vec<[f64; 3]>,
+    /// Nodal load vector at the start of the current step (ndof = 3*nnode).
+    pub f_start: Vec<f64>,
+    /// `*STEP, INC=` cap on static increments (CalculiX default 100).
+    pub max_inc: usize,
+    pub static_dt: f64,
+    pub static_period: f64,
 }
 
 impl Model {
@@ -933,6 +944,11 @@ impl Model {
             output_e: false,
             output_nt: false,
             warnings: Vec::new(),
+            u_start: Vec::new(),
+            f_start: Vec::new(),
+            max_inc: 100,
+            static_dt: 1.0,
+            static_period: 1.0,
         }
     }
 

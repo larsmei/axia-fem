@@ -74,15 +74,29 @@ fn solve_sequence(model: Model, t0: f64) -> Result<SolveOutput> {
     let all_d = model.dloads.clone();
     let all_b = model.bcs.clone();
     let mut last: Option<SolveOutput> = None;
+    let mut u_prev: Vec<[f64; 3]> = Vec::new();
+    let mut f_prev: Vec<f64> = Vec::new();
     for st in &steps {
         let mut m = model.clone();
         m.procedure = st.procedure.clone();
-        m.cloads = all_c[..st.n_cload.min(all_c.len())].to_vec();
-        m.dloads = all_d[..st.n_dload.min(all_d.len())].to_vec();
-        m.bcs = all_b[..st.n_bc.min(all_b.len())].to_vec();
+        let c0 = st.cload_from.min(all_c.len());
+        let c1 = st.n_cload.min(all_c.len()).max(c0);
+        let d0 = st.dload_from.min(all_d.len());
+        let d1 = st.n_dload.min(all_d.len()).max(d0);
+        let b0 = st.bc_from.min(all_b.len());
+        let b1 = st.n_bc.min(all_b.len()).max(b0);
+        m.cloads = all_c[c0..c1].to_vec();
+        m.dloads = all_d[d0..d1].to_vec();
+        m.bcs = all_b[b0..b1].to_vec();
         m.steps.clear();
+        m.u_start = u_prev.clone();
+        m.f_start = f_prev.clone();
         let mut out = solve_one(m, t0)?;
         out.nsteps = steps.len();
+        u_prev = out.u.clone();
+        let ndn = out.model.ndof_node();
+        let ndof = ndn * out.model.node_ids.len();
+        f_prev = assemble_fext(&out.model, ndn, ndof, out.model.static_period)?;
         last = Some(out);
     }
     last.ok_or_else(|| crate::error::FemError("Keine Schritte.".into()))
@@ -149,23 +163,7 @@ fn solve_one(mut model: Model, t0: f64) -> Result<SolveOutput> {
             return solve_truss_newton(model, t0, nlgeom);
         }
         if nlgeom && continuum_only {
-            match solve_continuum_newton(model.clone(), t0) {
-                Ok(o) => return Ok(o),
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("Jakob")
-                        || msg.contains("det(F)")
-                        || msg.contains("inversion")
-                        || msg.contains("negativ")
-                    {
-                        model.warn(format!(
-                            "NLGEOM Kontinuum fehlgeschlagen ({msg}) — linear-elastisch gerechnet."
-                        ));
-                        return solve_linear(model, t0);
-                    }
-                    return Err(e);
-                }
-            }
+            return solve_continuum_newton(model, t0);
         }
         if continuum_only && model.has_plastic() && !nlgeom {
             return solve_continuum_plastic(model, t0);
@@ -413,7 +411,12 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         }
     }
 
-    add_cloads(&model, ndn, 0.0, &mut f_full)?;
+    let t_cload = if matches!(model.procedure, Procedure::Dynamic { .. }) {
+        0.0
+    } else {
+        model.static_period.max(0.0)
+    };
+    add_cloads(&model, ndn, t_cload, &mut f_full)?;
     let f_dload = {
         let mut f = f_full.clone();
         // strip t=0 cloads so Dynamic can re-apply with amplitude(t)
@@ -1559,9 +1562,9 @@ fn now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
-fn assemble_fext(model: &Model, ndn: usize, ndof: usize) -> Result<Vec<f64>> {
+fn assemble_fext(model: &Model, ndn: usize, ndof: usize, t: f64) -> Result<Vec<f64>> {
     let mut f = vec![0.0; ndof];
-    add_cloads(model, ndn, 0.0, &mut f)?;
+    add_cloads(model, ndn, t, &mut f)?;
     for el in &model.elements {
         if el.kind.is_special() {
             apply_point_grav(model, el, ndn, &mut f)?;
@@ -1665,7 +1668,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
     pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
-    let f_ext = assemble_fext(&model, ndn, ndof)?;
+    let f_ext = assemble_fext(&model, ndn, ndof, model.static_period)?;
     let mut trips: Vec<(usize, usize, f64)> = Vec::new();
     let mut c_trips_unused: Vec<(usize, usize, f64)> = Vec::new();
     let mut m_unused = vec![0.0; ndof];
@@ -1927,7 +1930,7 @@ fn solve_continuum_plastic(model: Model, t0: f64) -> Result<SolveOutput> {
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
     pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
-    let f_ext = assemble_fext(&model, ndn, ndof)?;
+    let f_ext = assemble_fext(&model, ndn, ndof, model.static_period)?;
     let mpcs = constraint::build_all_mpcs(&model, ndn)?;
     let map = DofMap::build(ndof, &prescribed, &mpcs)?;
     let nfree = map.n_ind;
@@ -1947,6 +1950,7 @@ fn solve_continuum_plastic(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut last_strain: Vec<[f64; 6]> = vec![[0.0; 6]; model.elements.len()];
     let mut last_peeq: Vec<f64> = vec![0.0; model.elements.len()];
     let mut last_fint = vec![0.0; ndof];
+    let mut trial_hist = hist.clone();
     for it in 0..model.max_newton.max(1) {
         iters = it + 1;
         let mut trips: Vec<(usize, usize, f64)> = Vec::new();
@@ -1966,7 +1970,7 @@ fn solve_continuum_plastic(model: Model, t0: f64) -> Result<SolveOutput> {
             }
             let mat = model.material_for(el)?;
             let curve = model.plastic_for(el).unwrap_or(&[]);
-            let pl = plastic::continuum_plastic(
+            let (pl, hnew) = plastic::continuum_plastic(
                 el.kind,
                 &xyz0,
                 &ue,
@@ -1978,6 +1982,7 @@ fn solve_continuum_plastic(model: Model, t0: f64) -> Result<SolveOutput> {
             last_stress[ei] = pl.stress;
             last_strain[ei] = pl.strain;
             last_peeq[ei] = pl.peeq;
+            trial_hist[ei] = hnew;
             let nd = gdofs.len();
             for i in 0..nd {
                 f_int[gdofs[i]] += pl.fe[i];
@@ -2116,14 +2121,40 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
     pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
-    let f_ext = assemble_fext(&model, ndn, ndof)?;
+    let f_ext = assemble_fext(&model, ndn, ndof, model.static_period)?;
     let mpcs = constraint::build_all_mpcs(&model, ndn)?;
     let map = DofMap::build(ndof, &prescribed, &mpcs)?;
     let nfree = map.n_ind;
     if nfree == 0 {
         return err("NLGEOM Kontinuum: keine freien DOF.");
     }
-    let mut u_full = map.u0.clone();
+    let mut u_full = vec![0.0; ndof];
+    if model.u_start.len() == nnode {
+        for ni in 0..nnode {
+            for d in 0..3 {
+                u_full[dof_of(ndn, ni, d)] = model.u_start[ni][d];
+            }
+        }
+    }
+    let u_begin = u_full.clone();
+    let mut u_target = u_begin.clone();
+    for (&dof, &val) in &prescribed {
+        u_target[dof] = val;
+    }
+    let f_tgt = f_ext;
+    let f_0 = if model.f_start.len() == ndof {
+        model.f_start.clone()
+    } else {
+        vec![0.0; ndof]
+    };
+    let ninc = match model.procedure {
+        Procedure::Static {
+            increments,
+            riks: false,
+            ..
+        } => increments.max(1),
+        _ => 1,
+    };
     let mut solver = String::new();
     let mut residual = 0.0;
     let mut iters = 0usize;
@@ -2131,92 +2162,194 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut last_gl: Vec<[f64; 6]> = vec![[0.0; 6]; model.elements.len()];
     let mut last_peeq: Vec<f64> = vec![0.0; model.elements.len()];
     let mut last_fint = vec![0.0; ndof];
-    let hist: Vec<Vec<plastic::GpHist>> = model
+    let mut hist: Vec<Vec<plastic::GpHist>> = model
         .elements
         .iter()
         .map(|el| vec![plastic::GpHist::default(); plastic::n_gauss(el.kind).max(1)])
         .collect();
-    for it in 0..model.max_newton.max(1) {
-        iters = it + 1;
-        let mut trips: Vec<(usize, usize, f64)> = Vec::new();
-        let mut f_int = vec![0.0; ndof];
-        for (ei, el) in model.elements.iter().enumerate() {
-            let xyz0 = elem_xyz(&model, &el.nodes)?;
-            let nn = el.kind.nnodes();
-            let mut ue = vec![0.0; 3 * nn];
-            let mut gdofs = Vec::with_capacity(3 * nn);
-            for a in 0..nn {
-                let ni = model.node_index(el.nodes[a])?;
-                for d in 0..3 {
-                    let g = dof_of(ndn, ni, d);
-                    gdofs.push(g);
-                    ue[3 * a + d] = u_full[g];
+    let mut lam = 0.0;
+    let mut dt = 1.0 / ninc as f64;
+    let mut ninc_done = 0usize;
+    let mut retries = 0usize;
+    let mut f_now = f_0.clone();
+
+    while lam < 1.0 - 1e-14 {
+        let lam_new = (lam + dt).min(1.0);
+        let mut u_try = u_full.clone();
+        for (&dof, _) in &prescribed {
+            u_try[dof] = (1.0 - lam_new) * u_begin[dof] + lam_new * u_target[dof];
+        }
+        let mut f_inc = vec![0.0; ndof];
+        for i in 0..ndof {
+            f_inc[i] = (1.0 - lam_new) * f_0[i] + lam_new * f_tgt[i];
+        }
+        let mut trial_hist = hist.clone();
+        let mut inc_ok = false;
+        let mut inc_err: Option<String> = None;
+        let mut u_work = u_try;
+        for it in 0..model.max_newton.max(1) {
+            iters = it + 1;
+            let mut trips: Vec<(usize, usize, f64)> = Vec::new();
+            let mut f_int = vec![0.0; ndof];
+            let mut failed = false;
+            for (ei, el) in model.elements.iter().enumerate() {
+                let xyz0 = match elem_xyz(&model, &el.nodes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        inc_err = Some(e.to_string());
+                        failed = true;
+                        break;
+                    }
+                };
+                let nn = el.kind.nnodes();
+                let mut ue = vec![0.0; 3 * nn];
+                let mut gdofs = Vec::with_capacity(3 * nn);
+                for a in 0..nn {
+                    let ni = match model.node_index(el.nodes[a]) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            inc_err = Some(e.to_string());
+                            failed = true;
+                            break;
+                        }
+                    };
+                    for d in 0..3 {
+                        let g = dof_of(ndn, ni, d);
+                        gdofs.push(g);
+                        ue[3 * a + d] = u_work[g];
+                    }
                 }
-            }
-            let mat = model.material_for(el)?;
-            let nl = if let Some(curve) = model.plastic_for(el) {
-                plastic::continuum_plastic_nl(
-                    el.kind,
-                    &xyz0,
-                    &ue,
-                    mat.e,
-                    mat.nu,
-                    curve,
-                    &hist[ei],
-                )?
-            } else {
-                nlgeom::continuum_nl(el.kind, &xyz0, &ue, mat.e, mat.nu)?
-            };
-            last_cauchy[ei] = nl.cauchy;
-            last_gl[ei] = nl.gl;
-            last_peeq[ei] = nl.peeq;
-            let nd = gdofs.len();
-            for i in 0..nd {
-                f_int[gdofs[i]] += nl.fe[i];
-                for j in 0..nd {
-                    let v = nl.ke[i * nd + j];
-                    if v.abs() > 0.0 {
-                        trips.push((gdofs[i], gdofs[j], v));
+                if failed {
+                    break;
+                }
+                let mat = match model.material_for(el) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        inc_err = Some(e.to_string());
+                        failed = true;
+                        break;
+                    }
+                };
+                let nl = if let Some(curve) = model.plastic_for(el) {
+                    match plastic::continuum_plastic_nl(
+                        el.kind,
+                        &xyz0,
+                        &ue,
+                        mat.e,
+                        mat.nu,
+                        curve,
+                        &hist[ei],
+                    ) {
+                        Ok((n, hnew)) => {
+                            trial_hist[ei] = hnew;
+                            n
+                        }
+                        Err(e) => {
+                            inc_err = Some(e.to_string());
+                            failed = true;
+                            break;
+                        }
+                    }
+                } else {
+                    match nlgeom::continuum_nl(el.kind, &xyz0, &ue, mat.e, mat.nu) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            inc_err = Some(e.to_string());
+                            failed = true;
+                            break;
+                        }
+                    }
+                };
+                last_cauchy[ei] = nl.cauchy;
+                last_gl[ei] = nl.gl;
+                last_peeq[ei] = nl.peeq;
+                let nd = gdofs.len();
+                for i in 0..nd {
+                    f_int[gdofs[i]] += nl.fe[i];
+                    for j in 0..nd {
+                        let v = nl.ke[i * nd + j];
+                        if v.abs() > 0.0 {
+                            trips.push((gdofs[i], gdofs[j], v));
+                        }
                     }
                 }
             }
-        }
-        last_fint.clone_from(&f_int);
-        let mut r = vec![0.0; ndof];
-        for i in 0..ndof {
-            r[i] = f_ext[i] - f_int[i];
-        }
-        let (ff, rhs) = map.reduce_inc(&trips, &r);
-        residual = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let fref = f_ext.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if residual < model.newton_tol * (1.0 + fref) {
-            break;
-        }
-        if it + 1 == model.max_newton.max(1) {
-            return err(format!(
-                "Newton konvergierte nicht (r={residual:.3e} nach {iters} Iterationen)."
-            ));
-        }
-        let solved = solve_kff(nfree, ff, &rhs)?;
-        solver = solved.name;
-        let mut du_full = vec![0.0; ndof];
-        for i in 0..ndof {
-            for &(j, c) in &map.t_row[i] {
-                du_full[i] += c * solved.x[j];
+            if failed {
+                break;
+            }
+            last_fint.clone_from(&f_int);
+            let mut r = vec![0.0; ndof];
+            for i in 0..ndof {
+                r[i] = f_inc[i] - f_int[i];
+            }
+            let (ff, rhs) = match map.reduce_inc(&trips, &r) {
+                v => v,
+            };
+            residual = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let fref = f_inc.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if residual < model.newton_tol * (1.0 + fref) {
+                inc_ok = true;
+                break;
+            }
+            if it + 1 == model.max_newton.max(1) {
+                inc_err = Some(format!(
+                    "Newton konvergierte nicht (r={residual:.3e} nach {iters} Iterationen)."
+                ));
+                break;
+            }
+            let solved = match solve_kff(nfree, ff, &rhs) {
+                Ok(s) => s,
+                Err(e) => {
+                    inc_err = Some(e.to_string());
+                    break;
+                }
+            };
+            solver = solved.name;
+            let mut du_full = vec![0.0; ndof];
+            for i in 0..ndof {
+                for &(j, c) in &map.t_row[i] {
+                    du_full[i] += c * solved.x[j];
+                }
+            }
+            for i in 0..ndof {
+                u_work[i] += du_full[i];
+            }
+            for (&dof, _) in &prescribed {
+                u_work[dof] = (1.0 - lam_new) * u_begin[dof] + lam_new * u_target[dof];
+            }
+            let dun = solved.x.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if dun < 1e-14 {
+                inc_ok = true;
+                break;
             }
         }
-        for i in 0..ndof {
-            u_full[i] += du_full[i];
-        }
-        let dun = solved.x.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if dun < 1e-14 {
-            break;
+        if inc_ok {
+            u_full = u_work;
+            hist = trial_hist;
+            lam = lam_new;
+            f_now.clone_from(&f_inc);
+            ninc_done += 1;
+            retries = 0;
+            let remain = 1.0 - lam;
+            if remain > 1e-14 {
+                dt = (dt * 1.5).min(1.0 / ninc as f64).min(remain);
+            }
+        } else {
+            retries += 1;
+            dt *= 0.5;
+            if dt < 1e-6 || retries > 16 {
+                let why = inc_err.unwrap_or_else(|| "unbekannt".into());
+                return err(format!(
+                    "NLGEOM Inkrement bei λ={lam:.4} fehlgeschlagen ({why})."
+                ));
+            }
         }
     }
+    let f_ext = f_now;
     if solver.is_empty() {
         solver = "Newton (equilibrium)".into();
     } else {
-        solver = format!("Newton ({solver}, {iters} iters)");
+        solver = format!("Newton ({solver}, {iters} iters, {ninc_done} inc)");
     }
     if model.has_plastic() {
         solver = format!("{solver}, J2");
@@ -2293,7 +2426,7 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
         buckles: vec![],
         nsteps,
         lambda: 1.0,
-        ninc: 1,
+        ninc: ninc_done.max(1),
         peeq,
     })
 }
@@ -2326,6 +2459,16 @@ fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput
         return err("Truss-Newton: keine freien DOF.");
     }
     let mut u_full = map.u0.clone();
+    if model.u_start.len() == nnode {
+        for ni in 0..nnode {
+            for d in 0..3 {
+                let g = dof_of(ndn, ni, d);
+                if !prescribed.contains_key(&g) {
+                    u_full[g] = model.u_start[ni][d];
+                }
+            }
+        }
+    }
     let mut solver = String::new();
     let mut residual = 0.0;
     let mut iters = 0usize;
@@ -2755,7 +2898,7 @@ fn assemble_nl(
             let empty: Vec<plastic::GpHist> = Vec::new();
             let h = hist.get(ei).map(|v| v.as_slice()).unwrap_or(&empty);
             let nl = if let Some(curve) = model.plastic_for(el) {
-                plastic::continuum_plastic_nl(el.kind, &xyz0, &ue, mat.e, mat.nu, curve, h)?
+                plastic::continuum_plastic_nl(el.kind, &xyz0, &ue, mat.e, mat.nu, curve, h)?.0
             } else {
                 nlgeom::continuum_nl(el.kind, &xyz0, &ue, mat.e, mat.nu)?
             };
@@ -2804,7 +2947,7 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
     pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
-    let f_ext = assemble_fext(&model, ndn, ndof)?;
+    let f_ext = assemble_fext(&model, ndn, ndof, model.static_period)?;
     let fext_n = vnorm(&f_ext);
     if fext_n < 1e-30 {
         return err("RIKS: keine Last (*CLOAD/*DLOAD).");

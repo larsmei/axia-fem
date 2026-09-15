@@ -271,6 +271,9 @@ fn parse_expanded(inp: &str) -> Result<Model> {
     let mut current_interaction: Option<String> = None;
     let mut saw_step = false;
     let mut step_open = false;
+    let mut step_bc_from = 0usize;
+    let mut step_cload_from = 0usize;
+    let mut step_dload_from = 0usize;
 
     while i < n {
         let raw = strip_comment(lines[i]);
@@ -624,6 +627,9 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                 model.elset_beam.insert(elset, sec);
             }
             "*BOUNDARY" => {
+                if op_is_new(&params) {
+                    step_bc_from = model.bcs.len();
+                }
                 let (toks, ni) = collect_tokens(&lines, i + 1);
                 i = ni;
                 let mut k = 0;
@@ -742,6 +748,9 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                 }
             }
             "*CLOAD" => {
+                if op_is_new(&params) {
+                    step_cload_from = model.cloads.len();
+                }
                 let amp_name = params
                     .get("AMPLITUDE")
                     .cloned()
@@ -784,6 +793,9 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                 }
             }
             "*DLOAD" => {
+                if op_is_new(&params) {
+                    step_dload_from = model.dloads.len();
+                }
                 let (toks, ni) = collect_tokens(&lines, i + 1);
                 i = ni;
                 let mut k = 0;
@@ -920,7 +932,12 @@ fn parse_expanded(inp: &str) -> Result<Model> {
             }
             "*STEP" => {
                 if step_open {
-                    push_step(&mut model);
+                    push_step(
+                        &mut model,
+                        step_bc_from,
+                        step_cload_from,
+                        step_dload_from,
+                    );
                 }
                 saw_step = true;
                 step_open = true;
@@ -931,16 +948,33 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                         riks: false,
                     };
                 }
+                if let Some(inc) = params.get("INC") {
+                    if let Ok(v) = parse_i32(inc) {
+                        if v > 0 {
+                            model.max_inc = v as usize;
+                        }
+                    }
+                }
                 i += 1;
             }
             "*STATIC" => {
                 let (toks, ni) = collect_tokens(&lines, i + 1);
                 i = ni;
-                let inc = if !toks.is_empty() {
-                    parse_f64(&toks[0]).ok().map(|v| v.max(1.0) as usize).unwrap_or(1)
-                } else {
-                    1
-                };
+                // CalculiX: initial Δt, period, min Δt, max Δt [, max increments for RIKS]
+                let dt0 = toks
+                    .get(0)
+                    .and_then(|t| parse_f64(t).ok())
+                    .filter(|v| *v > 0.0)
+                    .unwrap_or(1.0);
+                let period = toks
+                    .get(1)
+                    .and_then(|t| parse_f64(t).ok())
+                    .filter(|v| *v > 0.0)
+                    .unwrap_or(1.0);
+                model.static_dt = dt0;
+                model.static_period = period;
+                let n_from_time = ((period / dt0).round() as usize).max(1);
+                let inc = n_from_time.min(model.max_inc.max(1));
                 let nlgeom = matches!(
                     model.procedure,
                     crate::model::Procedure::Static { nlgeom: true, .. }
@@ -1802,7 +1836,12 @@ fn parse_expanded(inp: &str) -> Result<Model> {
             }
             "*END STEP" | "*END STEP " => {
                 if step_open {
-                    push_step(&mut model);
+                    push_step(
+                        &mut model,
+                        step_bc_from,
+                        step_cload_from,
+                        step_dload_from,
+                    );
                 }
                 step_open = false;
                 i += 1;
@@ -1870,7 +1909,12 @@ fn parse_expanded(inp: &str) -> Result<Model> {
         model.warn("Kein *STEP — linear-statischer Schritt angenommen.");
     }
     if step_open || model.steps.is_empty() {
-        push_step(&mut model);
+        push_step(
+            &mut model,
+            step_bc_from,
+            step_cload_from,
+            step_dload_from,
+        );
     }
     if let Some(last) = model.steps.last() {
         model.procedure = last.procedure.clone();
@@ -1886,12 +1930,27 @@ fn parse_expanded(inp: &str) -> Result<Model> {
     Ok(model)
 }
 
-fn push_step(model: &mut Model) {
+fn op_is_new(params: &HashMap<String, String>) -> bool {
+    params
+        .get("OP")
+        .map(|v| v.eq_ignore_ascii_case("NEW"))
+        .unwrap_or(false)
+}
+
+fn push_step(
+    model: &mut Model,
+    bc_from: usize,
+    cload_from: usize,
+    dload_from: usize,
+) {
     model.steps.push(AnalysisStep {
         procedure: model.procedure.clone(),
         n_cload: model.cloads.len(),
         n_dload: model.dloads.len(),
         n_bc: model.bcs.len(),
+        cload_from,
+        dload_from,
+        bc_from,
     });
 }
 

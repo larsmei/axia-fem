@@ -1832,7 +1832,7 @@ U
 
     #[test]
     fn amplitude_ramps_static_end() {
-        // At t=0 amplitude is unused in STATIC; load is the CLOAD magnitude.
+        // At the end of a STATIC step amplitude is evaluated at t = period.
         let inp = r#"
 *HEADING
 amp static
@@ -1860,8 +1860,8 @@ amp static
 "#;
         let out = solve_native(inp).unwrap();
         let u2 = out.u[out.model.node_index(2).unwrap()][0];
-        // STATIC uses amp(t=0)=0 → u=0
-        assert!(u2.abs() < 1e-8, "static amp(0) ux={u2}");
+        // STATIC evaluates amplitude at the end of the step (t = period = 1).
+        assert!((u2 - 0.5).abs() < 1e-6, "static amp(period) ux={u2}, expected 0.5");
     }
 
     #[test]
@@ -2241,6 +2241,124 @@ controls
         );
         assert!(out.iters >= 1);
         assert!(out.residual < 1e-4, "residual={}", out.residual);
+    }
+
+    #[test]
+    fn static_increments_from_time_step() {
+        let inp = r#"
+*HEADING
+inc
+*NODE
+1,0,0,0
+2,1,0,0
+*ELEMENT, TYPE=T3D2, ELSET=T
+1,1,2
+*MATERIAL, NAME=STEEL
+*ELASTIC
+100,0
+*SOLID SECTION, ELSET=T, MATERIAL=STEEL
+1
+*BOUNDARY
+1,1,3
+*STEP, NLGEOM
+*STATIC
+0.25, 1.0
+*CLOAD
+2,1,1
+*END STEP
+"#;
+        let m = parse_model(inp).unwrap();
+        match m.procedure {
+            crate::model::Procedure::Static {
+                nlgeom,
+                increments,
+                riks,
+            } => {
+                assert!(nlgeom);
+                assert!(!riks);
+                assert_eq!(increments, 4);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!((m.static_dt - 0.25).abs() < 1e-12);
+        assert!((m.static_period - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nlgeom_two_steps_continue_displacement() {
+        // Two prescribed-U steps of 0.1 on a unit cube; continuation must
+        // start from the previous u, not the undeformed mesh.
+        let inp = r#"
+*HEADING
+nlgeom two step
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+5, 0, 0, 1
+6, 1, 0, 1
+7, 1, 1, 1
+8, 0, 1, 1
+*ELEMENT, TYPE=C3D8, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+100, 0.0
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 3
+4, 1, 1
+4, 3, 3
+5, 1, 2
+8, 1, 1
+2, 2, 3
+3, 3, 3
+6, 2, 2
+*STEP, NLGEOM
+*STATIC
+*BOUNDARY
+2, 1, 1, 0.1
+3, 1, 1, 0.1
+6, 1, 1, 0.1
+7, 1, 1, 0.1
+*END STEP
+*STEP, NLGEOM
+*STATIC
+*BOUNDARY, OP=NEW
+1, 1, 3
+4, 1, 1
+4, 3, 3
+5, 1, 2
+8, 1, 1
+2, 2, 3
+3, 3, 3
+6, 2, 2
+2, 1, 1, 0.2
+3, 1, 1, 0.2
+6, 1, 1, 0.2
+7, 1, 1, 0.2
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        assert_eq!(out.nsteps, 2);
+        assert!(
+            !out.solver.contains("linear-elastisch"),
+            "solver={}",
+            out.solver
+        );
+        let mut ux = Vec::new();
+        for (i, &id) in out.model.node_ids.iter().enumerate() {
+            if id == 2 || id == 3 || id == 6 || id == 7 {
+                ux.push(out.u[i][0]);
+            }
+        }
+        let mean: f64 = ux.iter().sum::<f64>() / ux.len() as f64;
+        assert!(
+            (mean - 0.2).abs() < 5e-4,
+            "two-step NLGEOM ux={mean}, expected 0.2 (continuation)"
+        );
+        assert!(out.ninc >= 1);
     }
 
     #[test]
