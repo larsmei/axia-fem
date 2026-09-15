@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::model::{ElemKind, Model, Procedure};
 
 /// Fortran ES12.5 (`1P,E12.5`): sign/space + `d.ddddd` + `E` + `±dd` = 12 chars.
@@ -61,19 +63,30 @@ fn line_1pstep(counter: i32, iinc: i32, istep: i32) -> String {
     String::from_utf8(t).unwrap() + "\n"
 }
 
-/// ccx 100CL: 75 chars, ASCII format flag at C index 74 (column 75).
-/// `stoi(rec, 74, 75)` still sees the `1`.
-fn line_100cl(kode: i32, time: f64, nout: i32, name: &str) -> String {
+/// ccx `frdheader.c` 100CL: 75 chars, ASCII format flag at column 75.
+///
+/// Field layout (0-based, matching CalculiX 2.22):
+/// - [0..7]   `"  100CL"`
+/// - [7..12]  `100+iinc` (load-case kode — Mecway keys frames by this)
+/// - [12..24] time ES12.5
+/// - [24..36] nout
+/// - [36..48] description (empty for U/S/RF)
+/// - [57]     nmethod flag `'0'` for STATIC
+/// - [58..63] iinc
+/// - [74]     `'1'` ASCII
+///
+/// Dataset names live on the following `-4` line, never here. Repeating
+/// kode 101/102/103 as dataset types makes Mecway treat every increment
+/// as the same load case.
+fn line_100cl(iinc: i32, time: f64, nout: i32) -> String {
     let mut t = vec![b' '; 75];
     t[..7].copy_from_slice(b"  100CL");
-    put_int(&mut t, 7, 5, kode);
+    put_int(&mut t, 7, 5, 100 + iinc);
     let ts = e12(time);
     t[12..24].copy_from_slice(ts.as_bytes());
     put_int(&mut t, 24, 12, nout);
-    let nb = name.as_bytes();
-    let n = nb.len().min(12);
-    t[36..36 + n].copy_from_slice(&nb[..n]);
-    put_int(&mut t, 58, 5, kode);
+    t[57] = b'0';
+    put_int(&mut t, 58, 5, iinc);
     t[74] = b'1';
     String::from_utf8(t).unwrap() + "\n"
 }
@@ -112,6 +125,37 @@ fn frd_nodes(kind: ElemKind, nodes: &[i32]) -> Vec<i32> {
         }
         _ => nodes.to_vec(),
     }
+}
+
+/// Nodes that belong to a mesh element (ccx `inum>0`). Pretension dummy
+/// nodes and MASS-only nodes are omitted from 2C and from result blocks.
+fn frd_output_nodes(model: &Model) -> Vec<(i32, usize)> {
+    let mut used = HashSet::new();
+    for el in &model.elements {
+        if el.kind.is_point() {
+            continue;
+        }
+        used.extend(el.nodes.iter().copied());
+    }
+    for p in &model.pretensions {
+        used.remove(&p.dummy);
+    }
+    if used.is_empty() {
+        return model
+            .node_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect();
+    }
+    model
+        .node_ids
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(i, id)| used.contains(&id).then_some((id, i)))
+        .collect()
 }
 
 pub struct FrdFrame {
@@ -159,13 +203,14 @@ pub fn write_frd_frames(model: &Model, frames: &[FrdFrame]) -> String {
     o.push_str("    1UTIME              18:00:00\n");
     o.push_str("    1UHOST              axia\n");
     o.push_str("    1UPGM               Axia FEM\n");
-    o.push_str("    1UVERSION           1.16.0\n");
+    o.push_str("    1UVERSION           1.17.0\n");
     o.push_str("    1UCODE              CalculiX-compatible Axia FEM\n");
 
-    let nn = model.node_ids.len() as i32;
+    let out_nodes = frd_output_nodes(model);
+    let nn = out_nodes.len() as i32;
     o.push_str(&mesh_block_header('2', nn));
-    for (k, &id) in model.node_ids.iter().enumerate() {
-        let c = model.coords[k];
+    for &(id, idx) in &out_nodes {
+        let c = model.coords[idx];
         o.push_str(&format!(
             " -1{id:10}{}{}{}\n",
             e12(c[0]),
@@ -193,16 +238,10 @@ pub fn write_frd_frames(model: &Model, frames: &[FrdFrame]) -> String {
     o.push_str(" -3\n");
 
     let heat = matches!(model.procedure, Procedure::HeatTransfer { .. });
-    let frames: &[FrdFrame] = if frames.is_empty() {
-        // mesh-only fallback (should not happen)
-        &[]
-    } else {
-        frames
-    };
+    let mut icounter = 0i32;
     for (k, fr) in frames.iter().enumerate() {
         let iinc = if fr.iinc > 0 { fr.iinc } else { (k as i32) + 1 };
-        o.push_str(&line_1pstep((k as i32) + 1, iinc, 1));
-        write_frame_datasets(&mut o, model, fr, nn, heat);
+        write_frame_datasets(&mut o, model, fr, &out_nodes, &mut icounter, iinc, heat);
     }
     o.push_str(" 9999\n");
     o
@@ -212,7 +251,9 @@ fn write_frame_datasets(
     o: &mut String,
     model: &Model,
     fr: &FrdFrame,
-    nn: i32,
+    out_nodes: &[(i32, usize)],
+    icounter: &mut i32,
+    iinc: i32,
     heat: bool,
 ) {
     let u = &fr.u;
@@ -225,39 +266,44 @@ fn write_frame_datasets(
     } else {
         1.0
     };
+    // ccx frd.c order for this deck: DISP, STRESS, FORC. 1PSTEP immediately
+    // before every 100CL so Mecway sees one load-case header per dataset.
     if heat || model.output_nt {
+        let vals: Vec<Vec<f64>> = u.iter().map(|v| vec![v[0]]).collect();
         write_result_block(
             o,
-            201,
-            nn,
+            iinc,
+            icounter,
             "NDTEMP",
             1,
             &[("NT", 1, 1, 0)],
             false,
-            &model.node_ids,
-            &u.iter().map(|v| vec![v[0]]).collect::<Vec<_>>(),
+            out_nodes,
+            &vals,
             t,
         );
         if model.output_rf {
+            let vals: Vec<Vec<f64>> = rf.iter().map(|v| vec![v[0]]).collect();
             write_result_block(
                 o,
-                202,
-                nn,
+                iinc,
+                icounter,
                 "RFL",
                 1,
                 &[("RFL", 1, 1, 0)],
                 false,
-                &model.node_ids,
-                &rf.iter().map(|v| vec![v[0]]).collect::<Vec<_>>(),
+                out_nodes,
+                &vals,
                 t,
             );
         }
     }
     if !heat && model.output_u {
+        let vals: Vec<Vec<f64>> = u.iter().map(|v| vec![v[0], v[1], v[2]]).collect();
         write_result_block(
             o,
-            101,
-            nn,
+            iinc,
+            icounter,
             "DISP",
             4,
             &[
@@ -267,37 +313,20 @@ fn write_frame_datasets(
                 ("ALL", 2, 0, 0),
             ],
             true,
-            &model.node_ids,
-            &u.iter().map(|v| vec![v[0], v[1], v[2]]).collect::<Vec<_>>(),
-            t,
-        );
-    }
-    if !heat && model.output_rf {
-        write_result_block(
-            o,
-            102,
-            nn,
-            "FORC",
-            4,
-            &[
-                ("F1", 2, 1, 0),
-                ("F2", 2, 2, 0),
-                ("F3", 2, 3, 0),
-                ("ALL", 2, 0, 0),
-            ],
-            true,
-            &model.node_ids,
-            &rf.iter()
-                .map(|v| vec![v[0], v[1], v[2]])
-                .collect::<Vec<_>>(),
+            out_nodes,
+            &vals,
             t,
         );
     }
     if !heat && model.output_s {
+        let vals: Vec<Vec<f64>> = stress
+            .iter()
+            .map(|v| vec![v[0], v[1], v[2], v[3], v[4], v[5]])
+            .collect();
         write_result_block(
             o,
-            103,
-            nn,
+            iinc,
+            icounter,
             "STRESS",
             6,
             &[
@@ -309,19 +338,40 @@ fn write_frame_datasets(
                 ("SZX", 4, 3, 1),
             ],
             false,
-            &model.node_ids,
-            &stress
-                .iter()
-                .map(|v| vec![v[0], v[1], v[2], v[3], v[4], v[5]])
-                .collect::<Vec<_>>(),
+            out_nodes,
+            &vals,
+            t,
+        );
+    }
+    if !heat && model.output_rf {
+        let vals: Vec<Vec<f64>> = rf.iter().map(|v| vec![v[0], v[1], v[2]]).collect();
+        write_result_block(
+            o,
+            iinc,
+            icounter,
+            "FORC",
+            4,
+            &[
+                ("F1", 2, 1, 0),
+                ("F2", 2, 2, 0),
+                ("F3", 2, 3, 0),
+                ("ALL", 2, 0, 0),
+            ],
+            true,
+            out_nodes,
+            &vals,
             t,
         );
     }
     if !heat && model.output_e {
+        let vals: Vec<Vec<f64>> = strain
+            .iter()
+            .map(|v| vec![v[0], v[1], v[2], v[3], v[4], v[5]])
+            .collect();
         write_result_block(
             o,
-            104,
-            nn,
+            iinc,
+            icounter,
             "TOSTRAIN",
             6,
             &[
@@ -333,25 +383,23 @@ fn write_frame_datasets(
                 ("EZX", 4, 3, 1),
             ],
             false,
-            &model.node_ids,
-            &strain
-                .iter()
-                .map(|v| vec![v[0], v[1], v[2], v[3], v[4], v[5]])
-                .collect::<Vec<_>>(),
+            out_nodes,
+            &vals,
             t,
         );
     }
     if !heat && peeq.len() == model.node_ids.len() && peeq.iter().any(|v| *v > 0.0) {
+        let vals: Vec<Vec<f64>> = peeq.iter().map(|v| vec![*v]).collect();
         write_result_block(
             o,
-            108,
-            nn,
+            iinc,
+            icounter,
             "PEEQ",
             1,
             &[("PEEQ", 1, 1, 0)],
             false,
-            &model.node_ids,
-            &peeq.iter().map(|v| vec![*v]).collect::<Vec<_>>(),
+            out_nodes,
+            &vals,
             t,
         );
     }
@@ -359,17 +407,20 @@ fn write_frame_datasets(
 
 fn write_result_block(
     o: &mut String,
-    kode: i32,
-    nout: i32,
+    iinc: i32,
+    icounter: &mut i32,
     name: &str,
     ncomp_header: i32,
     comps: &[(&str, i32, i32, i32)],
     last_is_all: bool,
-    ids: &[i32],
+    nodes: &[(i32, usize)],
     values: &[Vec<f64>],
     time: f64,
 ) {
-    o.push_str(&line_100cl(kode, time, nout, name));
+    *icounter += 1;
+    let nout = nodes.len() as i32;
+    o.push_str(&line_1pstep(*icounter, iinc, 1));
+    o.push_str(&line_100cl(iinc, time, nout));
     o.push_str(&format!(" -4  {name:<8}{ncomp_header:5}    1\n"));
     for (i, (cname, typ, a, b)) in comps.iter().enumerate() {
         if last_is_all && i == comps.len() - 1 {
@@ -385,9 +436,10 @@ fn write_result_block(
     } else {
         ncomp_header as usize
     };
-    for (k, &id) in ids.iter().enumerate() {
+    for &(id, idx) in nodes {
         o.push_str(&format!(" -1{id:10}"));
-        let row = &values[k];
+        let empty: Vec<f64> = Vec::new();
+        let row = values.get(idx).unwrap_or(&empty);
         for c in 0..nvals {
             let v = row.get(c).copied().unwrap_or(0.0);
             o.push_str(&e12(v));
@@ -444,11 +496,27 @@ mod tests {
         assert_eq!(&p[36..48], "           1");
         assert_eq!(&p[48..60], "           1");
 
-        let h = strip(&line_100cl(101, 1.0, 8, "DISP")).to_string();
+        let h = strip(&line_100cl(1, 1.0, 8)).to_string();
         assert_eq!(h.len(), 75, "100CL len={}", h.len());
         assert_eq!(h.as_bytes()[74], b'1');
         assert!(h.starts_with("  100CL"));
-        assert!(h.contains("DISP"));
+        assert_eq!(&h[7..12], "  101");
+        assert_eq!(&h[58..63], "    1");
+        assert_eq!(h.as_bytes()[57], b'0');
+        assert!(
+            !h.contains("DISP") && !h.contains("STRESS") && !h.contains("FORC"),
+            "dataset name belongs on -4, got `{h}`"
+        );
+
+        // Byte-identical to CalculiX 2.22 BoltedJoint.frd increment 1 DISP.
+        assert_eq!(
+            strip(&line_100cl(1, 0.1, 730)),
+            "  100CL  101 1.00000E-01         730                     0    1           1"
+        );
+        assert_eq!(
+            strip(&line_100cl(10, 1.0, 730)),
+            "  100CL  110 1.00000E+00         730                     0   10           1"
+        );
     }
 
     #[test]
@@ -457,8 +525,7 @@ mod tests {
 *HEADING
 Flacheisen
 *NODE
-519, 0.06, 0.01, 0.21
-1, 0, 0, 0
+1, 0.06, 0.01, 0.21
 2, 1, 0, 0
 3, 1, 1, 0
 4, 0, 1, 0
@@ -492,11 +559,12 @@ Flacheisen
         assert_eq!(c3.len(), 74, "3C `{c3}`");
         assert_eq!(c2.as_bytes()[73], b'1');
         assert_eq!(c3.as_bytes()[73], b'1');
+        assert_eq!(&c2[24..36], "           8");
 
         let node = lines
             .iter()
-            .find(|l| l.starts_with(" -1") && l.contains("519"))
-            .expect("node 519");
+            .find(|l| l.starts_with(" -1") && l.len() >= 13 && l[3..13].trim() == "1")
+            .expect("node 1");
         assert!(
             node.starts_with(" -1"),
             "leading space required, got `{node}`"
@@ -512,6 +580,8 @@ Flacheisen
         let cl = lines.iter().find(|l| l.starts_with("  100CL")).expect("100CL");
         assert_eq!(cl.len(), 75, "100CL `{cl}`");
         assert_eq!(cl.as_bytes()[74], b'1');
+        assert_eq!(&cl[7..12], "  101");
+        assert!(!cl.contains("DISP"), "100CL must not carry the dataset name");
     }
 
     fn dummy_frd(inp: &str) -> String {
@@ -697,6 +767,9 @@ Flacheisen
             !lines.iter().any(|l| *l == " -2      8975"),
             "MASS node must not appear as a 1-node -2 line"
         );
+        // MASS-only node 8975 is inum=0 in ccx — omit from 2C.
+        let c2 = lines.iter().find(|l| l.starts_with("    2C")).expect("2C");
+        assert_eq!(&c2[24..36], "           4", "2C must omit MASS-only node, got `{c2}`");
     }
 
     #[test]
@@ -780,20 +853,69 @@ inc
             })
             .collect();
         let frd = write_frd_frames(&model, &frames);
-        let psteps: Vec<_> = frd.lines().filter(|l| l.starts_with("    1PSTEP")).collect();
-        assert_eq!(psteps.len(), 10, "one 1PSTEP per increment");
-        let disp: Vec<_> = frd
-            .lines()
-            .filter(|l| l.starts_with("  100CL") && l.contains("DISP"))
+        let lines: Vec<&str> = frd.lines().collect();
+        let psteps: Vec<_> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("    1PSTEP"))
+            .collect();
+        // 10 increments × DISP+STRESS+FORC
+        assert_eq!(psteps.len(), 30, "1PSTEP before every 100CL");
+        let mut n_cl = 0;
+        for (i, l) in lines.iter().enumerate() {
+            if l.starts_with("  100CL") {
+                n_cl += 1;
+                assert!(
+                    i > 0 && lines[i - 1].starts_with("    1PSTEP"),
+                    "100CL must follow 1PSTEP, got prev={}",
+                    lines[i.saturating_sub(1)]
+                );
+                assert!(
+                    !l.contains("DISP") && !l.contains("STRESS") && !l.contains("FORC"),
+                    "100CL name field must be empty: `{l}`"
+                );
+            }
+        }
+        assert_eq!(n_cl, 30);
+        let disp: Vec<_> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with(" -4  DISP"))
             .collect();
         assert_eq!(disp.len(), 10);
-        assert!(disp[0].contains(" 1.00000E-01"), "{}", disp[0]);
-        assert!(disp[9].contains(" 1.00000E+00"), "{}", disp[9]);
-        let stress: Vec<_> = frd
-            .lines()
-            .filter(|l| l.starts_with("  100CL") && l.contains("STRESS"))
+        let stress: Vec<_> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with(" -4  STRESS"))
             .collect();
         assert_eq!(stress.len(), 10);
+        let forc: Vec<_> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with(" -4  FORC"))
+            .collect();
+        assert_eq!(forc.len(), 10);
+        // Dataset order per increment: DISP, STRESS, FORC
+        let names: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with(" -4  "))
+            .take(3)
+            .collect();
+        assert_eq!(
+            names,
+            [" -4  DISP        4    1", " -4  STRESS      6    1", " -4  FORC        4    1"]
+        );
+        let cls: Vec<_> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("  100CL"))
+            .collect();
+        assert!(cls[0].contains(" 1.00000E-01"), "{}", cls[0]);
+        assert_eq!(&cls[0][7..12], "  101");
+        assert!(cls[27].contains(" 1.00000E+00"), "{}", cls[27]);
+        assert_eq!(&cls[27][7..12], "  110");
+        assert_eq!(&cls[29][7..12], "  110");
         assert!(frd.contains(" 9999"));
     }
 }

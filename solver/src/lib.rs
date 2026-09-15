@@ -4063,19 +4063,51 @@ SL, MA
         let disp_n = out
             .frd
             .lines()
-            .filter(|l| l.starts_with("  100CL") && l.contains("DISP"))
+            .filter(|l| l.starts_with(" -4  DISP"))
             .count();
         let stress_n = out
             .frd
             .lines()
-            .filter(|l| l.starts_with("  100CL") && l.contains("STRESS"))
+            .filter(|l| l.starts_with(" -4  STRESS"))
+            .count();
+        let pstep_n = out
+            .frd
+            .lines()
+            .filter(|l| l.starts_with("    1PSTEP"))
             .count();
         assert_eq!(disp_n, 10, "FRD must contain DISP for each increment");
         assert_eq!(stress_n, 10, "FRD must contain STRESS for each increment");
+        assert_eq!(
+            pstep_n, 30,
+            "ccx/Mecway: 1PSTEP immediately before every 100CL (10×DISP/STRESS/FORC)"
+        );
+        let cl0 = out
+            .frd
+            .lines()
+            .find(|l| l.starts_with("  100CL"))
+            .expect("100CL");
+        assert_eq!(cl0.len(), 75, "100CL `{cl0}`");
+        assert_eq!(&cl0[7..12], "  101", "kode=100+iinc, got `{cl0}`");
+        assert!(
+            !cl0.contains("DISP") && !cl0.contains("STRESS"),
+            "100CL name field must be empty like ccx: `{cl0}`"
+        );
         assert!(
             out.frd.contains(" 1.00000E-01") && out.frd.contains(" 1.00000E+00"),
             "FRD increment times must include t=0.1 and t=1.0"
         );
+        // Pretension dummy 723 is not a mesh node (ccx inum=0) — Mecway
+        // keys nout from 2C and the 100CL count must match 730, not 731.
+        let c2 = out
+            .frd
+            .lines()
+            .find(|l| l.starts_with("    2C"))
+            .expect("2C");
+        assert_eq!(&c2[24..36], "         730", "2C `{c2}`");
+        let dummy_in_mesh = out.frd.lines().any(|l| {
+            l.starts_with(" -1") && l.len() >= 13 && l[3..13].trim() == "723"
+        });
+        assert!(!dummy_in_mesh, "dummy node 723 must be omitted from FRD");
         // CalculiX 2.22: vmMax ≈ 0.72 GPa at shank node 430. Node-evaluated
         // C3D20 B-matrix used to report ~1.8 GPa.
         let i430 = out.model.node_index(430).unwrap();
