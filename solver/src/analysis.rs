@@ -2151,48 +2151,33 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     } else {
         -1
     };
-    // Force-controlled dummy + penalty contact is a poorly scaled Newton
-    // problem (dummy CLOAD sits on a 1e10 N/m spring next to plate
-    // mechanisms). Hold the dummy at u = F/K_dd so the remaining system
-    // is displacement-driven and well-posed.
-    let mut kdd = 1e9_f64;
+    // Condensed dummy stiffness (Schur), not the Jacobi of K+contact.
+    // Jacobi was ~10× too stiff and under-opened the bolt vs CalculiX.
+    let mut kdd = 6e8_f64;
     if pretension && dummy_ind >= 0 {
         if let Ok(cf0) = contact::assemble(&model, ndn, ndof, &u_full) {
             let mut all = trips.clone();
             all.extend(cf0.trips);
             let (ff0, _) = map.reduce_inc(&all, &vec![0.0; ndof]);
-            let di = dummy_ind as usize;
-            let mut acc = 0.0_f64;
-            for &(a, b, v) in &ff0 {
-                if a == di && b == di {
-                    acc += v;
+            let mut rhs0 = vec![0.0; map.n_ind];
+            rhs0[dummy_ind as usize] = 1.0;
+            if let Ok(sol) = solve_kff(map.n_ind, ff0, &rhs0) {
+                let xd = sol.x.get(dummy_ind as usize).copied().unwrap_or(0.0);
+                if xd.is_finite() && xd.abs() > 1e-20 {
+                    kdd = (1.0 / xd).abs().clamp(1e7, 1e12);
                 }
             }
-            if acc.abs() > 1.0 {
-                kdd = acc.abs().clamp(1e6, 1e13);
-            }
         }
+        nl_eprint(&format!("pretension kdd(Schur)={kdd:.4e}"));
     }
-    let ninc_run = if pretension { 2 } else { ninc };
+    let ninc_run = ninc;
     for inc in 1..=ninc_run {
-        let t = if pretension {
-            model.static_period
-        } else {
-            (inc as f64 / ninc as f64) * model.static_period
-        };
+        let t = (inc as f64 / ninc as f64) * model.static_period;
         f_ext = assemble_fext(&model, ndn, ndof, t)?;
-        if pretension && inc == 1 {
-            // Clamp the joint under pretension before the service CLOADs.
-            for i in 0..ndof {
-                if i != dummy_dof {
-                    f_ext[i] = 0.0;
-                }
-            }
-        }
         let mut map_inc = map.clone();
         if pretension && dummy_ind >= 0 {
             let f_d = f_ext.get(dummy_dof).copied().unwrap_or(0.0);
-            let u_target = (f_d / kdd).clamp(-1e-3, 1e-3);
+            let u_target = (f_d / kdd).clamp(-1e-2, 1e-2);
             let u_now = u_full.get(dummy_dof).copied().unwrap_or(0.0);
             let du_d = u_target - u_now;
             let di = dummy_ind as usize;
@@ -2204,8 +2189,9 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                         }
                     }
                 }
-                // Rigid-body predictor on the copy-side bolt half so the cut
-                // opening is not absorbed as a one-element strain spike.
+                // Rigid predictor on the copy-side half (owning surface
+                // elements) so the cut opening is not a one-element spike.
+                // New MPC: n·(u_copy − u_orig) = u_dummy → copy moves +n·du.
                 let nrm = model
                     .pretensions
                     .first()
@@ -2255,7 +2241,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                             continue;
                         }
                         let col = col as usize;
-                        let add = -du_d * nrm[d];
+                        let add = du_d * nrm[d];
                         if add.abs() == 0.0 {
                             continue;
                         }
@@ -2298,33 +2284,22 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
             }
             let mut all = trips.clone();
             all.extend(cf.trips);
-            let (mut ff, rhs) = map_inc.reduce_inc(&all, &r);
+            let (ff, rhs) = map_inc.reduce_inc(&all, &r);
             residual = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
-            if pretension {
-                let mut dmax = 0.0_f64;
-                for &(a, b, v) in &ff {
-                    if a == b {
-                        dmax = dmax.max(v.abs());
-                    }
-                }
-                let stab = (1e-6 * dmax).clamp(1e4, 1e7);
-                for i in 0..nfree_inc {
-                    ff.push((i, i, stab));
-                }
-            }
             let fref = f_ext.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let contact_ok = pretension && fref > 0.0 && residual < 0.1 * fref.max(1.0);
-            // Dummy held at F/K_dd already balances the bolt cut to ~kN.
-            // Further undamped Newton steps deactivate contact and raise r.
-            if residual < model.newton_tol * (1.0 + fref)
-                || contact_ok
-                || (pretension && it > 0 && residual < 1e4)
-            {
+            if pretension {
+                nl_eprint(&format!(
+                    "inc {inc}/{ninc_run} it {it} r={residual:.3e} nact={n_active} ud={:.3e}",
+                    u_full.get(dummy_dof).copied().unwrap_or(0.0)
+                ));
+            }
+            let pret_ok = pretension && fref > 0.0 && residual < (1e-3 * fref).max(5.0);
+            if residual < model.newton_tol * (1.0 + fref) || pret_ok {
                 inc_ok = true;
                 break;
             }
             if it + 1 == newton_limit {
-                if pretension && residual < 1e4 {
+                if pretension && residual < (5e-2 * fref).max(100.0) {
                     inc_ok = true;
                     break;
                 }
@@ -2354,11 +2329,12 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                     for c in &model.coords {
                         s = s.max(c[0].abs()).max(c[1].abs()).max(c[2].abs());
                     }
-                    (0.05 * s).max(1e-4)
+                    (0.2 * s).max(1e-3)
                 };
                 let mut best_a = 0.0_f64;
                 let mut best_u = u0.clone();
-                for &a in &[1.0, 0.5, 0.25, 0.1, 0.01] {
+                let mut best_r = r0;
+                for &a in &[1.0, 0.5, 0.25, 0.125, 0.05, 0.01] {
                     for i in 0..ndof {
                         u_full[i] = u0[i] + a * du_full[i];
                     }
@@ -2373,7 +2349,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                     let Ok(cf_ls) = contact::assemble(&model, ndn, ndof, &u_full) else {
                         continue;
                     };
-                    if n_active > 8 && cf_ls.n_active * 3 < n_active {
+                    if n_active > 8 && cf_ls.n_active == 0 {
                         continue;
                     }
                     let mut ku = vec![0.0; ndof];
@@ -2391,9 +2367,10 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                     all.extend(cf_ls.trips);
                     let (_, rhs_ls) = map_inc.reduce_inc(&all, &rr);
                     let rt = rhs_ls.iter().map(|v| v * v).sum::<f64>().sqrt();
-                    if rt < r0 {
+                    if rt < best_r {
                         best_a = a;
                         best_u.clone_from(&u_full);
+                        best_r = rt;
                         if rt < 0.85 * r0 {
                             break;
                         }

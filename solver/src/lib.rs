@@ -3898,8 +3898,8 @@ S,NOE
         );
         let di = out.model.node_index(7).unwrap();
         assert!(
-            out.u[di][0].abs() > 1e-10,
-            "dummy ux should be the cut opening, got {}",
+            out.u[di][0] > 1e-10,
+            "dummy ux should be a positive cut opening, got {}",
             out.u[di][0]
         );
     }
@@ -3970,6 +3970,18 @@ SL, MA
             "pretension pairs empty, warnings={:?}",
             m.warnings
         );
+        let copies: std::collections::HashSet<i32> =
+            psec.pairs.iter().map(|&(_, c, _)| c).collect();
+        let el77 = m
+            .elements
+            .iter()
+            .find(|e| e.id == 77)
+            .expect("element 77 (pretension surface)");
+        assert!(
+            el77.nodes.iter().any(|n| copies.contains(n)),
+            "owning pretension element must use copy nodes (ccx gen3delem), nodes={:?}",
+            el77.nodes
+        );
         let ndn = m.ndof_node().max(3);
         let mpcs = crate::constraint::build_all_mpcs(&m, ndn).unwrap();
         let di = m.node_index(psec.dummy).unwrap();
@@ -4021,20 +4033,27 @@ SL, MA
             .iter()
             .flat_map(|v| v.iter())
             .fold(0.0_f64, |a, &x| a.max(x.abs()));
+        // CalculiX 2.22 on this deck: uMax ≈ 1.67 mm (lap bending), dummy opening ≈ 52 μm.
         assert!(
-            umax.is_finite() && umax < 0.01,
-            "uMax={umax} (expect ~1e-5 m bolt stretch)"
+            umax.is_finite() && umax > 2e-4 && umax < 0.01,
+            "uMax={umax} (expect ~1.7e-3 m plate motion, not a locked ~µm field)"
         );
         let di = out.model.node_index(723).unwrap();
+        let ud = out.u[di][0];
         assert!(
-            out.u[di][0].is_finite() && out.u[di][0].abs() > 1e-9,
-            "dummy opening ux={} should be the pretension gap",
-            out.u[di][0]
+            ud.is_finite() && ud.abs() > 1e-5 && ud.abs() < 5e-4,
+            "dummy opening ux={ud} should be the pretension gap (~5e-5 m)"
         );
         assert!(
-            out.residual.is_finite() && out.residual < 1e4,
+            out.residual.is_finite() && out.residual < 500.0,
             "residual={}",
             out.residual
+        );
+        let i294 = out.model.node_index(294).unwrap();
+        let uy294 = out.u[i294][1];
+        assert!(
+            uy294 < -2e-4,
+            "free corner 294 uy={uy294}, CalculiX ≈ -1.67e-3 m"
         );
     }
 }

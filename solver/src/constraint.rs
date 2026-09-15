@@ -586,8 +586,9 @@ pub fn coupling_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
     Ok(mpcs)
 }
 
-/// Duplicate pretension-surface nodes and remap elements that do not own a
-/// pretension face onto the copies (CalculiX `gen3delem` / `*PRE-TENSION SECTION`).
+/// Duplicate pretension-surface nodes and remap the surface-owning elements
+/// onto the copies (CalculiX `gen3delem` / `*PRE-TENSION SECTION`).
+/// Non-owning neighbours keep the original nodes.
 pub fn apply_pretension(model: &mut Model) -> Result<()> {
     if model.pretensions.is_empty() {
         return Ok(());
@@ -728,7 +729,7 @@ fn apply_one_pretension(model: &mut Model, si: usize) -> Result<()> {
         .collect();
 
     for el in &mut model.elements {
-        if owning.contains(&el.id) {
+        if !owning.contains(&el.id) {
             continue;
         }
         for n in &mut el.nodes {
@@ -823,7 +824,7 @@ fn pretension_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
         for &(orig, copy, _) in &sec.pairs {
             let oi = model.node_index(orig)?;
             let ci = model.node_index(copy)?;
-            // n · (u_orig − u_copy) = u_dummy  (+CLOAD = tension)
+            // n · (u_copy − u_orig) = u_dummy  (CCX: +CLOAD on dummy = pretension)
             if let Some(m) = normal_opening(ndn, dim, ci, oi, dummy_dof, n) {
                 mpcs.push(m);
             }
@@ -915,10 +916,10 @@ fn normal_opening(
         return None;
     }
     let cs = n[sidx];
-    // n · (u_orig − u_copy) = u_dummy  (CCX: +CLOAD on dummy = pretension / tension)
+    // n · (u_copy − u_orig) = u_dummy  (CCX: +CLOAD on dummy = pretension / tension)
     // slave = copy[sidx]
     let slave = ndn * ci + sidx;
-    let mut masters = vec![(dummy_dof, -1.0 / cs), (ndn * oi + sidx, 1.0)];
+    let mut masters = vec![(dummy_dof, 1.0 / cs), (ndn * oi + sidx, 1.0)];
     for k in 0..dim {
         if k == sidx {
             continue;
