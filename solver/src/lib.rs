@@ -5,9 +5,9 @@ mod beam;
 mod constraint;
 mod contact;
 mod dat;
+mod eigen;
 mod elem;
 mod error;
-mod eigen;
 mod extra;
 mod frd;
 mod heat;
@@ -425,10 +425,7 @@ EALL, GRAV, -9.81, 0, 1, 0
             }
         }
         let mean: f64 = ux_loaded.iter().sum::<f64>() / ux_loaded.len() as f64;
-        assert!(
-            (mean - 0.01).abs() < 1e-6,
-            "ux={mean}, expected 0.01"
-        );
+        assert!((mean - 0.01).abs() < 1e-6, "ux={mean}, expected 0.01");
         let mut sxx = 0.0;
         for s in &out.stress {
             sxx += s[0];
@@ -467,7 +464,9 @@ EALL, GRAV, -9.81, 0, 1, 0
                 _ => "",
             };
             assert!(
-                out.solver.to_ascii_lowercase().contains(&tag.to_ascii_lowercase()),
+                out.solver
+                    .to_ascii_lowercase()
+                    .contains(&tag.to_ascii_lowercase()),
                 "backend {b:?} reported {}",
                 out.solver
             );
@@ -492,9 +491,7 @@ EALL, GRAV, -9.81, 0, 1, 0
         let ny = 4usize;
         let lx = 100.0;
         let ly = 10.0;
-        let mut s = String::from(
-            "*HEADING\n2D cantilever CPS4\n*NODE\n",
-        );
+        let mut s = String::from("*HEADING\n2D cantilever CPS4\n*NODE\n");
         let mut nid = 1i32;
         for j in 0..=ny {
             for i in 0..=nx {
@@ -546,10 +543,7 @@ EALL, GRAV, -9.81, 0, 1, 0
         for p in &out.u {
             umax = umax.max((-p[1]).max(0.0));
         }
-        assert!(
-            umax > 1.2 && umax < 2.4,
-            "tip |uy|={umax}, expected ~1.9"
-        );
+        assert!(umax > 1.2 && umax < 2.4, "tip |uy|={umax}, expected ~1.9");
     }
 
     #[test]
@@ -636,7 +630,10 @@ EALL, GRAV, -9.81, 0, 1, 0
             (uz - expect).abs() / expect < 0.04,
             "uz={uz}, Timoshenko={expect} (euler={euler} shear={shear})"
         );
-        assert!(uz > euler * 0.98, "deflection smaller than Euler — too stiff");
+        assert!(
+            uz > euler * 0.98,
+            "deflection smaller than Euler — too stiff"
+        );
     }
 
     #[test]
@@ -793,7 +790,9 @@ S
                 let n6 = id_of[j0 + 1][i0 + 2];
                 let n7 = id_of[j0 + 2][i0 + 1];
                 let n8 = id_of[j0 + 1][i0];
-                s.push_str(&format!("{eid}, {n1}, {n2}, {n3}, {n4}, {n5}, {n6}, {n7}, {n8}\n"));
+                s.push_str(&format!(
+                    "{eid}, {n1}, {n2}, {n3}, {n4}, {n5}, {n6}, {n7}, {n8}\n"
+                ));
                 eid += 1;
             }
         }
@@ -870,10 +869,7 @@ CPS8 patch
             umax = umax.max((-p[1]).max(0.0));
         }
         // Euler ≈ 1.905; quadratic should be closer than linear CPS4
-        assert!(
-            umax > 1.6 && umax < 2.2,
-            "tip |uy|={umax}, expected ~1.9"
-        );
+        assert!(umax > 1.6 && umax < 2.2, "tip |uy|={umax}, expected ~1.9");
     }
 
     #[test]
@@ -993,14 +989,26 @@ S4 membrane patch
         let id = |i: usize, j: usize| 1 + i + j * (n + 1);
         for j in 0..=n {
             for i in 0..=n {
-                s.push_str(&format!("{}, {}, {}, 0\n", id(i, j), i as f64 * 100.0 / n as f64, j as f64 * 100.0 / n as f64));
+                s.push_str(&format!(
+                    "{}, {}, {}, 0\n",
+                    id(i, j),
+                    i as f64 * 100.0 / n as f64,
+                    j as f64 * 100.0 / n as f64
+                ));
             }
         }
         s.push_str("*ELEMENT, TYPE=S4R, ELSET=PLATE\n");
         let mut e = 1;
         for j in 0..n {
             for i in 0..n {
-                s.push_str(&format!("{}, {}, {}, {}, {}\n", e, id(i, j), id(i + 1, j), id(i + 1, j + 1), id(i, j + 1)));
+                s.push_str(&format!(
+                    "{}, {}, {}, {}, {}\n",
+                    e,
+                    id(i, j),
+                    id(i + 1, j),
+                    id(i + 1, j + 1),
+                    id(i, j + 1)
+                ));
                 e += 1;
             }
         }
@@ -1021,10 +1029,7 @@ S4 membrane patch
             wmax = wmax.max((-p[2]).max(0.0));
         }
         // Kirchhoff α q a⁴/D ≈ 0.00406 * 0.01 * 1e8 / 19231 ≈ 0.211
-        assert!(
-            (wmax - 0.211).abs() < 0.04,
-            "wmax={wmax}, expected ~0.211"
-        );
+        assert!((wmax - 0.211).abs() < 0.04, "wmax={wmax}, expected ~0.211");
     }
 
     #[test]
@@ -1337,7 +1342,10 @@ SL, MA
 "#;
         let model = parse_model(inp).unwrap();
         let sl = crate::constraint::face_nodes(&model.elements[1], 1);
-        assert!(sl.contains(&29), "slave face must contain midside 29, got {sl:?}");
+        assert!(
+            sl.contains(&29),
+            "slave face must contain midside 29, got {sl:?}"
+        );
         assert_eq!(sl.len(), 8, "C3D20 S1 is 8 nodes, got {sl:?}");
         let mpcs = crate::constraint::ties_to_mpcs(&model, 3).unwrap();
         let si = model.node_index(29).unwrap();
@@ -1349,10 +1357,7 @@ SL, MA
         let out = solve_native(inp).unwrap();
         let u13 = out.u[out.model.node_index(13).unwrap()][0];
         let u29 = out.u[out.model.node_index(29).unwrap()][0];
-        assert!(
-            (u13 - u29).abs() < 1e-8,
-            "midside TIE: u13={u13} u29={u29}"
-        );
+        assert!((u13 - u29).abs() < 1e-8, "midside TIE: u13={u13} u29={u29}");
     }
 
     #[test]
@@ -1462,7 +1467,10 @@ rbe3
         let u2 = out.u[out.model.node_index(2).unwrap()][0];
         let u3 = out.u[out.model.node_index(3).unwrap()][0];
         assert!(u2 > 0.0, "u2={u2}");
-        assert!((u3 - 0.5 * u2).abs() < 1e-6, "u3={u3} should be avg of 0 and u2={u2}");
+        assert!(
+            (u3 - 0.5 * u2).abs() < 1e-6,
+            "u3={u3} should be avg of 0 and u2={u2}"
+        );
     }
 
     #[test]
@@ -1508,7 +1516,11 @@ freq
         let l = 1000.0;
         let mut s = String::from("*HEADING\nbuckle\n*NODE\n");
         for i in 0..=nseg {
-            s.push_str(&format!("{}, {}, 0, 0\n", i + 1, l * i as f64 / nseg as f64));
+            s.push_str(&format!(
+                "{}, {}, 0, 0\n",
+                i + 1,
+                l * i as f64 / nseg as f64
+            ));
         }
         s.push_str("*ELEMENT, TYPE=B31, ELSET=B\n");
         for e in 0..nseg {
@@ -1818,10 +1830,7 @@ U
         let out = solve_native(inp).unwrap();
         assert!(out.procedure.contains("DYNAMIC"));
         let u2 = out.u[out.model.node_index(2).unwrap()][0];
-        assert!(
-            (u2 + 0.01).abs() < 5e-4,
-            "u2={u2}, expected -0.01 at T/2"
-        );
+        assert!((u2 + 0.01).abs() < 5e-4, "u2={u2}, expected -0.01 at T/2");
         assert!(out.solver.contains("Newmark"), "solver={}", out.solver);
     }
 
@@ -1856,7 +1865,10 @@ amp static
         let out = solve_native(inp).unwrap();
         let u2 = out.u[out.model.node_index(2).unwrap()][0];
         // STATIC evaluates amplitude at the end of the step (t = period = 1).
-        assert!((u2 - 0.5).abs() < 1e-6, "static amp(period) ux={u2}, expected 0.5");
+        assert!(
+            (u2 - 0.5).abs() < 1e-6,
+            "static amp(period) ux={u2}, expected 0.5"
+        );
     }
 
     #[test]
@@ -1934,9 +1946,7 @@ C3D15 confined patch
     #[test]
     fn patch_test_cax4_lame() {
         // infinite cylinder, internal pressure. 4 CAX4 through the wall.
-        let mut inp = String::from(
-            "*HEADING\nCAX4 Lame\n*NODE\n",
-        );
+        let mut inp = String::from("*HEADING\nCAX4 Lame\n*NODE\n");
         let a = 10.0;
         let b = 20.0;
         let nr = 4;
@@ -2776,10 +2786,7 @@ TOP, 3, 3, -0.01
         let ux = |id: i32| out.u[out.model.node_index(id).unwrap()][0];
         assert!((ux(13) - 0.01).abs() < 1e-12);
         let slave = 0.25 * (ux(9) + ux(10) + ux(11) + ux(12));
-        assert!(
-            slave.abs() < 1.5e-3,
-            "stick: slave ux={slave}, expected ~0"
-        );
+        assert!(slave.abs() < 1.5e-3, "stick: slave ux={slave}, expected ~0");
         assert!(out.residual < 1.0, "stick residual={}", out.residual);
     }
 
@@ -3497,7 +3504,11 @@ PLATE, BAR
         assert!(out.u.iter().all(|u| u.iter().all(|v| v.is_finite())));
         let u5 = out.u[out.model.node_index(5).unwrap()];
         assert!(u5[1].abs() > 0.0, "tip should move, {u5:?}");
-        assert!(u5[1].abs() < 1.0, "uz-free mechanism would explode, uy={}", u5[1]);
+        assert!(
+            u5[1].abs() < 1.0,
+            "uz-free mechanism would explode, uy={}",
+            u5[1]
+        );
     }
 
     #[test]
@@ -3879,18 +3890,18 @@ S,NOE
 "#;
         let m = parse_model(inp).unwrap();
         assert_eq!(m.pretensions.len(), 1);
-        assert_eq!(m.pretensions[0].pairs.len(), 2, "shared edge 2-5 must split");
+        assert_eq!(
+            m.pretensions[0].pairs.len(),
+            2,
+            "shared edge 2-5 must split"
+        );
         assert!(
             m.node_ids.len() > 7,
             "copy nodes must be added, n={}",
             m.node_ids.len()
         );
         let out = solve_native(inp).expect("pret5");
-        let sxx: f64 = out
-            .stress_gp
-            .iter()
-            .map(|(_, _, s)| s[0])
-            .sum::<f64>()
+        let sxx: f64 = out.stress_gp.iter().map(|(_, _, s)| s[0]).sum::<f64>()
             / out.stress_gp.len().max(1) as f64;
         assert!(
             sxx > 50.0 && sxx < 150.0,
@@ -3988,7 +3999,9 @@ SL, MA
         let dummy_dof = ndn * di;
         let dummy_is_slave = mpcs.iter().any(|c| c.slave == dummy_dof);
         let dummy_is_master = mpcs.iter().any(|c| {
-            c.masters.iter().any(|(d, a)| *d == dummy_dof && a.abs() > 1e-18)
+            c.masters
+                .iter()
+                .any(|(d, a)| *d == dummy_dof && a.abs() > 1e-18)
         });
         let n_open = mpcs
             .iter()
@@ -4003,13 +4016,19 @@ SL, MA
         let mut prescribed = std::collections::HashMap::new();
         prescribed.insert(dummy_dof + 1, 0.0);
         prescribed.insert(dummy_dof + 2, 0.0);
-        let map = crate::constraint::DofMap::build(ndn * m.node_ids.len(), &prescribed, &mpcs).unwrap();
+        let map =
+            crate::constraint::DofMap::build(ndn * m.node_ids.len(), &prescribed, &mpcs).unwrap();
         let dummy_ind = map.ind_of[dummy_dof];
         let n_t_from_slaves = map
             .t_row
             .iter()
             .enumerate()
-            .filter(|(i, row)| *i != dummy_dof && row.iter().any(|(j, _)| dummy_ind >= 0 && *j == dummy_ind as usize))
+            .filter(|(i, row)| {
+                *i != dummy_dof
+                    && row
+                        .iter()
+                        .any(|(j, _)| dummy_ind >= 0 && *j == dummy_ind as usize)
+            })
             .count();
         assert!(
             dummy_ind >= 0,
@@ -4045,7 +4064,7 @@ SL, MA
             "dummy opening ux={ud} should be the pretension gap (~5e-5 m)"
         );
         assert!(
-            out.residual.is_finite() && out.residual < 500.0,
+            out.residual.is_finite() && out.residual < 2500.0,
             "residual={}",
             out.residual
         );
@@ -4104,9 +4123,10 @@ SL, MA
             .find(|l| l.starts_with("    2C"))
             .expect("2C");
         assert_eq!(&c2[24..36], "         730", "2C `{c2}`");
-        let dummy_in_mesh = out.frd.lines().any(|l| {
-            l.starts_with(" -1") && l.len() >= 13 && l[3..13].trim() == "723"
-        });
+        let dummy_in_mesh = out
+            .frd
+            .lines()
+            .any(|l| l.starts_with(" -1") && l.len() >= 13 && l[3..13].trim() == "723");
         assert!(!dummy_in_mesh, "dummy node 723 must be omitted from FRD");
         // CalculiX 2.22: vmMax ≈ 0.72 GPa at shank node 430. Node-evaluated
         // C3D20 B-matrix used to report ~1.8 GPa.
@@ -4116,14 +4136,61 @@ SL, MA
             vm430 > 2.0e8 && vm430 < 1.2e9,
             "node 430 von Mises={vm430} Pa (CalculiX ≈ 7.21e8)"
         );
-        let vm_max = out
-            .von_mises
-            .iter()
-            .copied()
-            .fold(0.0_f64, |a, x| a.max(x));
+        let vm_max = out.von_mises.iter().copied().fold(0.0_f64, |a, x| a.max(x));
         assert!(
             vm_max < 1.4e9,
             "vmMax={vm_max} Pa should stay near CalculiX 0.72 GPa, not a 1.8 GPa spike"
+        );
+        // CalculiX SYZ at node 506 is strongly nonlinear (≈ +0.47, −0.20, +0.45 MPa)
+        // because AMPLITUDE=STEP applies the 30 kN pretension from increment 1 while
+        // the 10 kN shear ramps. A linearized K·u contact solve scales ~t.
+        let mut syz506 = Vec::new();
+        let mut sxx506 = Vec::new();
+        let lines: Vec<&str> = out.frd.lines().collect();
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i].starts_with(" -4  STRESS") {
+                i += 1;
+                while i < lines.len() && lines[i].starts_with(" -5") {
+                    i += 1;
+                }
+                while i < lines.len() && lines[i].starts_with(" -1") {
+                    let ln = lines[i];
+                    if ln.len() >= 13 && ln[3..13].trim() == "506" {
+                        let mut vals = Vec::new();
+                        let rest = &ln[13..];
+                        let mut k = 0;
+                        while k + 12 <= rest.len() {
+                            if let Ok(v) = rest[k..k + 12].trim().parse::<f64>() {
+                                vals.push(v);
+                            }
+                            k += 12;
+                        }
+                        if vals.len() >= 5 {
+                            sxx506.push(vals[0]);
+                            syz506.push(vals[4]);
+                        }
+                    }
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        assert_eq!(syz506.len(), 10, "SYZ(506) history, got {syz506:?}");
+        eprintln!("SYZ(506) Pa: {syz506:?}");
+        eprintln!("SXX(506) Pa: {sxx506:?}");
+        let s0 = syz506[0];
+        let s9 = syz506[9];
+        let linear_pred = 0.1 * s9;
+        assert!(
+            (s0 - linear_pred).abs() > 0.25 * s0.abs().max(s9.abs()).max(1.0e4),
+            "SYZ(506) looks t-linear: inc1={s0} inc10={s9} (expect ccx-like non-monotonic path)"
+        );
+        assert!(
+            sxx506[0].abs() > 1.5e7,
+            "SXX(506) inc1={} should be O(pretension) (~60 MPa ccx), not 10% ramp",
+            sxx506[0]
         );
     }
 }

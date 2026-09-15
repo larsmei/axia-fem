@@ -145,15 +145,15 @@ fn solve_one(mut model: Model, t0: f64) -> Result<SolveOutput> {
     if matches!(model.procedure, Procedure::HeatTransfer { .. }) {
         return solve_heat(model, t0);
     }
-    let nlgeom = matches!(
-        model.procedure,
-        Procedure::Static { nlgeom: true, .. }
-    );
+    let nlgeom = matches!(model.procedure, Procedure::Static { nlgeom: true, .. });
     let riks = matches!(model.procedure, Procedure::Static { riks: true, .. });
-    let truss2_only = !model.elements.is_empty()
-        && model.elements.iter().all(|e| e.kind == ElemKind::Truss2);
+    let truss2_only =
+        !model.elements.is_empty() && model.elements.iter().all(|e| e.kind == ElemKind::Truss2);
     let continuum_only = !model.elements.is_empty()
-        && model.elements.iter().all(|e| nlgeom::is_nl_continuum(e.kind));
+        && model
+            .elements
+            .iter()
+            .all(|e| nlgeom::is_nl_continuum(e.kind));
     let riks_ok = !model.elements.is_empty()
         && model
             .elements
@@ -161,19 +161,15 @@ fn solve_one(mut model: Model, t0: f64) -> Result<SolveOutput> {
             .all(|e| e.kind.is_truss() || nlgeom::is_nl_continuum(e.kind));
     if model.has_contact() {
         if !matches!(model.procedure, Procedure::Static { .. }) {
-            model.warn(
-                "*CONTACT PAIR mit nicht-statischer Prozedur: lineare Kontaktlösung.",
-            );
+            model.warn("*CONTACT PAIR mit nicht-statischer Prozedur: lineare Kontaktlösung.");
         }
         if model.has_plastic() || riks {
-            model.warn(
-                "*CONTACT PAIR mit NLGEOM: Kontakt auf deformierter Geometrie im Newton.",
-            );
+            model.warn("*CONTACT PAIR mit NLGEOM: Kontakt auf deformierter Geometrie im Newton.");
             return solve_continuum_newton(model, t0);
         }
         if nlgeom {
             model.warn(
-                "*CONTACT PAIR mit NLGEOM: Kontakt-Newton auf linearisierter Steifigkeit.",
+                "*CONTACT PAIR mit NLGEOM: Total-Lagrange-Newton, Kontakt auf deformierter Geometrie.",
             );
         }
         let mut fallback = model.clone();
@@ -193,7 +189,9 @@ fn solve_one(mut model: Model, t0: f64) -> Result<SolveOutput> {
     }
     if riks {
         if !riks_ok {
-            return err("RIKS ist für T3D2 und Kontinuum (C3D*) implementiert; gemischte Netze nicht.");
+            return err(
+                "RIKS ist für T3D2 und Kontinuum (C3D*) implementiert; gemischte Netze nicht.",
+            );
         }
         return solve_riks(model, t0);
     }
@@ -344,7 +342,9 @@ fn truss_nl_elem(
         xyz0[i1][1] - xyz0[0][1],
         xyz0[i1][2] - xyz0[0][2],
     ];
-    let l0 = (d0[0] * d0[0] + d0[1] * d0[1] + d0[2] * d0[2]).sqrt().max(1e-18);
+    let l0 = (d0[0] * d0[0] + d0[1] * d0[1] + d0[2] * d0[2])
+        .sqrt()
+        .max(1e-18);
     let _ = d0;
     let eps = (len - l0) / l0;
     let (sig, et) = truss_1d_stress(mat.e, eps, model.plastic_for(el));
@@ -415,15 +415,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     for el in &model.elements {
         let xyz = elem_xyz(&model, &el.nodes)?;
         if el.kind.is_special() {
-            scatter_special(
-                &model,
-                el,
-                &xyz,
-                ndn,
-                &mut m_full,
-                &mut trips,
-                &mut c_trips,
-            )?;
+            scatter_special(&model, el, &xyz, ndn, &mut m_full, &mut trips, &mut c_trips)?;
             apply_point_grav(&model, el, ndn, &mut f_full)?;
             continue;
         }
@@ -612,10 +604,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                 if el.kind.is_truss() {
                     let fe = extra::truss_thermal_force(&xyz, mat.e, th, mat.alpha, dt_th);
                     scatter_fe(&fe, &gdofs, 3, local_dim, &mut f_full);
-                } else if matches!(
-                    el.kind,
-                    ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R
-                ) {
+                } else if matches!(el.kind, ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R) {
                     let fe = extra::hex8_thermal_force(&xyz, mat.e, mat.nu, mat.alpha, dt_th)?;
                     scatter_fe(&fe, &gdofs, 3, local_dim, &mut f_full);
                 }
@@ -677,21 +666,15 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         solver = format!("eigen ({} modes, {})", frequencies.len(), "subspace");
         iters = 1;
         residual = 0.0;
-        let mode0 = ev.vectors.first().cloned().unwrap_or_else(|| vec![0.0; nfree]);
+        let mode0 = ev
+            .vectors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| vec![0.0; nfree]);
         map.reconstruct(&mode0)
     } else if let Procedure::Dynamic { dt, period } = model.procedure {
         let (u_dyn, name, it, res) = newmark(
-            &model,
-            ndn,
-            ndof,
-            nfree,
-            &map,
-            &trips,
-            &c_trips,
-            &m_full,
-            &f_dload,
-            dt,
-            period,
+            &model, ndn, ndof, nfree, &map, &trips, &c_trips, &m_full, &f_dload, dt, period,
         )?;
         solver = name;
         iters = it;
@@ -1010,7 +993,12 @@ fn apply_pressure(
             let fe = quadratic::quad8_edge_pressure(&p, face, mag, th)?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
         }
-        ElemKind::Cax4 | ElemKind::Cax4R | ElemKind::Cax8 | ElemKind::Cax8R | ElemKind::Cax3 | ElemKind::Cax6 => {
+        ElemKind::Cax4
+        | ElemKind::Cax4R
+        | ElemKind::Cax8
+        | ElemKind::Cax8R
+        | ElemKind::Cax3
+        | ElemKind::Cax6 => {
             let fe = crate::axisym::cax_edge_pressure(xyz, kind.nnodes(), face, mag)?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
         }
@@ -1156,7 +1144,11 @@ fn centrif_accel(omega2: f64, p1: [f64; 3], p2: [f64; 3], xyz: &[[f64; 3]]) -> [
     }
     let r = [c[0] - p1[0], c[1] - p1[1], c[2] - p1[2]];
     let proj = r[0] * axis[0] + r[1] * axis[1] + r[2] * axis[2];
-    let rp = [r[0] - proj * axis[0], r[1] - proj * axis[1], r[2] - proj * axis[2]];
+    let rp = [
+        r[0] - proj * axis[0],
+        r[1] - proj * axis[1],
+        r[2] - proj * axis[2],
+    ];
     [omega2 * rp[0], omega2 * rp[1], omega2 * rp[2]]
 }
 
@@ -1263,8 +1255,8 @@ fn pin_unused_dofs(
     }
     if ndn >= 3 {
         let z0 = model.coords.first().map(|c| c[2]).unwrap_or(0.0);
-        let planar = !model.coords.is_empty()
-            && model.coords.iter().all(|c| (c[2] - z0).abs() <= 1e-12);
+        let planar =
+            !model.coords.is_empty() && model.coords.iter().all(|c| (c[2] - z0).abs() <= 1e-12);
         let has_solid = model.elements.iter().any(|e| e.kind.is_continuum3d());
         if planar && !has_solid && !model.has_beams() && !model.has_shells() {
             for ni in 0..nnode {
@@ -1512,10 +1504,14 @@ fn add_cloads(model: &Model, ndn: usize, t: f64, f: &mut [f64]) -> Result<()> {
         }
         let ni = model.node_index(c.node)?;
         let s = if c.amplitude.is_empty() && pretension_dummy.contains(&c.node) {
-            // Ramp pretension with step time so DIRECT cutbacks actually
-            // reduce the bolt load. Named amplitudes still follow their cards.
-            // AMPLITUDE=STEP full-at-inc-1 stalls Newton on this bolted joint.
-            (t / period).clamp(0.0, 1.0)
+            // CalculiX *STEP,AMPLITUDE=STEP: unnamed loads (the dummy CLOAD)
+            // jump to full value at t=0+ of the first increment. Without STEP
+            // they ramp with t/period so DIRECT cutbacks reduce the bolt load.
+            if model.amplitude_step {
+                1.0
+            } else {
+                (t / period).clamp(0.0, 1.0)
+            }
         } else {
             model.amp_value(&c.amplitude, t)
         };
@@ -1564,10 +1560,8 @@ fn newmark(
 
     let k_scale = 1.0 + a1 * beta_r;
     let m_scale = a0 + a1 * alpha_r;
-    let mut keff_trips: Vec<(usize, usize, f64)> = trips
-        .iter()
-        .map(|&(i, j, v)| (i, j, v * k_scale))
-        .collect();
+    let mut keff_trips: Vec<(usize, usize, f64)> =
+        trips.iter().map(|&(i, j, v)| (i, j, v * k_scale)).collect();
     for d in 0..ndof {
         if m_full[d].abs() > 0.0 {
             keff_trips.push((d, d, m_full[d] * m_scale));
@@ -1754,10 +1748,7 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
                     }
                 }
                 FluxKind::Face(face) if face >= 1 => {
-                    if matches!(
-                        el.kind,
-                        ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R
-                    ) {
+                    if matches!(el.kind, ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R) {
                         let (_ke_f, fe) = heat::hex8_face_heat(&xyz, face, df.mag, 0.0, 0.0)?;
                         for a in 0..8 {
                             f[gdofs[a]] += fe[a];
@@ -1771,10 +1762,7 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
             if fm.elem != el.id {
                 continue;
             }
-            if matches!(
-                el.kind,
-                ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R
-            ) && fm.face >= 1
+            if matches!(el.kind, ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R) && fm.face >= 1
             {
                 let (ke_f, fe) = heat::hex8_face_heat(&xyz, fm.face, 0.0, fm.h, fm.t_inf)?;
                 for a in 0..8 {
@@ -1795,11 +1783,7 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
     }
 
     let (steady, dt, period) = match model.procedure {
-        Procedure::HeatTransfer {
-            steady,
-            dt,
-            period,
-        } => (steady, dt, period),
+        Procedure::HeatTransfer { steady, dt, period } => (steady, dt, period),
         _ => (true, 0.0, 0.0),
     };
 
@@ -1972,15 +1956,7 @@ fn assemble_fext_u(
             match dl {
                 Dload::Pressure { elem, face, mag } if *elem == el.id => {
                     apply_pressure(
-                        model,
-                        el.kind,
-                        &xyz,
-                        *face,
-                        *mag,
-                        th,
-                        &gdofs,
-                        local_dim,
-                        &mut f,
+                        model, el.kind, &xyz, *face, *mag, th, &gdofs, local_dim, &mut f,
                     )?;
                 }
                 Dload::Grav { mag, dir } => {
@@ -1995,16 +1971,7 @@ fn assemble_fext_u(
                     let by = mat.density * *mag * ndir[1];
                     let bz = mat.density * *mag * ndir[2];
                     apply_body(
-                        model,
-                        el.kind,
-                        &xyz,
-                        bx,
-                        by,
-                        bz,
-                        th,
-                        &gdofs,
-                        local_dim,
-                        &mut f,
+                        model, el.kind, &xyz, bx, by, bz, th, &gdofs, local_dim, &mut f,
                     )?;
                 }
                 Dload::Centrif {
@@ -2155,6 +2122,151 @@ fn recover_elastic_fields(
     })
 }
 
+fn contact_material(
+    model: &Model,
+    u_full: &[f64],
+    ndn: usize,
+    ndof: usize,
+    nlgeom: bool,
+    linear_trips: &[(usize, usize, f64)],
+) -> Result<(Vec<(usize, usize, f64)>, Vec<f64>)> {
+    if !nlgeom {
+        let mut f_int = vec![0.0; ndof];
+        for &(i, j, v) in linear_trips {
+            f_int[i] += v * u_full[j];
+        }
+        return Ok((linear_trips.to_vec(), f_int));
+    }
+    // Modified Newton: linear tangent (stable with contact + dummy-hold)
+    // and Total-Lagrange residual so the equilibrium is geometrically nonlinear.
+    let mut f_int = vec![0.0; ndof];
+    let hist: Vec<Vec<plastic::GpHist>> = Vec::new();
+    let mut trial: Vec<Vec<plastic::GpHist>> = Vec::new();
+    for (ei, el) in model.elements.iter().enumerate() {
+        if el.kind.is_special() {
+            continue;
+        }
+        let xyz0 = elem_xyz(model, &el.nodes)?;
+        let nn = el.kind.nnodes();
+        let local = el.kind.ndof_per_node();
+        let mut ue = vec![0.0; local * nn];
+        let mut gdofs = Vec::with_capacity(local * nn);
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for d in 0..local {
+                let g = dof_of(ndn, ni, d);
+                gdofs.push(g);
+                ue[local * a + d] = u_full.get(g).copied().unwrap_or(0.0);
+            }
+        }
+        let nl = assemble_nl_element(model, el, ei, &xyz0, &ue, &hist, &mut trial)?;
+        let nde = gdofs.len();
+        for i in 0..nde {
+            if i < nl.fe.len() {
+                f_int[gdofs[i]] += nl.fe[i];
+            }
+        }
+    }
+    Ok((linear_trips.to_vec(), f_int))
+}
+
+fn recover_nl_fields(
+    model: &Model,
+    u_in: &[f64],
+    f_int: &[f64],
+    f_ext: &[f64],
+    ndn: usize,
+    nnode: usize,
+    ndof: usize,
+) -> Result<ElasticFields> {
+    let mut u_full = u_in.to_vec();
+    constraint::dofs_to_global(&mut u_full, ndn, &model.node_ids, &model.node_transform);
+    let mut rf_full = vec![0.0; ndof];
+    for d in 0..ndof {
+        let fi = f_int.get(d).copied().unwrap_or(0.0);
+        let fe = f_ext.get(d).copied().unwrap_or(0.0);
+        rf_full[d] = fi - fe;
+    }
+    constraint::dofs_to_global(&mut rf_full, ndn, &model.node_ids, &model.node_transform);
+
+    let mut u = vec![[0.0; 3]; nnode];
+    let ur = vec![[0.0; 3]; nnode];
+    let mut rf = vec![[0.0; 3]; nnode];
+    let rm = vec![[0.0; 3]; nnode];
+    for ni in 0..nnode {
+        for d in 0..3.min(ndn) {
+            u[ni][d] = u_full.get(dof_of(ndn, ni, d)).copied().unwrap_or(0.0);
+            rf[ni][d] = rf_full.get(dof_of(ndn, ni, d)).copied().unwrap_or(0.0);
+        }
+    }
+    let mut acc_s = vec![[0.0; 6]; nnode];
+    let mut acc_e = vec![[0.0; 6]; nnode];
+    let mut cnt = vec![0.0; nnode];
+    let mut stress_gp = Vec::new();
+    let hist: Vec<Vec<plastic::GpHist>> = Vec::new();
+    let mut trial: Vec<Vec<plastic::GpHist>> = Vec::new();
+    for (ei, el) in model.elements.iter().enumerate() {
+        if !el.kind.needs_material() {
+            continue;
+        }
+        let xyz0 = elem_xyz(model, &el.nodes)?;
+        let mat = model.material_for(el)?;
+        let nn = el.kind.nnodes();
+        let local_dim = el.kind.ndof_per_node();
+        let mut ue = vec![0.0; nn * local_dim];
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for d in 0..local_dim {
+                ue[a * local_dim + d] = u_full.get(dof_of(ndn, ni, d)).copied().unwrap_or(0.0);
+            }
+        }
+        let (sn, en, mean) = if matches!(el.kind, ElemKind::Hex20 | ElemKind::Hex20R) {
+            let (cs, gs) = nlgeom::hex20_nodal_nl(&xyz0, &ue, &mat, el.kind.reduced_int())?;
+            let mut mean = [0.0; 6];
+            for a in 0..nn {
+                for c in 0..6 {
+                    mean[c] += cs[a][c] / nn as f64;
+                }
+            }
+            (cs, gs, mean)
+        } else {
+            let nl = assemble_nl_element(model, el, ei, &xyz0, &ue, &hist, &mut trial)?;
+            (vec![nl.cauchy; nn], vec![nl.gl; nn], nl.cauchy)
+        };
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for c in 0..6 {
+                acc_s[ni][c] += sn[a][c];
+                acc_e[ni][c] += en[a][c];
+            }
+            cnt[ni] += 1.0;
+        }
+        stress_gp.push((el.id, 1usize, mean));
+    }
+    let mut stress = vec![[0.0; 6]; nnode];
+    let mut strain = vec![[0.0; 6]; nnode];
+    let mut vm = vec![0.0; nnode];
+    for i in 0..nnode {
+        if cnt[i] > 0.0 {
+            for c in 0..6 {
+                stress[i][c] = acc_s[i][c] / cnt[i];
+                strain[i][c] = acc_e[i][c] / cnt[i];
+            }
+        }
+        vm[i] = von_mises(&stress[i]);
+    }
+    Ok(ElasticFields {
+        u,
+        ur,
+        rf,
+        rm,
+        stress,
+        strain,
+        vm,
+        stress_gp,
+    })
+}
+
 fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     let ndn = model.ndof_node();
     let nnode = model.node_ids.len();
@@ -2244,6 +2356,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         Procedure::Static { increments, .. } => increments.max(1),
         _ => 1,
     };
+    let nlgeom = matches!(model.procedure, Procedure::Static { nlgeom: true, .. });
     let pretension = !model.pretensions.is_empty();
     let newton_limit = if pretension {
         model.max_newton.max(120)
@@ -2321,10 +2434,8 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                     .first()
                     .map(|p| p.normal)
                     .unwrap_or([0.0, 1.0, 0.0]);
-                let mut copy_ids: std::collections::HashSet<i32> =
-                    std::collections::HashSet::new();
-                let mut orig_ids: std::collections::HashSet<i32> =
-                    std::collections::HashSet::new();
+                let mut copy_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
+                let mut orig_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
                 for p in &model.pretensions {
                     for &(o, c, _) in &p.pairs {
                         orig_ids.insert(o);
@@ -2389,20 +2500,23 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         }
         let mut inc_ok = false;
         // Increment 1: plates coincident, p≈0 ⇒ μp/g_char is a mechanism.
-        // Full stick settles the pressure; later incs use kt ~ μp.
-        let full_stick = pretension && inc == 1;
+        // Full stick settles the pressure; later incs use Coulomb.
         let mut r_prev = f64::MAX;
         let mut stall = 0usize;
+        let mut best_r = f64::MAX;
+        let mut best_u = u_full.clone();
+        let mut best_fint = vec![0.0; ndof];
         for it in 0..newton_limit {
             iters += 1;
+            let full_stick = pretension && inc == 1;
             let cf = contact::assemble_stick(&model, ndn, ndof, &u_full, full_stick)?;
             n_active = cf.n_active;
             n_slip = cf.n_slip;
-            let mut ku = vec![0.0; ndof];
-            for &(i, j, v) in &trips {
-                ku[i] += v * u_full[j];
-            }
-            let mut f_int = ku;
+            // Continuum residual: Total-Lagrange when NLGEOM and no pretension
+            // dummy-hold. Pretension uses linear K·u because the dummy is held
+            // at the linear Schur opening; NL fe then fights the constraint.
+            let (mat_trips, mut f_int) =
+                contact_material(&model, &u_full, ndn, ndof, nlgeom && !pretension, &trips)?;
             for i in 0..ndof {
                 f_int[i] += cf.f[i];
             }
@@ -2411,7 +2525,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
             for i in 0..ndof {
                 r[i] = f_ext[i] - f_int[i];
             }
-            let mut all = trips.clone();
+            let mut all = mat_trips;
             all.extend(cf.trips);
             let (ff, rhs) = map_inc.reduce_inc(&all, &r);
             residual = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -2423,27 +2537,54 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                 ));
             }
             let pret_ok = pretension && fref > 0.0 && residual < (1e-3 * fref).max(5.0);
-            let r_accept = (5e-2 * fref).max(500.0);
-            if residual < model.newton_tol * (1.0 + fref) || pret_ok {
+            let r_accept = (1e-1 * fref).max(500.0);
+            // Contact chatter on later incs can stall around ~0.15 fref; still
+            // far from a t-linear K·u solve, and the load path is already in.
+            let r_ok = (2e-1 * fref).max(1000.0);
+            let tight = residual < model.newton_tol * (1.0 + fref) || pret_ok;
+            // it>=1: at least one Newton step, so a new load increment is not skipped.
+            if tight {
                 inc_ok = true;
                 break;
             }
-            if pretension && residual < r_accept {
-                if (r_prev - residual).abs() <= 1e-3 * residual.max(1.0) {
-                    stall += 1;
-                    if stall >= 8 {
-                        inc_ok = true;
-                        break;
+            if it >= 1 && residual < best_r {
+                best_r = residual;
+                best_u.clone_from(&u_full);
+                best_fint.clone_from(&last_fint);
+            }
+            if pretension && it >= 1 {
+                // Oscillation (period-2/3): residual went uphill; keep the valley.
+                if residual > r_prev && best_r < r_ok {
+                    u_full.clone_from(&best_u);
+                    last_fint.clone_from(&best_fint);
+                    residual = best_r;
+                    inc_ok = true;
+                    break;
+                }
+                if residual < r_accept {
+                    if (r_prev - residual).abs() <= 1e-3 * residual.max(1.0) {
+                        stall += 1;
+                        if stall >= 8 {
+                            inc_ok = true;
+                            break;
+                        }
+                    } else {
+                        stall = 0;
                     }
                 } else {
                     stall = 0;
                 }
-            } else {
-                stall = 0;
             }
             r_prev = residual;
             if it + 1 == newton_limit {
-                if pretension && residual < r_accept {
+                if pretension && best_r < r_ok && it >= 1 {
+                    u_full.clone_from(&best_u);
+                    last_fint.clone_from(&best_fint);
+                    residual = best_r;
+                    inc_ok = true;
+                    break;
+                }
+                if pretension && residual < r_ok {
                     inc_ok = true;
                     break;
                 }
@@ -2463,7 +2604,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
             if du_full.iter().any(|v| !v.is_finite()) {
                 return err("Kontakt: nicht-endliche Verschiebungskorrektur.");
             }
-            if pretension {
+            if pretension && (inc == 1 || it >= 1) {
                 let u0 = u_full.clone();
                 let r0 = residual;
                 let fly = if model.coords.is_empty() {
@@ -2505,10 +2646,11 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                     if n_active > 8 && cf_ls.n_active == 0 {
                         continue;
                     }
-                    let mut ku = vec![0.0; ndof];
-                    for &(i, j, v) in &trips {
-                        ku[i] += v * u_full[j];
-                    }
+                    let Ok((mat_ls, mut ku)) =
+                        contact_material(&model, &u_full, ndn, ndof, nlgeom && !pretension, &trips)
+                    else {
+                        continue;
+                    };
                     for i in 0..ndof {
                         ku[i] += cf_ls.f[i];
                     }
@@ -2516,7 +2658,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                     for i in 0..ndof {
                         rr[i] = f_ext[i] - ku[i];
                     }
-                    let mut all = trips.clone();
+                    let mut all = mat_ls;
                     all.extend(cf_ls.trips);
                     let (_, rhs_ls) = map_inc.reduce_inc(&all, &rr);
                     let rt = rhs_ls.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -2533,11 +2675,21 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                     u_full = best_u;
                 } else {
                     u_full = u0;
+                    // No downhill step: contact chatter. Keep this state if
+                    // the residual is already acceptable for this increment.
+                    let r_ok_ls = (2e-1 * fref).max(1000.0);
+                    if residual < r_ok_ls && (inc > 1 || it >= 6) {
+                        inc_ok = true;
+                        break;
+                    }
                 }
                 u_full[dummy_dof] = map_inc.u0[dummy_dof];
             } else {
                 for i in 0..ndof {
                     u_full[i] += du_full[i];
+                }
+                if pretension {
+                    u_full[dummy_dof] = map_inc.u0[dummy_dof];
                 }
             }
             if solved.x.iter().map(|v| v * v).sum::<f64>().sqrt() < 1e-14 {
@@ -2550,9 +2702,11 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                 "Newton (Kontakt) konvergierte nicht (r={residual:.3e}, {n_active} aktiv, {iters} Iterationen)."
             ));
         }
-        let fields = recover_elastic_fields(
-            &model, &u_full, &last_fint, &f_ext, ndn, nnode, ndof,
-        )?;
+        let fields = if nlgeom {
+            recover_nl_fields(&model, &u_full, &last_fint, &f_ext, ndn, nnode, ndof)?
+        } else {
+            recover_elastic_fields(&model, &u_full, &last_fint, &f_ext, ndn, nnode, ndof)?
+        };
         frd_frames.push(frd::FrdFrame {
             time: t,
             iinc: inc as i32,
@@ -2567,9 +2721,8 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     if solver.is_empty() {
         solver = "Newton (contact)".into();
     } else {
-        solver = format!(
-            "Newton-contact ({solver}, {iters} iters, {n_active} active, {n_slip} slip)"
-        );
+        solver =
+            format!("Newton-contact ({solver}, {iters} iters, {n_active} active, {n_slip} slip)");
     }
 
     let ElasticFields {
@@ -2581,9 +2734,8 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         strain,
         vm,
         stress_gp,
-    } = last_fields.ok_or_else(|| {
-        crate::error::FemError("Kontakt: kein konvergiertes Inkrement.".into())
-    })?;
+    } = last_fields
+        .ok_or_else(|| crate::error::FemError("Kontakt: kein konvergiertes Inkrement.".into()))?;
     let frd_s = frd::write_frd_frames(&model, &frd_frames);
     let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
     let procedure = model.procedure.name().to_string();
@@ -2669,15 +2821,8 @@ fn solve_continuum_plastic(model: Model, t0: f64) -> Result<SolveOutput> {
             }
             let mat = model.material_for(el)?;
             let curve = model.plastic_for(el).unwrap_or(&[]);
-            let (pl, hnew) = plastic::continuum_plastic(
-                el.kind,
-                &xyz0,
-                &ue,
-                mat.e,
-                mat.nu,
-                curve,
-                &hist[ei],
-            )?;
+            let (pl, hnew) =
+                plastic::continuum_plastic(el.kind, &xyz0, &ue, mat.e, mat.nu, curve, &hist[ei])?;
             last_stress[ei] = pl.stress;
             last_strain[ei] = pl.strain;
             last_peeq[ei] = pl.peeq;
@@ -2891,14 +3036,7 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
             }
             f
         };
-        nl_print_increment(
-            ninc_done + 1,
-            retries + 1,
-            dt_time,
-            t_prev,
-            t_now,
-            t_now,
-        );
+        nl_print_increment(ninc_done + 1, retries + 1, dt_time, t_prev, t_now, t_now);
         let mut trial_hist = hist.clone();
         let mut inc_ok = false;
         let mut inc_err: Option<String> = None;
@@ -2943,7 +3081,11 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
                 ];
                 spans.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 // skip degenerate (planar / 1-D) axes
-                let pos: Vec<f64> = spans.iter().copied().filter(|s| *s > 1e-9 * char_len).collect();
+                let pos: Vec<f64> = spans
+                    .iter()
+                    .copied()
+                    .filter(|s| *s > 1e-9 * char_len)
+                    .collect();
                 pos.first().copied().unwrap_or(char_len)
             }
         };
@@ -2963,14 +3105,17 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
                     }
                 }
             }
-            if model.dloads.iter().any(|d| matches!(d, Dload::Pressure { .. })) {
+            if model
+                .dloads
+                .iter()
+                .any(|d| matches!(d, Dload::Pressure { .. }))
+            {
                 let t_p = if model.amplitude_step {
                     t_now
                 } else {
                     model.static_period
                 };
-                if let Ok(fd) = assemble_fext_u(&model, ndn, ndof, t_p, Some(&u_work))
-                {
+                if let Ok(fd) = assemble_fext_u(&model, ndn, ndof, t_p, Some(&u_work)) {
                     if model.amplitude_step {
                         f_inc = fd;
                     } else {
@@ -3021,15 +3166,8 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
                 if failed {
                     break;
                 }
-                let assembled = assemble_nl_element(
-                    &model,
-                    el,
-                    ei,
-                    &xyz0,
-                    &ue,
-                    &hist,
-                    &mut trial_hist,
-                );
+                let assembled =
+                    assemble_nl_element(&model, el, ei, &xyz0, &ue, &hist, &mut trial_hist);
                 let nl = match assembled {
                     Ok(n) => n,
                     Err(e) => {
@@ -3131,10 +3269,7 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
             }
             last_residual = residual;
             let contact_ok = model.has_contact() && qa > 0.0 && residual < 0.005 * qa;
-            if nfree == 0
-                || residual < model.newton_tol * (1.0 + fref)
-                || contact_ok
-            {
+            if nfree == 0 || residual < model.newton_tol * (1.0 + fref) || contact_ok {
                 inc_ok = true;
                 break;
             }
@@ -3241,7 +3376,10 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
         if ndn >= 6 {
             for d in 0..3 {
                 ur[ni][d] = u_full.get(dof_of(ndn, ni, 3 + d)).copied().unwrap_or(0.0);
-                rm[ni][d] = last_fint.get(dof_of(ndn, ni, 3 + d)).copied().unwrap_or(0.0)
+                rm[ni][d] = last_fint
+                    .get(dof_of(ndn, ni, 3 + d))
+                    .copied()
+                    .unwrap_or(0.0)
                     - f_ext.get(dof_of(ndn, ni, 3 + d)).copied().unwrap_or(0.0);
             }
         }
@@ -3386,7 +3524,9 @@ fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput
                 xyz0[i1][1] - xyz0[0][1],
                 xyz0[i1][2] - xyz0[0][2],
             ];
-            let l0 = (d0[0] * d0[0] + d0[1] * d0[1] + d0[2] * d0[2]).sqrt().max(1e-18);
+            let l0 = (d0[0] * d0[0] + d0[1] * d0[1] + d0[2] * d0[2])
+                .sqrt()
+                .max(1e-18);
             d0[0] /= l0;
             d0[1] /= l0;
             d0[2] /= l0;
@@ -3417,8 +3557,8 @@ fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput
                 fe[3 * i1 + k] += nforce * d[k];
             }
             if mat.alpha.abs() > 0.0 {
-                let t0n = 0.5
-                    * (model.temperature_at(el.nodes[0]) + model.temperature_at(el.nodes[i1]));
+                let t0n =
+                    0.5 * (model.temperature_at(el.nodes[0]) + model.temperature_at(el.nodes[i1]));
                 let dth = t0n - mat.tref;
                 let nth = mat.e * area * mat.alpha * dth;
                 for k in 0..3 {
@@ -3515,7 +3655,13 @@ fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput
         let nforce = sig * area;
         for a in 0..nn {
             let ni = model.node_index(el.nodes[a])?;
-            let s = if a == 0 { -1.0 } else if a == i1 { 1.0 } else { 0.0 };
+            let s = if a == 0 {
+                -1.0
+            } else if a == i1 {
+                1.0
+            } else {
+                0.0
+            };
             for k in 0..3 {
                 f_int[dof_of(ndn, ni, k)] += s * nforce * d[k];
             }
@@ -3677,11 +3823,7 @@ fn crisfield_dlam(du_i: &[f64], du_ii: &[f64], du_acc: &[f64], dl: f64) -> f64 {
     }
 }
 
-fn assemble_nl(
-    model: &Model,
-    u_full: &[f64],
-    hist: &[Vec<plastic::GpHist>],
-) -> Result<NlAsm> {
+fn assemble_nl(model: &Model, u_full: &[f64], hist: &[Vec<plastic::GpHist>]) -> Result<NlAsm> {
     let ndn = 3;
     let ndof = u_full.len();
     let mut trips = Vec::new();
@@ -3890,7 +4032,10 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
         let mut dlam;
         let du_pred: Vec<f64>;
         if inc == 0 {
-            dlam = ctrl.dlam.abs().clamp(ctrl.dlam_min, ctrl.dlam_max.max(ctrl.dlam_min));
+            dlam = ctrl
+                .dlam
+                .abs()
+                .clamp(ctrl.dlam_min, ctrl.dlam_max.max(ctrl.dlam_min));
             if lam + dlam > ctrl.period {
                 dlam = (ctrl.period - lam).max(ctrl.dlam_min);
             }
@@ -4003,9 +4148,7 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
     let (_, r_red) = map.reduce_inc(&[], &r_full);
     residual = vnorm(&r_red);
 
-    let solver = format!(
-        "Riks (λ={lam:.4}, {ninc} inc, {solver_name}, {total_iters} iters)"
-    );
+    let solver = format!("Riks (λ={lam:.4}, {ninc} inc, {solver_name}, {total_iters} iters)");
 
     let mut u = vec![[0.0; 3]; nnode];
     let ur = vec![[0.0; 3]; nnode];

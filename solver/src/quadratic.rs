@@ -119,7 +119,12 @@ pub(crate) fn hex_gauss(reduced: bool) -> Vec<(f64, f64, f64, f64)> {
     o
 }
 
-pub fn hex20_stiffness(xyz: &[[f64; 3]], e: f64, nu: f64, reduced: bool) -> Result<(Vec<f64>, f64)> {
+pub fn hex20_stiffness(
+    xyz: &[[f64; 3]],
+    e: f64,
+    nu: f64,
+    reduced: bool,
+) -> Result<(Vec<f64>, f64)> {
     if xyz.len() < 20 {
         return err("C3D20 braucht 20 Knoten.");
     }
@@ -163,11 +168,11 @@ pub fn hex20_nodal_stress(
         six.copy_from_slice(&s);
         gsig.push(six);
     }
-    let pts: Vec<f64> = if reduced {
-        vec![-G2, G2]
-    } else {
-        G3.to_vec()
-    };
+    Ok(hex20_extrapolate(&gsig, reduced))
+}
+
+pub(crate) fn hex20_extrapolate(gsig: &[[f64; 6]], reduced: bool) -> Vec<[f64; 6]> {
+    let pts: Vec<f64> = if reduced { vec![-G2, G2] } else { G3.to_vec() };
     let n1 = pts.len();
     let mut out = vec![[0.0; 6]; 20];
     for a in 0..20 {
@@ -187,7 +192,7 @@ pub fn hex20_nodal_stress(
             }
         }
     }
-    Ok(out)
+    out
 }
 
 fn lagrange1d(pts: &[f64], x: f64) -> Vec<f64> {
@@ -204,8 +209,13 @@ fn lagrange1d(pts: &[f64], x: f64) -> Vec<f64> {
     w
 }
 
-
-pub fn hex20_body_force(xyz: &[[f64; 3]], bx: f64, by: f64, bz: f64, reduced: bool) -> Result<Vec<f64>> {
+pub fn hex20_body_force(
+    xyz: &[[f64; 3]],
+    bx: f64,
+    by: f64,
+    bz: f64,
+    reduced: bool,
+) -> Result<Vec<f64>> {
     let mut fe = vec![0.0; 60];
     for (xi, eta, zeta, w) in hex_gauss(reduced) {
         let (_, det, n) = hex20_dndx(xyz, xi, eta, zeta)?;
@@ -307,7 +317,11 @@ pub(crate) fn quad8_shape(xi: f64, eta: f64) -> ([f64; 8], [[f64; 2]; 8]) {
     (n, dn)
 }
 
-pub(crate) fn quad8_dndx(xy: &[[f64; 2]], xi: f64, eta: f64) -> Result<([[f64; 2]; 8], f64, [f64; 8])> {
+pub(crate) fn quad8_dndx(
+    xy: &[[f64; 2]],
+    xi: f64,
+    eta: f64,
+) -> Result<([[f64; 2]; 8], f64, [f64; 8])> {
     let (n, dn) = quad8_shape(xi, eta);
     let mut j = [[0.0; 2]; 2];
     for a in 0..8 {
@@ -406,7 +420,13 @@ pub fn quad8_nodal_stress(
     Ok(out)
 }
 
-pub fn quad8_body_force(xy: &[[f64; 2]], bx: f64, by: f64, t: f64, reduced: bool) -> Result<Vec<f64>> {
+pub fn quad8_body_force(
+    xy: &[[f64; 2]],
+    bx: f64,
+    by: f64,
+    t: f64,
+    reduced: bool,
+) -> Result<Vec<f64>> {
     let mut fe = vec![0.0; 16];
     for (xi, eta, w) in quad_gauss(reduced) {
         let (_, det, n) = quad8_dndx(xy, xi, eta)?;
@@ -490,7 +510,12 @@ fn tet10_shape(r: f64, s: f64, t: f64) -> ([f64; 10], [[f64; 3]; 10]) {
     (n, dn)
 }
 
-pub(crate) fn tet10_dndx(xyz: &[[f64; 3]], r: f64, s: f64, t: f64) -> Result<([[f64; 3]; 10], f64, [f64; 10])> {
+pub(crate) fn tet10_dndx(
+    xyz: &[[f64; 3]],
+    r: f64,
+    s: f64,
+    t: f64,
+) -> Result<([[f64; 3]; 10], f64, [f64; 10])> {
     let (n, dn) = tet10_shape(r, s, t);
     let mut j = [[0.0; 3]; 3];
     for a in 0..10 {
@@ -649,7 +674,11 @@ pub(crate) fn tri6_shape(xi: f64, eta: f64) -> ([f64; 6], [[f64; 2]; 6]) {
     (n, dn)
 }
 
-pub(crate) fn tri6_dndx(xy: &[[f64; 2]], xi: f64, eta: f64) -> Result<([[f64; 2]; 6], f64, [f64; 6])> {
+pub(crate) fn tri6_dndx(
+    xy: &[[f64; 2]],
+    xi: f64,
+    eta: f64,
+) -> Result<([[f64; 2]; 6], f64, [f64; 6])> {
     let (n, dn) = tri6_shape(xi, eta);
     let mut j = [[0.0; 2]; 2];
     for a in 0..6 {
@@ -683,7 +712,11 @@ pub fn tri6_stiffness(
     let mut ke = vec![0.0; n * n];
     let mut area = 0.0;
     // 3-point Hammer, parent area 1/2
-    let pts = [[1.0 / 6.0, 1.0 / 6.0], [2.0 / 3.0, 1.0 / 6.0], [1.0 / 6.0, 2.0 / 3.0]];
+    let pts = [
+        [1.0 / 6.0, 1.0 / 6.0],
+        [2.0 / 3.0, 1.0 / 6.0],
+        [1.0 / 6.0, 2.0 / 3.0],
+    ];
     let w = 1.0 / 6.0;
     for p in &pts {
         let (dndx, det, _) = tri6_dndx(xy, p[0], p[1])?;
@@ -738,7 +771,11 @@ pub fn tri6_nodal_stress(
 
 pub fn tri6_body_force(xy: &[[f64; 2]], bx: f64, by: f64, t: f64) -> Result<Vec<f64>> {
     let mut fe = vec![0.0; 12];
-    let pts = [[1.0 / 6.0, 1.0 / 6.0], [2.0 / 3.0, 1.0 / 6.0], [1.0 / 6.0, 2.0 / 3.0]];
+    let pts = [
+        [1.0 / 6.0, 1.0 / 6.0],
+        [2.0 / 3.0, 1.0 / 6.0],
+        [1.0 / 6.0, 2.0 / 3.0],
+    ];
     let w = 1.0 / 6.0;
     for p in &pts {
         let (_, det, n) = tri6_dndx(xy, p[0], p[1])?;
@@ -749,7 +786,6 @@ pub fn tri6_body_force(xy: &[[f64; 2]], bx: f64, by: f64, t: f64) -> Result<Vec<
     }
     Ok(fe)
 }
-
 
 #[cfg(test)]
 mod tests {

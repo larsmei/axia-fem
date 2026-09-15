@@ -1,8 +1,10 @@
 //! Total-Lagrange St. Venant–Kirchhoff for continuum (NLGEOM).
 //! Small strain recovers linear elasticity.
 
-use crate::elem::{d_iso_3d, d_plane_strain, d_plane_stress, gemm_bt_d_b, hex8_dndx, invert2, invert3, G2};
 use crate::eigen::add_continuum_kg;
+use crate::elem::{
+    d_iso_3d, d_plane_strain, d_plane_stress, gemm_bt_d_b, hex8_dndx, invert2, invert3, G2,
+};
 use crate::error::{err, Result};
 use crate::model::{ElemKind, HyperKind, Material};
 use crate::quadratic;
@@ -68,11 +70,7 @@ fn det3(a: &[[f64; 3]; 3]) -> f64 {
 }
 
 pub(crate) fn pk2_to_cauchy(f: &[[f64; 3]; 3], s: &[f64; 6]) -> Result<[f64; 6]> {
-    let sm = [
-        [s[0], s[3], s[5]],
-        [s[3], s[1], s[4]],
-        [s[5], s[4], s[2]],
-    ];
+    let sm = [[s[0], s[3], s[5]], [s[3], s[1], s[4]], [s[5], s[4], s[2]]];
     let mut fs = [[0.0; 3]; 3];
     for i in 0..3 {
         for j in 0..3 {
@@ -224,7 +222,12 @@ fn assemble_gp(
     let cauchy = pk2_to_cauchy(&f, &s)?;
     let egl = green_lagrange(&f);
     let glv = [
-        egl[0][0], egl[1][1], egl[2][2], 2.0 * egl[0][1], 2.0 * egl[1][2], 2.0 * egl[2][0],
+        egl[0][0],
+        egl[1][1],
+        egl[2][2],
+        2.0 * egl[0][1],
+        2.0 * egl[1][2],
+        2.0 * egl[2][0],
     ];
     for i in 0..6 {
         acc.cauchy[i] += cauchy[i] * w;
@@ -255,12 +258,7 @@ fn hex8_nl(xyz0: &[[f64; 3]], ue: &[f64], mat: &Material) -> Result<NlElem> {
     Ok(acc.finish())
 }
 
-fn hex20_nl(
-    xyz0: &[[f64; 3]],
-    ue: &[f64],
-    mat: &Material,
-    reduced: bool,
-) -> Result<NlElem> {
+fn hex20_nl(xyz0: &[[f64; 3]], ue: &[f64], mat: &Material, reduced: bool) -> Result<NlElem> {
     let mut acc = GpAcc::new(60);
     for (xi, eta, zeta, w0) in quadratic::hex_gauss(reduced) {
         let (dndx, det, _) = quadratic::hex20_dndx(xyz0, xi, eta, zeta)?;
@@ -270,6 +268,43 @@ fn hex20_nl(
         assemble_gp(&mut acc, 20, &dndx, ue, mat, w0 * det)?;
     }
     Ok(acc.finish())
+}
+
+/// Cauchy and Green–Lagrange at the 20 C3D20 nodes (Gauss + Lagrange, like ccx).
+pub fn hex20_nodal_nl(
+    xyz0: &[[f64; 3]],
+    ue: &[f64],
+    mat: &Material,
+    reduced: bool,
+) -> Result<(Vec<[f64; 6]>, Vec<[f64; 6]>)> {
+    let gps = quadratic::hex_gauss(reduced);
+    let mut g_c = Vec::with_capacity(gps.len());
+    let mut g_e = Vec::with_capacity(gps.len());
+    for &(xi, eta, zeta, _) in &gps {
+        let (dndx, det, _) = quadratic::hex20_dndx(xyz0, xi, eta, zeta)?;
+        if det <= 0.0 {
+            return err("NLGEOM C3D20: negative Jakobideterminante.");
+        }
+        let f = deformation_gradient(&dndx, ue, 20);
+        if det3(&f) <= 1e-18 {
+            return err("NLGEOM: det(F) ≤ 0 (Element inversion).");
+        }
+        let (s, _) = pk2_and_c(&f, mat)?;
+        g_c.push(pk2_to_cauchy(&f, &s)?);
+        let egl = green_lagrange(&f);
+        g_e.push([
+            egl[0][0],
+            egl[1][1],
+            egl[2][2],
+            2.0 * egl[0][1],
+            2.0 * egl[1][2],
+            2.0 * egl[2][0],
+        ]);
+    }
+    Ok((
+        quadratic::hex20_extrapolate(&g_c, reduced),
+        quadratic::hex20_extrapolate(&g_e, reduced),
+    ))
 }
 
 fn tet4_nl(xyz0: &[[f64; 3]], ue: &[f64], mat: &Material) -> Result<NlElem> {
@@ -439,12 +474,7 @@ fn pk2_hyper(c: &[[f64; 3]; 3], mat: &Material) -> Result<[f64; 6]> {
     }
 }
 
-fn ogden_pk2(
-    c: &[[f64; 3]; 3],
-    j: f64,
-    cinv: &[[f64; 3]; 3],
-    mat: &Material,
-) -> Result<[f64; 6]> {
+fn ogden_pk2(c: &[[f64; 3]; 3], j: f64, cinv: &[[f64; 3]; 3], mat: &Material) -> Result<[f64; 6]> {
     let (evals, evecs) = eigen3_sym(c)?;
     let mut lam = [0.0; 3];
     for i in 0..3 {
@@ -563,7 +593,12 @@ fn hyper_pk2_and_c(f: &[[f64; 3]; 3], mat: &Material) -> Result<([f64; 6], [f64;
     let s0 = pk2_hyper(&c0, mat)?;
     let egl = green_lagrange(f);
     let e0 = [
-        egl[0][0], egl[1][1], egl[2][2], 2.0 * egl[0][1], 2.0 * egl[1][2], 2.0 * egl[2][0],
+        egl[0][0],
+        egl[1][1],
+        egl[2][2],
+        2.0 * egl[0][1],
+        2.0 * egl[1][2],
+        2.0 * egl[2][0],
     ];
     let eps = 1e-7;
     let mut d = [0.0; 36];
@@ -602,7 +637,10 @@ fn plane_nl(
     for (xi, eta, w0) in plane_gauss(nn, reduced) {
         let (dndx2, det, _) = plane_dndx(kind, xyz0, xi, eta)?;
         if det <= 0.0 {
-            return err(format!("NLGEOM {}: negative Jakobideterminante.", kind.ccx_name()));
+            return err(format!(
+                "NLGEOM {}: negative Jakobideterminante.",
+                kind.ccx_name()
+            ));
         }
         let mut dndx3 = vec![[0.0; 3]; nn];
         for a in 0..nn {
@@ -640,8 +678,10 @@ fn assemble_gp_plane_stress(
         return err("NLGEOM plane stress: det(F) ≤ 0.");
     }
     let egl = [
-        [0.5 * (f2[0][0] * f2[0][0] + f2[1][0] * f2[1][0] - 1.0),
-         0.5 * (f2[0][0] * f2[0][1] + f2[1][0] * f2[1][1])],
+        [
+            0.5 * (f2[0][0] * f2[0][0] + f2[1][0] * f2[1][0] - 1.0),
+            0.5 * (f2[0][0] * f2[0][1] + f2[1][0] * f2[1][1]),
+        ],
         [0.0, 0.5 * (f2[0][1] * f2[0][1] + f2[1][1] * f2[1][1] - 1.0)],
     ];
     let e_eng = [egl[0][0], egl[1][1], 2.0 * egl[0][1]];
@@ -775,7 +815,11 @@ fn plane_dndx(
     }
 }
 
-fn quad4_dndx_local(xy: &[[f64; 2]; 4], xi: f64, eta: f64) -> Result<([[f64; 2]; 4], f64, [f64; 4])> {
+fn quad4_dndx_local(
+    xy: &[[f64; 2]; 4],
+    xi: f64,
+    eta: f64,
+) -> Result<([[f64; 2]; 4], f64, [f64; 4])> {
     let mut n = [0.0; 4];
     let mut dn = [[0.0; 2]; 4];
     const Q: [[f64; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
@@ -808,7 +852,11 @@ fn tri3_dndx_local(xy: &[[f64; 2]]) -> ([[f64; 2]; 3], f64) {
     let x3 = xy[2][0];
     let y3 = xy[2][1];
     let two_a = (x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1);
-    let inv = if two_a.abs() > 1e-18 { 1.0 / two_a } else { 0.0 };
+    let inv = if two_a.abs() > 1e-18 {
+        1.0 / two_a
+    } else {
+        0.0
+    };
     let dndx = [
         [(y2 - y3) * inv, (x3 - x2) * inv],
         [(y3 - y1) * inv, (x1 - x3) * inv],
@@ -824,7 +872,10 @@ fn cax_nl(kind: ElemKind, xyz0: &[[f64; 3]], ue: &[f64], mat: &Material) -> Resu
     for (xi, eta, w0) in plane_gauss(nn, reduced) {
         let (dndx2, det, nshp) = plane_dndx(kind, xyz0, xi, eta)?;
         if det <= 0.0 {
-            return err(format!("NLGEOM {}: negative Jakobideterminante.", kind.ccx_name()));
+            return err(format!(
+                "NLGEOM {}: negative Jakobideterminante.",
+                kind.ccx_name()
+            ));
         }
         let mut r0 = 0.0;
         for a in 0..nn {
@@ -861,7 +912,11 @@ fn assemble_gp_cax(
     r: f64,
 ) -> Result<()> {
     let nd = 3 * nn;
-    let mut f = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, r / r0.abs().max(1e-12)]];
+    let mut f = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, r / r0.abs().max(1e-12)],
+    ];
     for a in 0..nn {
         let ur = ue[3 * a];
         let uz = ue[3 * a + 1];
@@ -893,7 +948,12 @@ fn assemble_gp_cax(
     let cauchy = pk2_to_cauchy(&f, &s)?;
     let egl = green_lagrange(&f);
     let glv = [
-        egl[0][0], egl[1][1], egl[2][2], 2.0 * egl[0][1], 2.0 * egl[1][2], 2.0 * egl[2][0],
+        egl[0][0],
+        egl[1][1],
+        egl[2][2],
+        2.0 * egl[0][1],
+        2.0 * egl[1][2],
+        2.0 * egl[2][0],
     ];
     for i in 0..6 {
         acc.cauchy[i] += cauchy[i] * w;
@@ -903,4 +963,3 @@ fn assemble_gp_cax(
     let _ = r;
     Ok(())
 }
-
