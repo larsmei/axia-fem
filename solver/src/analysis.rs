@@ -2542,7 +2542,9 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
             // far from a t-linear K·u solve, and the load path is already in.
             let r_ok = (2e-1 * fref).max(1000.0);
             let tight = residual < model.newton_tol * (1.0 + fref) || pret_ok;
-            // it>=1: at least one Newton step, so a new load increment is not skipped.
+            // Record from it>=1 so a new load increment is not skipped (it=0 is
+            // the incoming residual). Accept an uphill restore only after a
+            // second iteration — otherwise even incs kept the first spike.
             if tight {
                 inc_ok = true;
                 break;
@@ -2552,7 +2554,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                 best_u.clone_from(&u_full);
                 best_fint.clone_from(&last_fint);
             }
-            if pretension && it >= 1 {
+            if pretension && it >= 2 {
                 // Oscillation (period-2/3): residual went uphill; keep the valley.
                 if residual > r_prev && best_r < r_ok {
                     u_full.clone_from(&best_u);
@@ -2678,7 +2680,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
                     // No downhill step: contact chatter. Keep this state if
                     // the residual is already acceptable for this increment.
                     let r_ok_ls = (2e-1 * fref).max(1000.0);
-                    if residual < r_ok_ls && (inc > 1 || it >= 6) {
+                    if residual < r_ok_ls && it >= 2 && (inc > 1 || it >= 6) {
                         inc_ok = true;
                         break;
                     }
