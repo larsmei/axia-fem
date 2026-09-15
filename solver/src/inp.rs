@@ -5,7 +5,7 @@ use crate::error::{err, Result};
 use crate::model::{
     Amplitude, AnalysisStep, BeamSection, Boundary, Cflux, Cload, ContactPair, Coupling, Dflux,
     Dload, ElemKind, Element, Equation, Film, FluxKind, InitCond, InitKind, Material, Model,
-    HyperKind, RigidBody, Surface, SurfaceInteraction, ThermalBc, Tie, Transform,
+    HyperKind, PretensionSection, RigidBody, Surface, SurfaceInteraction, ThermalBc, Tie, Transform,
 };
 
 fn strip_comment(line: &str) -> &str {
@@ -46,6 +46,7 @@ fn unglue_keyword(kw: &str) -> String {
         ("*BEAMSECTION", "*BEAM SECTION"),
         ("*BEAMGENERALSECTION", "*BEAM GENERAL SECTION"),
         ("*RIGIDBODY", "*RIGID BODY"),
+        ("*PRETENSIONSECTION", "*PRE-TENSION SECTION"),
         ("*CONTACTPAIR", "*CONTACT PAIR"),
         ("*SURFACEINTERACTION", "*SURFACE INTERACTION"),
         ("*INITIALCONDITIONS", "*INITIAL CONDITIONS"),
@@ -980,6 +981,9 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                         riks: false,
                     };
                 }
+                if let Some(amp) = params.get("AMPLITUDE") {
+                    model.amplitude_step = amp.eq_ignore_ascii_case("STEP");
+                }
                 if let Some(inc) = params.get("INC") {
                     if let Ok(v) = parse_i32(inc) {
                         if v > 0 {
@@ -1538,22 +1542,62 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                     master: toks[1].to_ascii_uppercase(),
                     kn,
                     mu,
+                    interaction: iname,
                 });
             }
             "*TIE" => {
                 let (toks, ni) = collect_tokens(&lines, i + 1);
                 i = ni;
-                let tol = params
+                let (tol, coincident_only) = match params
                     .get("POSITION TOLERANCE")
                     .or_else(|| params.get("POSITIONTOLERANCE"))
-                    .and_then(|s| parse_f64(s).ok())
-                    .unwrap_or(0.0);
+                {
+                    Some(s) => {
+                        let v = parse_f64(s).unwrap_or(0.0);
+                        (v.max(0.0), v <= 0.0)
+                    }
+                    None => (0.0, false),
+                };
                 if toks.len() >= 2 {
                     model.ties.push(Tie {
                         slave: toks[0].to_ascii_uppercase(),
                         master: toks[1].to_ascii_uppercase(),
                         position_tol: tol,
+                        coincident_only,
                     });
+                }
+            }
+            "*PRE-TENSION SECTION" => {
+                let dummy = params.get("NODE").and_then(|s| parse_i32(s).ok());
+                let surface = params.get("SURFACE").cloned();
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let mut nrm = [0.0, 0.0, 0.0];
+                if toks.len() >= 3 {
+                    nrm = [
+                        parse_f64(&toks[0]).unwrap_or(0.0),
+                        parse_f64(&toks[1]).unwrap_or(0.0),
+                        parse_f64(&toks[2]).unwrap_or(0.0),
+                    ];
+                }
+                if let Some(node) = dummy {
+                    ensure_node(&mut model, node);
+                    if let Some(surf) = surface {
+                        model.pretensions.push(PretensionSection {
+                            surface: surf.to_ascii_uppercase(),
+                            dummy: node,
+                            normal: nrm,
+                            pairs: Vec::new(),
+                        });
+                    } else if params.contains_key("ELEMENT") {
+                        model.warn(
+                            "*PRE-TENSION SECTION, ELEMENT= (Balken) wird noch nicht unterstützt.",
+                        );
+                    } else {
+                        model.warn("*PRE-TENSION SECTION braucht SURFACE= oder ELEMENT=.");
+                    }
+                } else {
+                    model.warn("*PRE-TENSION SECTION ohne NODE= — ignoriert.");
                 }
             }
             "*RIGID BODY" => {
@@ -1999,12 +2043,26 @@ fn parse_expanded(inp: &str) -> Result<Model> {
 
     model.compact();
     expand_deferred(&mut model)?;
+    bind_contact_interactions(&mut model);
+    crate::constraint::apply_pretension(&mut model)?;
     if let Some(last) = model.steps.last_mut() {
         last.n_cload = last.n_cload.max(model.cloads.len());
         last.n_dload = last.n_dload.max(model.dloads.len());
         last.n_bc = last.n_bc.max(model.bcs.len());
     }
     Ok(model)
+}
+
+fn bind_contact_interactions(model: &mut Model) {
+    for pair in &mut model.contact_pairs {
+        if pair.interaction.is_empty() {
+            continue;
+        }
+        if let Some(it) = model.interactions.get(&pair.interaction) {
+            pair.kn = it.kn;
+            pair.mu = it.mu;
+        }
+    }
 }
 
 fn op_is_new(params: &HashMap<String, String>) -> bool {

@@ -690,6 +690,8 @@ pub struct Tie {
     pub slave: String,
     pub master: String,
     pub position_tol: f64,
+    /// `*TIE, POSITION TOLERANCE=0` — only coincident nodes (no nearest-if-far).
+    pub coincident_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -728,6 +730,19 @@ pub struct ContactPair {
     pub master: String,
     pub kn: f64,
     pub mu: f64,
+    /// `*SURFACE INTERACTION` name; kn/mu are rebound after the full parse
+    /// because Mecway emits `*CONTACT PAIR` before the interaction card.
+    pub interaction: String,
+}
+
+/// CalculiX `*PRE-TENSION SECTION, SURFACE=, NODE=`.
+/// After `apply_pretension`, `pairs` holds (orig, copy, area weight).
+#[derive(Clone, Debug)]
+pub struct PretensionSection {
+    pub surface: String,
+    pub dummy: i32,
+    pub normal: [f64; 3],
+    pub pairs: Vec<(i32, i32, f64)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -916,6 +931,7 @@ pub struct Model {
     pub plastic: HashMap<String, Vec<(f64, f64)>>, // material -> [(peeq, sy)]
     pub interactions: HashMap<String, SurfaceInteraction>,
     pub contact_pairs: Vec<ContactPair>,
+    pub pretensions: Vec<PretensionSection>,
     pub thermal_bcs: Vec<ThermalBc>,
     pub cfluxes: Vec<Cflux>,
     pub dfluxes: Vec<Dflux>,
@@ -944,6 +960,8 @@ pub struct Model {
     pub max_inc: usize,
     pub static_dt: f64,
     pub static_period: f64,
+    /// `*STEP, AMPLITUDE=STEP`: unnamed loads jump to full value at t=0+ of the step.
+    pub amplitude_step: bool,
 }
 
 impl Model {
@@ -979,6 +997,7 @@ impl Model {
             plastic: HashMap::new(),
             interactions: HashMap::new(),
             contact_pairs: Vec::new(),
+            pretensions: Vec::new(),
             thermal_bcs: Vec::new(),
             cfluxes: Vec::new(),
             dfluxes: Vec::new(),
@@ -1004,6 +1023,7 @@ impl Model {
             max_inc: 100,
             static_dt: 1.0,
             static_period: 1.0,
+            amplitude_step: false,
         }
     }
 

@@ -3836,4 +3836,205 @@ LOAD, 1, 1., 3, 1, -1.
         let uz = out.u[out.model.node_index(2).unwrap()][2];
         assert!(uz.abs() > 1e-8 && uz.is_finite(), "uz={uz}");
     }
+
+    #[test]
+    fn pretension_cpe4_force() {
+        // CalculiX pret5 geometry: two CPE4, cut at x=1, +CLOAD dummy = pretension.
+        // Ends fixed → tension in both halves, σxx ≈ 10 / (height*th) = 100.
+        let inp = r#"
+*NODE
+1,0.,0.,0.
+2,1.,0.,0.
+3,2.,0.,0.
+4,0.,1.,0.
+5,1.,1.,0.
+6,2.,1.,0.
+7,0.,0.,0.
+*ELEMENT,TYPE=CPE4,ELSET=Eall
+1,1,2,5,4
+2,2,3,6,5
+*BOUNDARY
+1,1,2
+3,1,2
+4,1,2
+6,1,2
+*MATERIAL,NAME=EL
+*ELASTIC
+210000.,.3
+*SOLID SECTION,ELSET=Eall,MATERIAL=EL
+.1
+*SURFACE,NAME=SURF1
+1,S2
+*PRE-TENSION SECTION,SURFACE=SURF1,NODE=7
+1.,0.,0.
+*STEP
+*STATIC
+*CLOAD
+7,1,10.
+*NODE FILE
+U,RF
+*EL FILE
+S,NOE
+*END STEP
+"#;
+        let m = parse_model(inp).unwrap();
+        assert_eq!(m.pretensions.len(), 1);
+        assert_eq!(m.pretensions[0].pairs.len(), 2, "shared edge 2-5 must split");
+        assert!(
+            m.node_ids.len() > 7,
+            "copy nodes must be added, n={}",
+            m.node_ids.len()
+        );
+        let out = solve_native(inp).expect("pret5");
+        let sxx: f64 = out
+            .stress_gp
+            .iter()
+            .map(|(_, _, s)| s[0])
+            .sum::<f64>()
+            / out.stress_gp.len().max(1) as f64;
+        assert!(
+            sxx > 50.0 && sxx < 150.0,
+            "pretension σxx={sxx}, expected ~100"
+        );
+        let di = out.model.node_index(7).unwrap();
+        assert!(
+            out.u[di][0].abs() > 1e-10,
+            "dummy ux should be the cut opening, got {}",
+            out.u[di][0]
+        );
+    }
+
+    #[test]
+    fn tie_position_tolerance_zero_skips_far() {
+        let inp = r#"
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 10, 0, 0
+4, 11, 0, 0
+*ELEMENT, TYPE=T3D2, ELSET=E
+1, 1, 2
+2, 3, 4
+*NSET, NSET=SL
+2
+*NSET, NSET=MA
+3
+*SURFACE, NAME=SL, TYPE=NODE
+2
+*SURFACE, NAME=MA, TYPE=NODE
+3
+*TIE, POSITION TOLERANCE=0
+SL, MA
+*MATERIAL, NAME=EL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=E, MATERIAL=EL
+1.0
+*BOUNDARY
+1, 1, 3
+4, 2, 3
+*STEP
+*STATIC
+*CLOAD
+4, 1, 1
+*END STEP
+"#;
+        let m = parse_model(inp).unwrap();
+        assert!(m.ties[0].coincident_only);
+        let mpcs = crate::constraint::ties_to_mpcs(&m, 3).unwrap();
+        assert!(
+            mpcs.is_empty(),
+            "POSITION TOLERANCE=0 must not bind nodes 9 units apart, got {} mpcs",
+            mpcs.len()
+        );
+    }
+
+    #[test]
+    fn bolted_joint_pretension_mpcs_connect_dummy() {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/bolted_joint.inp");
+        let inp = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        let m = parse_model(&inp).unwrap();
+        assert!(!m.pretensions.is_empty(), "pretension section missing");
+        assert_eq!(m.contact_pairs.len(), 2, "two contact pairs");
+        assert!(
+            (m.contact_pairs[0].kn - 2e14).abs() / 2e14 < 1e-12,
+            "SI_18 kn={} (CONTACT PAIR before *SURFACE INTERACTION must still bind)",
+            m.contact_pairs[0].kn
+        );
+        assert!((m.contact_pairs[0].mu - 0.5).abs() < 1e-12);
+        assert!((m.contact_pairs[1].kn - 2e14).abs() / 2e14 < 1e-12);
+        let psec = &m.pretensions[0];
+        assert!(
+            !psec.pairs.is_empty(),
+            "pretension pairs empty, warnings={:?}",
+            m.warnings
+        );
+        let ndn = m.ndof_node().max(3);
+        let mpcs = crate::constraint::build_all_mpcs(&m, ndn).unwrap();
+        let di = m.node_index(psec.dummy).unwrap();
+        let dummy_dof = ndn * di;
+        let dummy_is_slave = mpcs.iter().any(|c| c.slave == dummy_dof);
+        let dummy_is_master = mpcs.iter().any(|c| {
+            c.masters.iter().any(|(d, a)| *d == dummy_dof && a.abs() > 1e-18)
+        });
+        let n_open = mpcs
+            .iter()
+            .filter(|c| c.masters.iter().any(|(d, _)| *d == dummy_dof))
+            .count();
+        assert!(
+            dummy_is_master && n_open > 0,
+            "dummy dof must be a pretension master (pairs={}, mpcs={}, slave={dummy_is_slave})",
+            psec.pairs.len(),
+            mpcs.len()
+        );
+        let mut prescribed = std::collections::HashMap::new();
+        prescribed.insert(dummy_dof + 1, 0.0);
+        prescribed.insert(dummy_dof + 2, 0.0);
+        let map = crate::constraint::DofMap::build(ndn * m.node_ids.len(), &prescribed, &mpcs).unwrap();
+        let dummy_ind = map.ind_of[dummy_dof];
+        let n_t_from_slaves = map
+            .t_row
+            .iter()
+            .enumerate()
+            .filter(|(i, row)| *i != dummy_dof && row.iter().any(|(j, _)| dummy_ind >= 0 && *j == dummy_ind as usize))
+            .count();
+        assert!(
+            dummy_ind >= 0,
+            "dummy dof must stay independent, prescribed={:?}",
+            prescribed.get(&dummy_dof)
+        );
+        assert!(
+            n_t_from_slaves > 0,
+            "no slave DOF depends on dummy — TIE probably stole pretension slaves"
+        );
+    }
+
+    #[test]
+    fn bolted_joint_solves_finite_displacements() {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/bolted_joint.inp");
+        let inp = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        let out = solve_native(&inp).expect("bolted joint should converge");
+        let umax = out
+            .u
+            .iter()
+            .flat_map(|v| v.iter())
+            .fold(0.0_f64, |a, &x| a.max(x.abs()));
+        assert!(
+            umax.is_finite() && umax < 0.01,
+            "uMax={umax} (expect ~1e-5 m bolt stretch)"
+        );
+        let di = out.model.node_index(723).unwrap();
+        assert!(
+            out.u[di][0].is_finite() && out.u[di][0].abs() > 1e-9,
+            "dummy opening ux={} should be the pretension gap",
+            out.u[di][0]
+        );
+        assert!(
+            out.residual.is_finite() && out.residual < 1e4,
+            "residual={}",
+            out.residual
+        );
+    }
 }

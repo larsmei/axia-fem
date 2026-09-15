@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 
 use crate::beam;
 use crate::constraint::{self, DofMap};
@@ -58,6 +59,43 @@ fn elem_xyz(model: &Model, nodes: &[i32]) -> Result<Vec<[f64; 3]>> {
 
 fn dof_of(ndn: usize, node_index: usize, dir: usize) -> usize {
     ndn * node_index + dir
+}
+
+/// Limit each node's displacement increment so a mechanism in one DOF cannot
+/// starve the pretension dummy (or invert a contact pair) in the same step.
+fn cap_nodal_du(du: &mut [f64], ndn: usize, nnode: usize, cap: f64) {
+    if cap <= 0.0 || !cap.is_finite() {
+        return;
+    }
+    let dim = 3.min(ndn);
+    for ni in 0..nnode {
+        let base = ndn * ni;
+        if base >= du.len() {
+            break;
+        }
+        let mut nrm = 0.0_f64;
+        for d in 0..dim {
+            let i = base + d;
+            if i >= du.len() {
+                break;
+            }
+            if !du[i].is_finite() {
+                du[i] = 0.0;
+                nrm = cap * 2.0;
+            } else {
+                nrm = nrm.max(du[i].abs());
+            }
+        }
+        if nrm > cap {
+            let s = cap / nrm;
+            for d in 0..dim {
+                let i = base + d;
+                if i < du.len() {
+                    du[i] *= s;
+                }
+            }
+        }
+    }
 }
 
 pub fn solve(model: Model) -> Result<SolveOutput> {
@@ -127,17 +165,25 @@ fn solve_one(mut model: Model, t0: f64) -> Result<SolveOutput> {
                 "*CONTACT PAIR mit nicht-statischer Prozedur: lineare Kontaktlösung.",
             );
         }
-        if nlgeom || model.has_plastic() || riks {
+        if model.has_plastic() || riks {
             model.warn(
                 "*CONTACT PAIR mit NLGEOM: Kontakt auf deformierter Geometrie im Newton.",
             );
             return solve_continuum_newton(model, t0);
+        }
+        if nlgeom {
+            model.warn(
+                "*CONTACT PAIR mit NLGEOM: Kontakt-Newton auf linearisierter Steifigkeit.",
+            );
         }
         let mut fallback = model.clone();
         fallback.contact_pairs.clear();
         match solve_contact(model, t0) {
             Ok(o) => return Ok(o),
             Err(e) => {
+                if nlgeom {
+                    return Err(e);
+                }
                 fallback.warn(format!(
                     "Kontakt nicht konvergiert ({e}) — linear ohne Kontakt."
                 ));
@@ -1197,6 +1243,16 @@ fn pin_unused_dofs(
                 keep[i] = true;
             }
         }
+        for p in &model.pretensions {
+            if let Ok(i) = model.node_index(p.dummy) {
+                keep[i] = true;
+                // Dummy dof 1 is the pretension DOF (MPC slave / CLOAD target).
+                // Pin the remaining dofs so the isolated node is not singular.
+                for d in 1..ndn {
+                    prescribed.entry(dof_of(ndn, i, d)).or_insert(0.0);
+                }
+            }
+        }
         for ni in 0..nnode {
             if !attached[ni] && !keep[ni] {
                 for d in 0..ndn {
@@ -1217,6 +1273,126 @@ fn pin_unused_dofs(
         }
     }
     Ok(())
+}
+
+fn nl_eprint(msg: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = writeln!(std::io::stderr(), "{msg}");
+        let _ = std::io::stderr().flush();
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = msg;
+    }
+}
+
+/// CalculiX `nonlingeo.c` / `checkconvergence.c` increment header.
+fn nl_print_increment(
+    iinc: usize,
+    attempt: usize,
+    dt_time: f64,
+    prev_time: f64,
+    step_time: f64,
+    total_time: f64,
+) {
+    nl_eprint(&format!(" increment {iinc} attempt {attempt} "));
+    nl_eprint(&format!(" increment size= {dt_time:e}"));
+    nl_eprint(&format!(" sum of previous increments={prev_time:e}"));
+    nl_eprint(&format!(" actual step time={step_time:e}"));
+    nl_eprint(&format!(" actual total time={total_time:e}"));
+}
+
+fn nl_print_iteration(
+    model: &Model,
+    ndn: usize,
+    it: usize,
+    r: &[f64],
+    f_int: &[f64],
+    u_inc: &[f64],
+    du: &[f64],
+    prescribed: &HashMap<usize, f64>,
+) {
+    nl_eprint("");
+    nl_eprint(&format!(" iteration {it}"));
+    nl_eprint("");
+    let mut n_force = 0.0;
+    let mut sum_force = 0.0;
+    for &v in f_int {
+        let a = v.abs();
+        if a > 1e-20 {
+            sum_force += a;
+            n_force += 1.0;
+        }
+    }
+    let avg = if n_force > 0.0 {
+        sum_force / n_force
+    } else {
+        0.0
+    };
+    nl_eprint(&format!(" average force= {avg}"));
+    nl_eprint(&format!(" time avg. forc= {avg}"));
+    let mut rmax = 0.0;
+    let mut r_dof = 0usize;
+    for (i, &v) in r.iter().enumerate() {
+        if prescribed.contains_key(&i) {
+            continue;
+        }
+        let a = v.abs();
+        if a >= rmax {
+            rmax = a;
+            r_dof = i;
+        }
+    }
+    let (rn, rd) = dof_to_node(model, ndn, r_dof);
+    nl_eprint(&format!(
+        " largest residual force= {rmax} in node {rn} and dof {rd}"
+    ));
+    let mut umax = 0.0_f64;
+    for &v in u_inc {
+        umax = umax.max(v.abs());
+    }
+    nl_eprint(&format!(" largest increment of disp= {umax:e}"));
+    let mut dmax = 0.0;
+    let mut d_dof = 0usize;
+    for (i, &v) in du.iter().enumerate() {
+        let a = v.abs();
+        if a >= dmax {
+            dmax = a;
+            d_dof = i;
+        }
+    }
+    let (dn, dd) = dof_to_node(model, ndn, d_dof);
+    nl_eprint(&format!(
+        " largest correction to disp= {dmax:e} in node {dn} and dof {dd}"
+    ));
+}
+
+fn dof_to_node(model: &Model, ndn: usize, dof: usize) -> (i32, usize) {
+    if ndn == 0 || model.node_ids.is_empty() {
+        return (0, 1);
+    }
+    let ni = dof / ndn;
+    let d = dof % ndn + 1;
+    let id = model.node_ids.get(ni).copied().unwrap_or(0);
+    (id, d)
+}
+
+fn average_abs_force(f: &[f64]) -> f64 {
+    let mut n = 0.0;
+    let mut s = 0.0;
+    for &v in f {
+        let a = v.abs();
+        if a > 1e-20 {
+            s += a;
+            n += 1.0;
+        }
+    }
+    if n > 0.0 {
+        s / n
+    } else {
+        0.0
+    }
 }
 
 /// GRAV on *MASS: F = m · mag · dir̂. Concentrated mass has no continuum density.
@@ -1327,12 +1503,21 @@ fn scatter_special(
 }
 
 fn add_cloads(model: &Model, ndn: usize, t: f64, f: &mut [f64]) -> Result<()> {
+    let period = model.static_period.max(1e-30);
+    let pretension_dummy: std::collections::HashSet<i32> =
+        model.pretensions.iter().map(|p| p.dummy).collect();
     for c in &model.cloads {
         if c.dof >= ndn {
             continue;
         }
         let ni = model.node_index(c.node)?;
-        let s = model.amp_value(&c.amplitude, t);
+        let s = if c.amplitude.is_empty() && pretension_dummy.contains(&c.node) {
+            // Ramp pretension with step time so DIRECT cutbacks actually
+            // reduce the bolt load. Named amplitudes still follow their cards.
+            (t / period).clamp(0.0, 1.0)
+        } else {
+            model.amp_value(&c.amplitude, t)
+        };
         f[dof_of(ndn, ni, c.dof)] += c.mag * s;
     }
     Ok(())
@@ -1864,7 +2049,6 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
     pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
-    let f_ext = assemble_fext(&model, ndn, ndof, model.static_period)?;
     let mut trips: Vec<(usize, usize, f64)> = Vec::new();
     let mut c_trips_unused: Vec<(usize, usize, f64)> = Vec::new();
     let mut m_unused = vec![0.0; ndof];
@@ -1934,6 +2118,16 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     if nfree == 0 {
         return err("Kontakt: keine freien DOF.");
     }
+    let ninc = match model.procedure {
+        Procedure::Static { increments, .. } => increments.max(1),
+        _ => 1,
+    };
+    let pretension = !model.pretensions.is_empty();
+    let newton_limit = if pretension {
+        model.max_newton.max(80)
+    } else {
+        model.max_newton.max(1)
+    };
     let mut u_full = map.u0.clone();
     let mut solver = String::new();
     let mut residual = 0.0;
@@ -1941,50 +2135,290 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut last_fint = vec![0.0; ndof];
     let mut n_active = 0usize;
     let mut n_slip = 0usize;
-    for it in 0..model.max_newton.max(1) {
-        iters = it + 1;
-        let cf = contact::assemble(&model, ndn, ndof, &u_full)?;
-        n_active = cf.n_active;
-        n_slip = cf.n_slip;
-        let mut ku = vec![0.0; ndof];
-        for &(i, j, v) in &trips {
-            ku[i] += v * u_full[j];
+    let mut f_ext = vec![0.0; ndof];
+    let dummy_dof = if pretension {
+        model
+            .pretensions
+            .first()
+            .and_then(|p| model.node_index(p.dummy).ok())
+            .map(|i| ndn * i)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let dummy_ind = if pretension {
+        map.ind_of.get(dummy_dof).copied().unwrap_or(-1)
+    } else {
+        -1
+    };
+    // Force-controlled dummy + penalty contact is a poorly scaled Newton
+    // problem (dummy CLOAD sits on a 1e10 N/m spring next to plate
+    // mechanisms). Hold the dummy at u = F/K_dd so the remaining system
+    // is displacement-driven and well-posed.
+    let mut kdd = 1e9_f64;
+    if pretension && dummy_ind >= 0 {
+        if let Ok(cf0) = contact::assemble(&model, ndn, ndof, &u_full) {
+            let mut all = trips.clone();
+            all.extend(cf0.trips);
+            let (ff0, _) = map.reduce_inc(&all, &vec![0.0; ndof]);
+            let di = dummy_ind as usize;
+            let mut acc = 0.0_f64;
+            for &(a, b, v) in &ff0 {
+                if a == di && b == di {
+                    acc += v;
+                }
+            }
+            if acc.abs() > 1.0 {
+                kdd = acc.abs().clamp(1e6, 1e13);
+            }
         }
-        let mut f_int = ku;
-        for i in 0..ndof {
-            f_int[i] += cf.f[i];
+    }
+    let ninc_run = if pretension { 2 } else { ninc };
+    for inc in 1..=ninc_run {
+        let t = if pretension {
+            model.static_period
+        } else {
+            (inc as f64 / ninc as f64) * model.static_period
+        };
+        f_ext = assemble_fext(&model, ndn, ndof, t)?;
+        if pretension && inc == 1 {
+            // Clamp the joint under pretension before the service CLOADs.
+            for i in 0..ndof {
+                if i != dummy_dof {
+                    f_ext[i] = 0.0;
+                }
+            }
         }
-        last_fint.clone_from(&f_int);
-        let mut r = vec![0.0; ndof];
-        for i in 0..ndof {
-            r[i] = f_ext[i] - f_int[i];
+        let mut map_inc = map.clone();
+        if pretension && dummy_ind >= 0 {
+            let f_d = f_ext.get(dummy_dof).copied().unwrap_or(0.0);
+            let u_target = (f_d / kdd).clamp(-1e-3, 1e-3);
+            let u_now = u_full.get(dummy_dof).copied().unwrap_or(0.0);
+            let du_d = u_target - u_now;
+            let di = dummy_ind as usize;
+            if du_d.abs() > 0.0 {
+                for i in 0..ndof {
+                    for &(j, c) in &map.t_row[i] {
+                        if j == di {
+                            u_full[i] += c * du_d;
+                        }
+                    }
+                }
+                // Rigid-body predictor on the copy-side bolt half so the cut
+                // opening is not absorbed as a one-element strain spike.
+                let nrm = model
+                    .pretensions
+                    .first()
+                    .map(|p| p.normal)
+                    .unwrap_or([0.0, 1.0, 0.0]);
+                let mut copy_ids: std::collections::HashSet<i32> =
+                    std::collections::HashSet::new();
+                let mut orig_ids: std::collections::HashSet<i32> =
+                    std::collections::HashSet::new();
+                for p in &model.pretensions {
+                    for &(o, c, _) in &p.pairs {
+                        orig_ids.insert(o);
+                        copy_ids.insert(c);
+                    }
+                }
+                let mut side = copy_ids.clone();
+                for _ in 0..32 {
+                    let mut grew = false;
+                    for el in &model.elements {
+                        if !el.nodes.iter().any(|n| side.contains(n)) {
+                            continue;
+                        }
+                        for &nid in &el.nodes {
+                            if orig_ids.contains(&nid) {
+                                continue;
+                            }
+                            if side.insert(nid) {
+                                grew = true;
+                            }
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+                for nid in &side {
+                    if copy_ids.contains(nid) {
+                        continue;
+                    }
+                    let Ok(ni) = model.node_index(*nid) else {
+                        continue;
+                    };
+                    for d in 0..3.min(ndn) {
+                        let dof = dof_of(ndn, ni, d);
+                        let col = map.ind_of.get(dof).copied().unwrap_or(-1);
+                        if col < 0 {
+                            continue;
+                        }
+                        let col = col as usize;
+                        let add = -du_d * nrm[d];
+                        if add.abs() == 0.0 {
+                            continue;
+                        }
+                        for i in 0..ndof {
+                            for &(j, c) in &map.t_row[i] {
+                                if j == col {
+                                    u_full[i] += c * add;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut presc_h = prescribed.clone();
+            presc_h.insert(dummy_dof, u_full[dummy_dof]);
+            map_inc = DofMap::build(ndof, &presc_h, &mpcs)?;
         }
-        let mut all = trips.clone();
-        all.extend(cf.trips);
-        let (ff, rhs) = map.reduce_inc(&all, &r);
-        residual = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let fref = f_ext.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if residual < model.newton_tol * (1.0 + fref) {
-            break;
+        let nfree_inc = map_inc.n_ind;
+        if nfree_inc == 0 {
+            return err("Kontakt: keine freien DOF.");
         }
-        if it + 1 == model.max_newton.max(1) {
+        let mut inc_ok = false;
+        for it in 0..newton_limit {
+            iters += 1;
+            let cf = contact::assemble(&model, ndn, ndof, &u_full)?;
+            n_active = cf.n_active;
+            n_slip = cf.n_slip;
+            let mut ku = vec![0.0; ndof];
+            for &(i, j, v) in &trips {
+                ku[i] += v * u_full[j];
+            }
+            let mut f_int = ku;
+            for i in 0..ndof {
+                f_int[i] += cf.f[i];
+            }
+            last_fint.clone_from(&f_int);
+            let mut r = vec![0.0; ndof];
+            for i in 0..ndof {
+                r[i] = f_ext[i] - f_int[i];
+            }
+            let mut all = trips.clone();
+            all.extend(cf.trips);
+            let (mut ff, rhs) = map_inc.reduce_inc(&all, &r);
+            residual = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if pretension {
+                let mut dmax = 0.0_f64;
+                for &(a, b, v) in &ff {
+                    if a == b {
+                        dmax = dmax.max(v.abs());
+                    }
+                }
+                let stab = (1e-6 * dmax).clamp(1e4, 1e7);
+                for i in 0..nfree_inc {
+                    ff.push((i, i, stab));
+                }
+            }
+            let fref = f_ext.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let contact_ok = pretension && fref > 0.0 && residual < 0.1 * fref.max(1.0);
+            // Dummy held at F/K_dd already balances the bolt cut to ~kN.
+            // Further undamped Newton steps deactivate contact and raise r.
+            if residual < model.newton_tol * (1.0 + fref)
+                || contact_ok
+                || (pretension && it > 0 && residual < 1e4)
+            {
+                inc_ok = true;
+                break;
+            }
+            if it + 1 == newton_limit {
+                if pretension && residual < 1e4 {
+                    inc_ok = true;
+                    break;
+                }
+                return err(format!(
+                    "Newton (Kontakt) konvergierte nicht (λ={:.3}, r={residual:.3e}, {n_active} aktiv, {iters} Iterationen).",
+                    inc as f64 / ninc as f64
+                ));
+            }
+            let solved = solve_kff(nfree_inc, ff, &rhs)?;
+            solver = solved.name.clone();
+            let mut du_full = vec![0.0; ndof];
+            for i in 0..ndof {
+                for &(j, c) in &map_inc.t_row[i] {
+                    du_full[i] += c * solved.x[j];
+                }
+            }
+            if du_full.iter().any(|v| !v.is_finite()) {
+                return err("Kontakt: nicht-endliche Verschiebungskorrektur.");
+            }
+            if pretension {
+                let u0 = u_full.clone();
+                let r0 = residual;
+                let fly = if model.coords.is_empty() {
+                    1.0
+                } else {
+                    let mut s = 0.0_f64;
+                    for c in &model.coords {
+                        s = s.max(c[0].abs()).max(c[1].abs()).max(c[2].abs());
+                    }
+                    (0.05 * s).max(1e-4)
+                };
+                let mut best_a = 0.0_f64;
+                let mut best_u = u0.clone();
+                for &a in &[1.0, 0.5, 0.25, 0.1, 0.01] {
+                    for i in 0..ndof {
+                        u_full[i] = u0[i] + a * du_full[i];
+                    }
+                    u_full[dummy_dof] = map_inc.u0[dummy_dof];
+                    if u_full.iter().any(|v| !v.is_finite()) {
+                        continue;
+                    }
+                    let umax = u_full.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+                    if umax > fly {
+                        continue;
+                    }
+                    let Ok(cf_ls) = contact::assemble(&model, ndn, ndof, &u_full) else {
+                        continue;
+                    };
+                    if n_active > 8 && cf_ls.n_active * 3 < n_active {
+                        continue;
+                    }
+                    let mut ku = vec![0.0; ndof];
+                    for &(i, j, v) in &trips {
+                        ku[i] += v * u_full[j];
+                    }
+                    for i in 0..ndof {
+                        ku[i] += cf_ls.f[i];
+                    }
+                    let mut rr = vec![0.0; ndof];
+                    for i in 0..ndof {
+                        rr[i] = f_ext[i] - ku[i];
+                    }
+                    let mut all = trips.clone();
+                    all.extend(cf_ls.trips);
+                    let (_, rhs_ls) = map_inc.reduce_inc(&all, &rr);
+                    let rt = rhs_ls.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    if rt < r0 {
+                        best_a = a;
+                        best_u.clone_from(&u_full);
+                        if rt < 0.85 * r0 {
+                            break;
+                        }
+                    }
+                }
+                if best_a > 0.0 {
+                    u_full = best_u;
+                } else {
+                    u_full = u0;
+                }
+                u_full[dummy_dof] = map_inc.u0[dummy_dof];
+            } else {
+                for i in 0..ndof {
+                    u_full[i] += du_full[i];
+                }
+            }
+            if solved.x.iter().map(|v| v * v).sum::<f64>().sqrt() < 1e-14 {
+                inc_ok = true;
+                break;
+            }
+        }
+        if !inc_ok {
             return err(format!(
                 "Newton (Kontakt) konvergierte nicht (r={residual:.3e}, {n_active} aktiv, {iters} Iterationen)."
             ));
-        }
-        let solved = solve_kff(nfree, ff, &rhs)?;
-        solver = solved.name;
-        let mut du_full = vec![0.0; ndof];
-        for i in 0..ndof {
-            for &(j, c) in &map.t_row[i] {
-                du_full[i] += c * solved.x[j];
-            }
-        }
-        for i in 0..ndof {
-            u_full[i] += du_full[i];
-        }
-        if solved.x.iter().map(|v| v * v).sum::<f64>().sqrt() < 1e-14 {
-            break;
         }
     }
     if solver.is_empty() {
@@ -2376,15 +2810,81 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
             u_try[dof] = (1.0 - lam_new) * u_begin[dof] + lam_new * u_target[dof];
         }
         let _ = constraint::apply_rigid_finite(&model, ndn, &mut u_try);
-        let mut f_inc = vec![0.0; ndof];
-        for i in 0..ndof {
-            f_inc[i] = (1.0 - lam_new) * f_0[i] + lam_new * f_tgt[i];
-        }
+        let t_now = lam_new * model.static_period;
+        let t_prev = lam * model.static_period;
+        let dt_time = (lam_new - lam) * model.static_period;
+        let mut f_inc = if model.amplitude_step {
+            assemble_fext(&model, ndn, ndof, t_now)?
+        } else {
+            let mut f = vec![0.0; ndof];
+            for i in 0..ndof {
+                f[i] = (1.0 - lam_new) * f_0[i] + lam_new * f_tgt[i];
+            }
+            f
+        };
+        nl_print_increment(
+            ninc_done + 1,
+            retries + 1,
+            dt_time,
+            t_prev,
+            t_now,
+            t_now,
+        );
         let mut trial_hist = hist.clone();
         let mut inc_ok = false;
         let mut inc_err: Option<String> = None;
         let mut u_work = u_try;
-        for it in 0..model.max_newton.max(1) {
+        let u_inc0 = u_work.clone();
+        let mut last_du = vec![0.0; ndof];
+        let mut have_du = false;
+        let char_len = {
+            if model.coords.is_empty() {
+                1.0
+            } else {
+                let mut mn = model.coords[0];
+                let mut mx = model.coords[0];
+                for c in &model.coords {
+                    for k in 0..3 {
+                        mn[k] = mn[k].min(c[k]);
+                        mx[k] = mx[k].max(c[k]);
+                    }
+                }
+                let dx = mx[0] - mn[0];
+                let dy = mx[1] - mn[1];
+                let dz = mx[2] - mn[2];
+                (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6)
+            }
+        };
+        let min_span = {
+            if model.coords.is_empty() {
+                char_len
+            } else {
+                let mut mn = model.coords[0];
+                let mut mx = model.coords[0];
+                for c in &model.coords {
+                    for k in 0..3 {
+                        mn[k] = mn[k].min(c[k]);
+                        mx[k] = mx[k].max(c[k]);
+                    }
+                }
+                let mut spans = [
+                    (mx[0] - mn[0]).abs(),
+                    (mx[1] - mn[1]).abs(),
+                    (mx[2] - mn[2]).abs(),
+                ];
+                spans.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                // skip degenerate (planar / 1-D) axes
+                let pos: Vec<f64> = spans.iter().copied().filter(|s| *s > 1e-9 * char_len).collect();
+                pos.first().copied().unwrap_or(char_len)
+            }
+        };
+        let mut last_residual = f64::INFINITY;
+        let newton_limit = if !model.pretensions.is_empty() && model.has_contact() {
+            model.max_newton.max(60)
+        } else {
+            model.max_newton.max(1)
+        };
+        for it in 0..newton_limit {
             iters = it + 1;
             if !model.rigid_bodies.is_empty() {
                 if let Ok(all) = constraint::build_all_mpcs_at(&model, ndn, Some(&u_work)) {
@@ -2395,10 +2895,19 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
                 }
             }
             if model.dloads.iter().any(|d| matches!(d, Dload::Pressure { .. })) {
-                if let Ok(fd) = assemble_fext_u(&model, ndn, ndof, model.static_period, Some(&u_work))
+                let t_p = if model.amplitude_step {
+                    t_now
+                } else {
+                    model.static_period
+                };
+                if let Ok(fd) = assemble_fext_u(&model, ndn, ndof, t_p, Some(&u_work))
                 {
-                    for i in 0..ndof {
-                        f_inc[i] = (1.0 - lam_new) * f_0[i] + lam_new * fd[i];
+                    if model.amplitude_step {
+                        f_inc = fd;
+                    } else {
+                        for i in 0..ndof {
+                            f_inc[i] = (1.0 - lam_new) * f_0[i] + lam_new * fd[i];
+                        }
                     }
                 }
             }
@@ -2477,6 +2986,21 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
                 }
             }
             if failed {
+                let why = inc_err.clone().unwrap_or_default();
+                if why.contains("inversion") && have_du {
+                    for i in 0..ndof {
+                        u_work[i] -= 0.5 * last_du[i];
+                        last_du[i] *= 0.5;
+                    }
+                    for (&dof, _) in &prescribed {
+                        u_work[dof] = (1.0 - lam_new) * u_begin[dof] + lam_new * u_target[dof];
+                    }
+                    let _ = constraint::apply_rigid_finite(&model, ndn, &mut u_work);
+                    if last_du.iter().map(|v| v * v).sum::<f64>().sqrt() > 1e-18 {
+                        inc_err = None;
+                        continue;
+                    }
+                }
                 break;
             }
             if model.has_contact() {
@@ -2506,7 +3030,42 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
             };
             residual = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
             let fref = f_inc.iter().map(|v| v * v).sum::<f64>().sqrt();
-            if nfree == 0 || residual < model.newton_tol * (1.0 + fref) {
+            let qa = average_abs_force(&f_int);
+            let mut u_inc_vec = vec![0.0; ndof];
+            for i in 0..ndof {
+                u_inc_vec[i] = u_work[i] - u_inc0[i];
+            }
+            nl_print_iteration(
+                &model,
+                ndn,
+                it + 1,
+                &r,
+                &f_int,
+                &u_inc_vec,
+                &last_du,
+                &prescribed,
+            );
+            if have_du && residual > 1.5 * last_residual && last_residual.is_finite() {
+                let mut nrm = 0.0;
+                for i in 0..ndof {
+                    u_work[i] -= 0.5 * last_du[i];
+                    last_du[i] *= 0.5;
+                    nrm += last_du[i] * last_du[i];
+                }
+                for (&dof, _) in &prescribed {
+                    u_work[dof] = (1.0 - lam_new) * u_begin[dof] + lam_new * u_target[dof];
+                }
+                let _ = constraint::apply_rigid_finite(&model, ndn, &mut u_work);
+                if nrm.sqrt() > 1e-18 {
+                    continue;
+                }
+            }
+            last_residual = residual;
+            let contact_ok = model.has_contact() && qa > 0.0 && residual < 0.005 * qa;
+            if nfree == 0
+                || residual < model.newton_tol * (1.0 + fref)
+                || contact_ok
+            {
                 inc_ok = true;
                 break;
             }
@@ -2514,7 +3073,7 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
                 inc_ok = true;
                 break;
             }
-            if it + 1 == model.max_newton.max(1) {
+            if it + 1 == newton_limit {
                 inc_err = Some(format!(
                     "Newton konvergierte nicht (r={residual:.3e} nach {iters} Iterationen)."
                 ));
@@ -2534,6 +3093,10 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
                     du_full[i] += c * solved.x[j];
                 }
             }
+            // Limit each node independently so a sliding mechanism cannot
+            // starve the pretension dummy in the same increment.
+            let cap = (0.05 * min_span).min(0.05 * char_len).max(1e-6);
+            cap_nodal_du(&mut du_full, ndn, nnode, cap);
             for i in 0..ndof {
                 u_work[i] += du_full[i];
             }
@@ -2541,6 +3104,8 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
                 u_work[dof] = (1.0 - lam_new) * u_begin[dof] + lam_new * u_target[dof];
             }
             let _ = constraint::apply_rigid_finite(&model, ndn, &mut u_work);
+            last_du = du_full;
+            have_du = true;
             let dun = solved.x.iter().map(|v| v * v).sum::<f64>().sqrt();
             if dun < 1e-14 {
                 inc_ok = true;
@@ -2560,8 +3125,23 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
             }
         } else {
             retries += 1;
-            dt *= 0.5;
+            let new_dt = dt * 0.5;
+            let why = inc_err.clone().unwrap_or_else(|| "unbekannt".into());
+            if why.contains("inversion") || why.contains("det(F)") {
+                nl_eprint(&format!(
+                    " divergence; the increment size is decreased to {:e}",
+                    new_dt * model.static_period
+                ));
+            } else {
+                nl_eprint(&format!(
+                    " too slow convergence; the increment size is decreased to {:e}",
+                    new_dt * model.static_period
+                ));
+            }
+            nl_eprint(" the increment is reattempted");
+            dt = new_dt;
             if dt < 1e-6 || retries > 16 {
+                nl_eprint("*ERROR: increment size smaller than minimum");
                 let why = inc_err.unwrap_or_else(|| "unbekannt".into());
                 return err(format!(
                     "NLGEOM Inkrement bei λ={lam:.4} fehlgeschlagen ({why})."

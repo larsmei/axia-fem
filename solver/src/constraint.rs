@@ -292,11 +292,20 @@ pub fn ties_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
         if slave_nodes.is_empty() || master_nodes.is_empty() {
             continue;
         }
-        let tol = if tie.position_tol > 0.0 {
+        let coincident = tie.coincident_only;
+        let d = diag.max(1e-15);
+        let typical = 1e-4 * d;
+        let tol = if coincident {
+            // explicit POSITION TOLERANCE=0 still uses ccx default (2.5 % typical)
+            // plus nearest-if-far capped by 5 % of the model diagonal, matching
+            // Mecway's "0 = automatic" export used on bonded bolt faces.
+            (0.025 * (d * 0.1).max(typical)).max(typical)
+        } else if tie.position_tol > 0.0 {
             tie.position_tol
         } else {
-            1e-4 * diag.max(1.0)
+            (0.025 * (d * 0.1).max(typical)).max(typical)
         };
+        let far_cap = 0.05 * d;
         let mut used_master = HashSet::new();
         for &s in &slave_nodes {
             let si = model.node_index(s)?;
@@ -304,7 +313,7 @@ pub fn ties_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
             let mut best = None;
             let mut best_d = f64::MAX;
             for &m in &master_nodes {
-                if s == m {
+                if s == m || used_master.contains(&m) {
                     continue;
                 }
                 let mi = model.node_index(m)?;
@@ -315,9 +324,13 @@ pub fn ties_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
                     best = Some(m);
                 }
             }
+            let cap = if tie.position_tol > 0.0 {
+                tol.max(1e-15)
+            } else {
+                far_cap.max(tol)
+            };
             let m = match best {
-                Some(m) if best_d <= tol.max(1e-12) => m,
-                Some(m) if !used_master.contains(&m) => m, // nearest even if far
+                Some(m) if best_d <= cap => m,
                 _ => continue,
             };
             used_master.insert(m);
@@ -573,12 +586,364 @@ pub fn coupling_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
     Ok(mpcs)
 }
 
+/// Duplicate pretension-surface nodes and remap elements that do not own a
+/// pretension face onto the copies (CalculiX `gen3delem` / `*PRE-TENSION SECTION`).
+pub fn apply_pretension(model: &mut Model) -> Result<()> {
+    if model.pretensions.is_empty() {
+        return Ok(());
+    }
+    let nsec = model.pretensions.len();
+    for si in 0..nsec {
+        apply_one_pretension(model, si)?;
+    }
+    Ok(())
+}
+
+fn apply_one_pretension(model: &mut Model, si: usize) -> Result<()> {
+    let surface = model.pretensions[si].surface.clone();
+    let dummy = model.pretensions[si].dummy;
+    let mut nrm = model.pretensions[si].normal;
+    let key = surface.to_ascii_uppercase();
+    let Some(surf) = model.surfaces.get(&key) else {
+        model.warn(format!(
+            "*PRE-TENSION SECTION: Fläche {surface} nicht gefunden."
+        ));
+        return Ok(());
+    };
+    if surf.faces.is_empty() && surf.nodes.is_empty() {
+        model.warn(format!("*PRE-TENSION SECTION {surface}: leere Fläche."));
+        return Ok(());
+    }
+    let owning: HashSet<i32> = surf.faces.iter().map(|(e, _)| *e).collect();
+    let face_list = surf.faces.clone();
+    let node_list = surf.nodes.clone();
+
+    let mut node_area: HashMap<i32, f64> = HashMap::new();
+    let mut geom_n = [0.0, 0.0, 0.0];
+    let mut geom_a = 0.0;
+    if !face_list.is_empty() {
+        for &(eid, face) in &face_list {
+            let Some(el) = model.elements.iter().find(|e| e.id == eid) else {
+                continue;
+            };
+            let ids = face_nodes(el, face);
+            if ids.is_empty() {
+                continue;
+            }
+            let mut pts = Vec::new();
+            for &id in &ids {
+                if let Ok(i) = model.node_index(id) {
+                    pts.push(model.coords[i]);
+                }
+            }
+            let corners = if pts.len() >= 8 {
+                4
+            } else if pts.len() >= 4 {
+                4
+            } else {
+                pts.len()
+            };
+            let (area, n) = poly_area_normal(&pts[..corners.min(pts.len())]);
+            if area > geom_a {
+                geom_a = area;
+                geom_n = n;
+            }
+            let share = if ids.is_empty() {
+                0.0
+            } else {
+                area.max(0.0) / ids.len() as f64
+            };
+            for &id in &ids {
+                *node_area.entry(id).or_insert(0.0) += share;
+            }
+        }
+    } else {
+        for &id in &node_list {
+            node_area.insert(id, 1.0);
+        }
+    }
+    if nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2] < 1e-20 {
+        nrm = geom_n;
+    }
+    let nl = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
+    if nl < 1e-18 {
+        nrm = [1.0, 0.0, 0.0];
+    } else {
+        nrm = [nrm[0] / nl, nrm[1] / nl, nrm[2] / nl];
+    }
+    model.pretensions[si].normal = nrm;
+
+    let surf_nodes: HashSet<i32> = node_area.keys().copied().collect();
+    if surf_nodes.is_empty() {
+        model.warn(format!("*PRE-TENSION SECTION {surface}: keine Knoten."));
+        return Ok(());
+    }
+
+    // Only duplicate nodes that are also used by an element that does not own a pretension face.
+    let mut used_other: HashSet<i32> = HashSet::new();
+    for el in &model.elements {
+        if owning.contains(&el.id) {
+            continue;
+        }
+        for &id in &el.nodes {
+            if surf_nodes.contains(&id) {
+                used_other.insert(id);
+            }
+        }
+    }
+    if used_other.is_empty() {
+        model.warn(format!(
+            "*PRE-TENSION SECTION {surface}: Schnitt trennt keine Elemente (keine Nachbarn)."
+        ));
+        return Ok(());
+    }
+
+    let mut next_id = model.node_ids.iter().copied().max().unwrap_or(0) + 1;
+    if next_id == dummy {
+        next_id += 1;
+    }
+    let mut orig_to_copy: HashMap<i32, i32> = HashMap::new();
+    let mut new_ids = Vec::new();
+    let mut new_xyz = Vec::new();
+    for &orig in &used_other {
+        let Ok(oi) = model.node_index(orig) else {
+            continue;
+        };
+        let copy = next_id;
+        next_id += 1;
+        if copy == dummy {
+            next_id += 1;
+        }
+        orig_to_copy.insert(orig, copy);
+        new_ids.push(copy);
+        new_xyz.push(model.coords[oi]);
+    }
+    model.node_ids.extend(new_ids.iter().copied());
+    model.coords.extend(new_xyz.iter().copied());
+    model.id_to_index = model
+        .node_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+
+    for el in &mut model.elements {
+        if owning.contains(&el.id) {
+            continue;
+        }
+        for n in &mut el.nodes {
+            if let Some(&c) = orig_to_copy.get(n) {
+                *n = c;
+            }
+        }
+    }
+
+    let extra_bcs: Vec<crate::model::Boundary> = model
+        .bcs
+        .iter()
+        .filter_map(|bc| {
+            orig_to_copy.get(&bc.node).map(|&c| crate::model::Boundary {
+                node: c,
+                dof: bc.dof,
+                value: bc.value,
+            })
+        })
+        .collect();
+    model.bcs.extend(extra_bcs);
+
+    let mut pairs = Vec::new();
+    let mut wsum = 0.0;
+    for (&orig, &copy) in &orig_to_copy {
+        let w = node_area.get(&orig).copied().unwrap_or(1.0).max(0.0);
+        pairs.push((orig, copy, w));
+        wsum += w;
+    }
+    if wsum <= 0.0 {
+        let n = pairs.len() as f64;
+        for p in &mut pairs {
+            p.2 = 1.0 / n.max(1.0);
+        }
+    } else {
+        for p in &mut pairs {
+            p.2 /= wsum;
+        }
+    }
+    pairs.sort_by_key(|p| p.0);
+    model.nsets.insert("NALL".into(), model.node_ids.clone());
+    model.warn(format!(
+        "*PRE-TENSION SECTION {surface}: {} Knoten dupliziert, Dummy {dummy}.",
+        pairs.len()
+    ));
+    model.pretensions[si].pairs = pairs;
+    Ok(())
+}
+
+fn poly_area_normal(pts: &[[f64; 3]]) -> (f64, [f64; 3]) {
+    if pts.len() < 2 {
+        return (0.0, [0.0, 0.0, 1.0]);
+    }
+    if pts.len() == 2 {
+        let dx = pts[1][0] - pts[0][0];
+        let dy = pts[1][1] - pts[0][1];
+        let dz = pts[1][2] - pts[0][2];
+        let len = (dx * dx + dy * dy + dz * dz).sqrt();
+        return (len, [0.0, 0.0, 1.0]);
+    }
+    let mut n = [0.0; 3];
+    let np = pts.len();
+    for i in 0..np {
+        let a = pts[i];
+        let b = pts[(i + 1) % np];
+        n[0] += (a[1] - b[1]) * (a[2] + b[2]);
+        n[1] += (a[2] - b[2]) * (a[0] + b[0]);
+        n[2] += (a[0] - b[0]) * (a[1] + b[1]);
+    }
+    let mag = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if mag < 1e-18 {
+        (0.0, [0.0, 0.0, 1.0])
+    } else {
+        (0.5 * mag, [n[0] / mag, n[1] / mag, n[2] / mag])
+    }
+}
+
+fn pretension_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
+    let mut mpcs = Vec::new();
+    let dim = 3.min(ndn);
+    for sec in &model.pretensions {
+        if sec.pairs.is_empty() {
+            continue;
+        }
+        let n = sec.normal;
+        let (t1, t2) = orthonormals(n);
+        let di = match model.node_index(sec.dummy) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        let dummy_dof = ndn * di; // dof 1 = generalized opening (independent)
+        for &(orig, copy, _) in &sec.pairs {
+            let oi = model.node_index(orig)?;
+            let ci = model.node_index(copy)?;
+            // n · (u_orig − u_copy) = u_dummy  (+CLOAD = tension)
+            if let Some(m) = normal_opening(ndn, dim, ci, oi, dummy_dof, n) {
+                mpcs.push(m);
+            }
+            if let Some(m) = dir_tie(ndn, dim, ci, oi, t1) {
+                mpcs.push(m);
+            }
+            if dim >= 3 {
+                if let Some(m) = dir_tie(ndn, dim, ci, oi, t2) {
+                    mpcs.push(m);
+                }
+            }
+        }
+    }
+    Ok(mpcs)
+}
+
+fn orthonormals(n: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let a = if n[2].abs() < 0.9 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let mut t1 = [
+        n[1] * a[2] - n[2] * a[1],
+        n[2] * a[0] - n[0] * a[2],
+        n[0] * a[1] - n[1] * a[0],
+    ];
+    let l = (t1[0] * t1[0] + t1[1] * t1[1] + t1[2] * t1[2]).sqrt();
+    if l < 1e-18 {
+        t1 = [0.0, 1.0, 0.0];
+    } else {
+        t1 = [t1[0] / l, t1[1] / l, t1[2] / l];
+    }
+    let t2 = [
+        n[1] * t1[2] - n[2] * t1[1],
+        n[2] * t1[0] - n[0] * t1[2],
+        n[0] * t1[1] - n[1] * t1[0],
+    ];
+    (t1, t2)
+}
+
+/// t · (u_a − u_b) = 0, slave = a's largest |t| component.
+fn dir_tie(ndn: usize, dim: usize, ni_a: usize, ni_b: usize, t: [f64; 3]) -> Option<Mpc> {
+    let mut sidx = 0usize;
+    for d in 1..dim {
+        if t[d].abs() > t[sidx].abs() {
+            sidx = d;
+        }
+    }
+    if t[sidx].abs() < 1e-14 {
+        return None;
+    }
+    let cs = t[sidx];
+    let slave = ndn * ni_a + sidx;
+    let mut masters = vec![(ndn * ni_b + sidx, 1.0)];
+    for k in 0..dim {
+        if k == sidx {
+            continue;
+        }
+        let r = t[k] / cs;
+        if r.abs() < 1e-16 {
+            continue;
+        }
+        masters.push((ndn * ni_a + k, -r));
+        masters.push((ndn * ni_b + k, r));
+    }
+    Some(Mpc {
+        slave,
+        masters: coalesce(masters),
+        u0: 0.0,
+    })
+}
+
+fn normal_opening(
+    ndn: usize,
+    dim: usize,
+    ci: usize,
+    oi: usize,
+    dummy_dof: usize,
+    n: [f64; 3],
+) -> Option<Mpc> {
+    let mut sidx = 0usize;
+    for d in 1..dim {
+        if n[d].abs() > n[sidx].abs() {
+            sidx = d;
+        }
+    }
+    if n[sidx].abs() < 1e-14 {
+        return None;
+    }
+    let cs = n[sidx];
+    // n · (u_orig − u_copy) = u_dummy  (CCX: +CLOAD on dummy = pretension / tension)
+    // slave = copy[sidx]
+    let slave = ndn * ci + sidx;
+    let mut masters = vec![(dummy_dof, -1.0 / cs), (ndn * oi + sidx, 1.0)];
+    for k in 0..dim {
+        if k == sidx {
+            continue;
+        }
+        let r = n[k] / cs;
+        if r.abs() < 1e-16 {
+            continue;
+        }
+        masters.push((ndn * ci + k, -r));
+        masters.push((ndn * oi + k, r));
+    }
+    Some(Mpc {
+        slave,
+        masters: coalesce(masters),
+        u0: 0.0,
+    })
+}
+
 pub fn build_all_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
     build_all_mpcs_at(model, ndn, None)
 }
 
 pub fn build_all_mpcs_at(model: &Model, ndn: usize, u: Option<&[f64]>) -> Result<Vec<Mpc>> {
     let mut v = equations_to_mpcs(model, ndn)?;
+    v.extend(pretension_to_mpcs(model, ndn)?);
     v.extend(ties_to_mpcs(model, ndn)?);
     v.extend(rigid_to_mpcs_at(model, ndn, u)?);
     v.extend(coupling_to_mpcs(model, ndn)?);

@@ -1089,6 +1089,14 @@ fn pack(csr: &Csr, rhs: &[f64], x: Vec<f64>, name: &str) -> SparseSolve {
     }
 }
 
+fn residual_ok(s: &SparseSolve, rhs: &[f64]) -> bool {
+    if s.x.iter().any(|v| !v.is_finite()) {
+        return false;
+    }
+    let b = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+    s.residual.is_finite() && s.residual <= 1e-8 * b.max(1.0) + 1e-10
+}
+
 fn try_rivrs(csr: &Csr, rhs: &[f64]) -> Result<Vec<f64>> {
     use faer::{Col, Par};
     use rivrs_sparse::symmetric::{OrderingStrategy, SolverOptions, SparseLDLT};
@@ -1174,29 +1182,48 @@ pub fn solve_kff(csr: &Csr, rhs: &[f64]) -> Result<SparseSolve> {
         return Ok(pack(csr, rhs, x, &name));
     }
 
-    // SPD: faer supernodal LLT (PARDISO-class, no extra libs).
-    // Indefinite (contact, some Newton): rivrs APTP LDLT, then faer LU.
+    // SPD: faer supernodal LLT. Contact/Newton K is often indefinite —
+    // rivrs LDLT can return without error but with a useless residual, so
+    // try faer LU next and only then rivrs (gated on residual quality).
     match try_faer_llt(csr, rhs) {
         Ok(x) => {
-            announce("faer (supernodal LLT)");
-            return Ok(pack(csr, rhs, x, "faer (supernodal LLT)"));
+            let s = pack(csr, rhs, x, "faer (supernodal LLT)");
+            if residual_ok(&s, rhs) {
+                announce("faer (supernodal LLT)");
+                return Ok(s);
+            }
         }
         Err(_) => {}
     }
 
-    match try_rivrs(csr, rhs) {
+    match try_faer_lu(csr, rhs) {
         Ok(x) => {
-            announce("rivrs-sparse (LDLT)");
-            return Ok(pack(csr, rhs, x, "rivrs-sparse (LDLT)"));
+            announce("faer (supernodal LU)");
+            return Ok(pack(csr, rhs, x, "faer (supernodal LU)"));
         }
         Err(e) => {
-            eprintln!("axia: rivrs-sparse failed ({e}), trying faer LU");
+            eprintln!("axia: faer LU failed ({e}), trying rivrs-sparse");
         }
     }
 
-    let x = try_faer_lu(csr, rhs)?;
-    announce("faer (supernodal LU)");
-    Ok(pack(csr, rhs, x, "faer (supernodal LU)"))
+    match try_rivrs(csr, rhs) {
+        Ok(x) => {
+            let s = pack(csr, rhs, x, "rivrs-sparse (LDLT)");
+            if residual_ok(&s, rhs) {
+                announce("rivrs-sparse (LDLT)");
+                return Ok(s);
+            }
+            eprintln!(
+                "axia: rivrs-sparse residual {:.3e} too large, refusing",
+                s.residual
+            );
+        }
+        Err(e) => {
+            eprintln!("axia: rivrs-sparse failed ({e})");
+        }
+    }
+
+    err("Sparse-Solver: faer LLT/LU und rivrs-sparse sind fehlgeschlagen.")
 }
 
 #[cfg(test)]
