@@ -337,6 +337,14 @@ pub fn ties_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
 }
 
 pub fn rigid_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
+    rigid_to_mpcs_at(model, ndn, None)
+}
+
+/// Finite-rotation rigid MPCs. `u` is the current global displacement (ndn per node);
+/// θ of the ref node is taken from u[ndn*ri+3..6] (or 0). Tangent uses the
+/// current lever arm R r0: Δu_s = Δu_r + Δθ × (R r0), particular u0 = (R−I)r0 − (∂Rr/∂θ)θ
+/// so the linear map matches the finite kinematics at the linearization point.
+pub fn rigid_to_mpcs_at(model: &Model, ndn: usize, u: Option<&[f64]>) -> Result<Vec<Mpc>> {
     let mut mpcs = Vec::new();
     if ndn < 6 && !model.rigid_bodies.is_empty() {
         return err("*RIGID BODY benötigt 6 DOF (Rotationen am Referenzknoten).");
@@ -345,44 +353,62 @@ pub fn rigid_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
         let refn = rb.ref_node;
         let ri = model.node_index(refn)?;
         let xr = model.coords[ri];
+        let mut theta = [0.0; 3];
+        if let Some(u) = u {
+            for d in 0..3 {
+                theta[d] = u.get(ndn * ri + 3 + d).copied().unwrap_or(0.0);
+            }
+        }
+        let rmat = rot_matrix(theta);
         let slaves = model.expand_nset(&rb.nset)?;
         for s in slaves {
             if s == refn {
                 continue;
             }
+            if rb.rot_node == Some(s) {
+                continue;
+            }
             let si = model.node_index(s)?;
             let xs = model.coords[si];
-            let rx = xs[0] - xr[0];
-            let ry = xs[1] - xr[1];
-            let rz = xs[2] - xr[2];
-            // u_s = u_r + θ × r
-            // ux: urx + θy*rz - θz*ry
+            let r0 = [xs[0] - xr[0], xs[1] - xr[1], xs[2] - xr[2]];
+            let rr = matvec(rmat, r0);
+            // u0_finite = (R-I) r0
+            let ufin = [rr[0] - r0[0], rr[1] - r0[1], rr[2] - r0[2]];
+            // tangent: Δu = Δθ × (R r0)  →  ux +=  θy * rrz - θz * rry
             let urx = ndn * ri;
             let ury = ndn * ri + 1;
             let urz = ndn * ri + 2;
             let thx = ndn * ri + 3;
             let thy = ndn * ri + 4;
             let thz = ndn * ri + 5;
+            // u_s = u_r + ufin + [∂(Rr)/∂θ](θ - θ0) with θ0=current
+            // stored as u_s = 1*u_r + (skew(Rr))^T θ + (ufin - skew(Rr)^T θ_current)
+            // Δu = Δθ × rr = [θy*rrz - θz*rry, θz*rrx - θx*rrz, θx*rry - θy*rrx]
+            let particular = [
+                ufin[0] - (theta[1] * rr[2] - theta[2] * rr[1]),
+                ufin[1] - (theta[2] * rr[0] - theta[0] * rr[2]),
+                ufin[2] - (theta[0] * rr[1] - theta[1] * rr[0]),
+            ];
             mpcs.push(Mpc {
                 slave: ndn * si,
-                masters: vec![(urx, 1.0), (thy, rz), (thz, -ry)],
-                u0: 0.0,
+                masters: vec![(urx, 1.0), (thy, rr[2]), (thz, -rr[1])],
+                u0: particular[0],
             });
             mpcs.push(Mpc {
                 slave: ndn * si + 1,
-                masters: vec![(ury, 1.0), (thz, rx), (thx, -rz)],
-                u0: 0.0,
+                masters: vec![(ury, 1.0), (thz, rr[0]), (thx, -rr[2])],
+                u0: particular[1],
             });
             mpcs.push(Mpc {
                 slave: ndn * si + 2,
-                masters: vec![(urz, 1.0), (thx, ry), (thy, -rx)],
-                u0: 0.0,
+                masters: vec![(urz, 1.0), (thx, rr[1]), (thy, -rr[0])],
+                u0: particular[2],
             });
             if ndn >= 6 {
-                for r in 0..3 {
+                for rot in 0..3 {
                     mpcs.push(Mpc {
-                        slave: ndn * si + 3 + r,
-                        masters: vec![(ndn * ri + 3 + r, 1.0)],
+                        slave: ndn * si + 3 + rot,
+                        masters: vec![(ndn * ri + 3 + rot, 1.0)],
                         u0: 0.0,
                     });
                 }
@@ -390,6 +416,81 @@ pub fn rigid_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
         }
     }
     Ok(mpcs)
+}
+
+fn rot_matrix(theta: [f64; 3]) -> [[f64; 3]; 3] {
+    let ang = (theta[0] * theta[0] + theta[1] * theta[1] + theta[2] * theta[2]).sqrt();
+    if ang < 1e-14 {
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    }
+    let n = [theta[0] / ang, theta[1] / ang, theta[2] / ang];
+    let s = ang.sin();
+    let c = ang.cos();
+    let mut r = [[0.0; 3]; 3];
+    for i in 0..3 {
+        r[i][i] = c;
+        for j in 0..3 {
+            r[i][j] += (1.0 - c) * n[i] * n[j];
+        }
+    }
+    r[0][1] -= n[2] * s;
+    r[0][2] += n[1] * s;
+    r[1][0] += n[2] * s;
+    r[1][2] -= n[0] * s;
+    r[2][0] -= n[1] * s;
+    r[2][1] += n[0] * s;
+    r
+}
+
+fn matvec(m: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+/// Overwrite slave translations with exact finite-rotation kinematics.
+pub fn apply_rigid_finite(model: &Model, ndn: usize, u: &mut [f64]) -> Result<()> {
+    if ndn < 6 {
+        return Ok(());
+    }
+    for rb in &model.rigid_bodies {
+        let ri = model.node_index(rb.ref_node)?;
+        let xr = model.coords[ri];
+        let ur = [
+            u.get(ndn * ri).copied().unwrap_or(0.0),
+            u.get(ndn * ri + 1).copied().unwrap_or(0.0),
+            u.get(ndn * ri + 2).copied().unwrap_or(0.0),
+        ];
+        let theta = [
+            u.get(ndn * ri + 3).copied().unwrap_or(0.0),
+            u.get(ndn * ri + 4).copied().unwrap_or(0.0),
+            u.get(ndn * ri + 5).copied().unwrap_or(0.0),
+        ];
+        let rmat = rot_matrix(theta);
+        let slaves = model.expand_nset(&rb.nset)?;
+        for s in slaves {
+            if s == rb.ref_node || rb.rot_node == Some(s) {
+                continue;
+            }
+            let si = model.node_index(s)?;
+            let xs = model.coords[si];
+            let r0 = [xs[0] - xr[0], xs[1] - xr[1], xs[2] - xr[2]];
+            let rr = matvec(rmat, r0);
+            if ndn * si + 2 < u.len() {
+                u[ndn * si] = ur[0] + rr[0] - r0[0];
+                u[ndn * si + 1] = ur[1] + rr[1] - r0[1];
+                u[ndn * si + 2] = ur[2] + rr[2] - r0[2];
+            }
+            if ndn >= 6 && ndn * si + 5 < u.len() {
+                u[ndn * si + 3] = theta[0];
+                u[ndn * si + 4] = theta[1];
+                u[ndn * si + 5] = theta[2];
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn coupling_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
@@ -473,9 +574,13 @@ pub fn coupling_to_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
 }
 
 pub fn build_all_mpcs(model: &Model, ndn: usize) -> Result<Vec<Mpc>> {
+    build_all_mpcs_at(model, ndn, None)
+}
+
+pub fn build_all_mpcs_at(model: &Model, ndn: usize, u: Option<&[f64]>) -> Result<Vec<Mpc>> {
     let mut v = equations_to_mpcs(model, ndn)?;
     v.extend(ties_to_mpcs(model, ndn)?);
-    v.extend(rigid_to_mpcs(model, ndn)?);
+    v.extend(rigid_to_mpcs_at(model, ndn, u)?);
     v.extend(coupling_to_mpcs(model, ndn)?);
     Ok(v)
 }

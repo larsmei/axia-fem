@@ -408,6 +408,15 @@ pub struct Element {
     pub elset: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HyperKind {
+    #[default]
+    None,
+    NeoHooke,
+    Ogden,
+    Hyperfoam,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Material {
     pub e: f64,
@@ -417,6 +426,10 @@ pub struct Material {
     pub tref: f64,
     pub conductivity: f64,
     pub specific_heat: f64,
+    pub hyper: HyperKind,
+    /// Neo-Hooke: [C10, D1, ..]; Ogden: [μ1, α1, D1, μ2, α2, D2]; Foam: [μ1, α1, β1, μ2, α2, β2]
+    pub h: [f64; 6],
+    pub h_n: u8,
 }
 
 impl Default for Material {
@@ -429,7 +442,49 @@ impl Default for Material {
             tref: 0.0,
             conductivity: 0.0,
             specific_heat: 0.0,
+            hyper: HyperKind::None,
+            h: [0.0; 6],
+            h_n: 0,
         }
+    }
+}
+
+impl Material {
+    pub fn is_hyper(&self) -> bool {
+        self.hyper != HyperKind::None
+    }
+
+    /// Equivalent Lamé pair so a linear path still has stiffness.
+    pub fn set_equiv_from_hyper(&mut self) {
+        let mu = match self.hyper {
+            HyperKind::NeoHooke => 2.0 * self.h[0].abs(),
+            HyperKind::Ogden | HyperKind::Hyperfoam => {
+                let mut s = 0.0;
+                let n = self.h_n.max(1) as usize;
+                for i in 0..n.min(2) {
+                    s += 0.5 * self.h[3 * i].abs() * self.h[3 * i + 1].abs().max(1.0);
+                }
+                if s < 1e-18 {
+                    s = self.h[0].abs();
+                }
+                s.max(1e-12)
+            }
+            HyperKind::None => return,
+        };
+        let d1 = match self.hyper {
+            HyperKind::NeoHooke => self.h[1],
+            HyperKind::Ogden => self.h[2],
+            HyperKind::Hyperfoam => 0.0,
+            HyperKind::None => 0.0,
+        };
+        let kappa = if d1.abs() > 1e-18 {
+            2.0 / d1.abs()
+        } else {
+            1.0e4 * mu
+        };
+        let den = 3.0 * kappa + mu;
+        self.e = 9.0 * kappa * mu / den.max(1e-30);
+        self.nu = ((3.0 * kappa - 2.0 * mu) / (2.0 * den.max(1e-30))).clamp(-0.49, 0.499);
     }
 }
 

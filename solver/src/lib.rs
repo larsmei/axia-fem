@@ -1668,10 +1668,10 @@ elastic plastic
     }
 
     #[test]
-    fn nlgeom_mixed_mesh_falls_back_linear() {
+    fn nlgeom_s4_runs_newton() {
         let inp = r#"
 *HEADING
-nlgeom mixed
+nlgeom s4
 *NODE
 1, 0, 0, 0
 2, 10, 0, 0
@@ -1679,31 +1679,26 @@ nlgeom mixed
 4, 0, 10, 0
 *ELEMENT, TYPE=S4, ELSET=S
 1, 1, 2, 3, 4
-*ELEMENT, TYPE=T3D2, ELSET=T
-2, 1, 2
 *MATERIAL, NAME=STEEL
 *ELASTIC
 210000, 0.3
 *SHELL SECTION, ELSET=S, MATERIAL=STEEL
 1.0
-*SOLID SECTION, ELSET=T, MATERIAL=STEEL
-1
 *BOUNDARY
 1, 1, 6
+2, 1, 6
+4, 1, 6
 *STEP, NLGEOM
 *STATIC
-*CLOAD
-2, 3, 1
+*DLOAD
+1, P, -0.01
 *END STEP
 "#;
-        let out = solve_native(inp).expect("mixed NLGEOM should fall back to linear");
+        let out = solve_native(inp).expect("S4 NLGEOM");
         assert!(
-            out.model
-                .warnings
-                .iter()
-                .any(|w| w.contains("NLGEOM") || w.contains("linear")),
-            "expected fallback warning, got {:?}",
-            out.model.warnings
+            !out.solver.contains("linear-elastisch"),
+            "solver={}",
+            out.solver
         );
         assert!(out.u.iter().all(|u| u.iter().all(|v| v.is_finite())));
     }
@@ -3675,5 +3670,170 @@ LOAD, 1, 1., 3, 1, -1.
         );
         let out = solve_native(inp).unwrap();
         assert!(out.u.iter().all(|u| u.iter().all(|v| v.is_finite())));
+    }
+
+    #[test]
+    fn glued_solidsection_and_rigidbody_keywords() {
+        let inp = r#"
+*NODE, NSET=NALL
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+*NODE, NSET=CENTER
+9, 0, 0, 0
+10, 0, 0, 0
+*ELEMENT, TYPE=CPE4, ELSET=EALL
+1, 1, 2, 3, 4
+*MATERIAL, NAME=EL
+*ELASTIC
+210000, 0.3
+*SOLIDSECTION, ELSET=EALL, MATERIAL=EL
+0.1
+*RIGIDBODY, NSET=NALL, REFNODE=9, ROTNODE=10
+*STEP, NLGEOM
+*STATIC
+*BOUNDARY
+9, 1, 3
+10, 1, 2
+10, 3, 3, 0.1
+*END STEP
+"#;
+        let m = parse_model(inp).unwrap();
+        assert_eq!(m.elset_material.get("EALL").map(String::as_str), Some("EL"));
+        assert_eq!(m.rigid_bodies.len(), 1);
+        let out = solve_native(inp).expect("glued keywords + rigid NLGEOM");
+        assert!(
+            !out.solver.contains("linear-elastisch"),
+            "solver={}",
+            out.solver
+        );
+        // 0.1 rad about z: node 2 at (1,0) → (cos, sin)
+        let i2 = out.model.node_index(2).unwrap();
+        let ux = out.u[i2][0];
+        let uy = out.u[i2][1];
+        let c = 0.1_f64.cos();
+        let s = 0.1_f64.sin();
+        assert!((ux - (c - 1.0)).abs() < 0.02, "ux={ux}");
+        assert!((uy - s).abs() < 0.02, "uy={uy}");
+    }
+
+    #[test]
+    fn nlgeom_cps4_tension() {
+        let inp = r#"
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+*ELEMENT, TYPE=CPS4, ELSET=E
+1, 1, 2, 3, 4
+*MATERIAL, NAME=STEEL
+*ELASTIC
+100, 0.0
+*SOLID SECTION, ELSET=E, MATERIAL=STEEL
+1
+*BOUNDARY
+1, 1, 2
+4, 1, 1
+2, 2, 2
+*STEP, NLGEOM
+*STATIC
+*BOUNDARY
+2, 1, 1, 0.01
+3, 1, 1, 0.01
+*END STEP
+"#;
+        let out = solve_native(inp).expect("CPS4 NLGEOM");
+        assert!(
+            !out.solver.contains("linear-elastisch"),
+            "solver={}",
+            out.solver
+        );
+        let ux = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((ux - 0.01).abs() < 1e-6, "ux={ux}");
+    }
+
+    #[test]
+    fn hyperelastic_neo_hooke_parses_and_runs() {
+        let inp = r#"
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+5, 0, 0, 1
+6, 1, 0, 1
+7, 1, 1, 1
+8, 0, 1, 1
+*ELEMENT, TYPE=C3D8, ELSET=E
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=HY
+*HYPERELASTIC, NEO HOOKE
+1.92505, 0.026
+*SOLID SECTION, ELSET=E, MATERIAL=HY
+*BOUNDARY
+1, 1, 3
+4, 1, 1
+4, 3, 3
+5, 1, 2
+8, 1, 1
+2, 2, 3
+3, 3, 3
+6, 2, 2
+*STEP, NLGEOM
+*STATIC
+*BOUNDARY
+2, 1, 1, 0.1
+3, 1, 1, 0.1
+6, 1, 1, 0.1
+7, 1, 1, 0.1
+*END STEP
+"#;
+        let m = parse_model(inp).unwrap();
+        let hy = m.materials.get("HY").unwrap();
+        assert_eq!(hy.hyper, crate::model::HyperKind::NeoHooke);
+        assert!((hy.h[0] - 1.92505).abs() < 1e-8);
+        let out = solve_native(inp).expect("neo-hooke cube");
+        assert!(
+            !out.solver.contains("linear-elastisch"),
+            "solver={}",
+            out.solver
+        );
+        let ux = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((ux - 0.1).abs() < 1e-4, "ux={ux}");
+        assert!(out.u.iter().all(|u| u.iter().all(|v| v.is_finite())));
+    }
+
+    #[test]
+    fn nlgeom_b31_cantilever_runs() {
+        let inp = r#"
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+*ELEMENT, TYPE=B31, ELSET=E
+1, 1, 2
+*BOUNDARY
+1, 1, 6
+*MATERIAL, NAME=EL
+*ELASTIC
+210000, 0.3
+*BEAM SECTION, ELSET=E, MATERIAL=EL, SECTION=RECT
+0.1, 0.1
+0, 0, 1
+*STEP, NLGEOM
+*STATIC
+*CLOAD
+2, 3, 1
+*END STEP
+"#;
+        let out = solve_native(inp).expect("B31 NLGEOM");
+        assert!(
+            !out.solver.contains("linear-elastisch"),
+            "solver={}",
+            out.solver
+        );
+        let uz = out.u[out.model.node_index(2).unwrap()][2];
+        assert!(uz.abs() > 1e-8 && uz.is_finite(), "uz={uz}");
     }
 }

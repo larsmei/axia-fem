@@ -1128,6 +1128,109 @@ pub fn membrane_pressure(kind: ElemKind, xyz: &[[f64; 3]], p: f64) -> Result<Vec
     Ok(fe)
 }
 
+/// Co-rotational shell: linear stiffness on the current mid-surface,
+/// internal force from deformational displacement (rigid motion removed).
+pub fn stiffness_nl(
+    kind: ElemKind,
+    xyz0: &[[f64; 3]],
+    ue: &[f64],
+    e: f64,
+    nu: f64,
+    h: f64,
+) -> Result<(Vec<f64>, Vec<f64>, [f64; 6])> {
+    let nn = kind.nnodes();
+    let nd = 6 * nn;
+    let mut xyz = vec![[0.0; 3]; nn];
+    for a in 0..nn.min(xyz0.len()) {
+        xyz[a] = [
+            xyz0[a][0] + ue.get(6 * a).copied().unwrap_or(0.0),
+            xyz0[a][1] + ue.get(6 * a + 1).copied().unwrap_or(0.0),
+            xyz0[a][2] + ue.get(6 * a + 2).copied().unwrap_or(0.0),
+        ];
+    }
+    let (e1, e2, e3) = local_frame(&xyz, nn)?;
+    let (e10, e20, e30) = local_frame(xyz0, nn)?;
+    let mut c0 = [0.0; 3];
+    let mut c1 = [0.0; 3];
+    for a in 0..nn {
+        for d in 0..3 {
+            c0[d] += xyz0[a][d];
+            c1[d] += xyz[a][d];
+        }
+    }
+    let invn = 1.0 / nn as f64;
+    for d in 0..3 {
+        c0[d] *= invn;
+        c1[d] *= invn;
+    }
+    let mut r = [[0.0; 3]; 3];
+    let t0 = [e10, e20, e30];
+    let t1 = [e1, e2, e3];
+    for i in 0..3 {
+        for j in 0..3 {
+            r[i][j] = t1[0][i] * t0[0][j] + t1[1][i] * t0[1][j] + t1[2][i] * t0[2][j];
+        }
+    }
+    let th = rotvec_from_r_shell(r);
+    let mut udef = vec![0.0; nd];
+    for a in 0..nn {
+        let d0 = [
+            xyz0[a][0] - c0[0],
+            xyz0[a][1] - c0[1],
+            xyz0[a][2] - c0[2],
+        ];
+        let rd = [
+            r[0][0] * d0[0] + r[0][1] * d0[1] + r[0][2] * d0[2],
+            r[1][0] * d0[0] + r[1][1] * d0[1] + r[1][2] * d0[2],
+            r[2][0] * d0[0] + r[2][1] * d0[1] + r[2][2] * d0[2],
+        ];
+        let urig = [
+            c1[0] + rd[0] - xyz0[a][0],
+            c1[1] + rd[1] - xyz0[a][1],
+            c1[2] + rd[2] - xyz0[a][2],
+        ];
+        udef[6 * a] = ue.get(6 * a).copied().unwrap_or(0.0) - urig[0];
+        udef[6 * a + 1] = ue.get(6 * a + 1).copied().unwrap_or(0.0) - urig[1];
+        udef[6 * a + 2] = ue.get(6 * a + 2).copied().unwrap_or(0.0) - urig[2];
+        udef[6 * a + 3] = ue.get(6 * a + 3).copied().unwrap_or(0.0) - th[0];
+        udef[6 * a + 4] = ue.get(6 * a + 4).copied().unwrap_or(0.0) - th[1];
+        udef[6 * a + 5] = ue.get(6 * a + 5).copied().unwrap_or(0.0) - th[2];
+    }
+    let (ke0, _) = stiffness(kind, xyz0, e, nu, h)?;
+    let (ke, _) = stiffness(kind, &xyz, e, nu, h)?;
+    let mut fe = vec![0.0; nd];
+    for i in 0..nd {
+        let mut s = 0.0;
+        for j in 0..nd {
+            s += ke0.get(i * nd + j).copied().unwrap_or(0.0) * udef[j];
+        }
+        fe[i] = s;
+    }
+    let stress = nodal_stress(kind, &xyz, &udef, e, nu, h)
+        .ok()
+        .and_then(|v| v.first().copied())
+        .unwrap_or([0.0; 6]);
+    let _ = (e2, e20);
+    Ok((ke, fe, stress))
+}
+
+fn rotvec_from_r_shell(r: [[f64; 3]; 3]) -> [f64; 3] {
+    let c = ((r[0][0] + r[1][1] + r[2][2] - 1.0) * 0.5).clamp(-1.0, 1.0);
+    let ang = c.acos();
+    if ang.abs() < 1e-14 {
+        return [0.0, 0.0, 0.0];
+    }
+    let s = ang.sin();
+    if s.abs() < 1e-14 {
+        return [0.0, 0.0, 0.0];
+    }
+    [
+        ang * (r[2][1] - r[1][2]) / (2.0 * s),
+        ang * (r[0][2] - r[2][0]) / (2.0 * s),
+        ang * (r[1][0] - r[0][1]) / (2.0 * s),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

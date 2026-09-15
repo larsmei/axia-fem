@@ -406,3 +406,205 @@ pub fn line_load_local(
     }
     Ok(fe)
 }
+
+/// Co-rotational NLGEOM: linear Timoshenko in the current chord frame.
+pub fn stiffness_nl(
+    kind: ElemKind,
+    xyz0: &[[f64; 3]],
+    ue: &[f64],
+    e: f64,
+    nu: f64,
+    sec: &BeamSection,
+) -> Result<(Vec<f64>, Vec<f64>, [f64; 6])> {
+    let nn = kind.nnodes();
+    let nd = 6 * nn;
+    let mut xyz = vec![[0.0; 3]; nn];
+    for a in 0..nn {
+        xyz[a] = [
+            xyz0[a][0] + ue.get(6 * a).copied().unwrap_or(0.0),
+            xyz0[a][1] + ue.get(6 * a + 1).copied().unwrap_or(0.0),
+            xyz0[a][2] + ue.get(6 * a + 2).copied().unwrap_or(0.0),
+        ];
+    }
+    let i1 = if nn == 2 { 1 } else { 1 }; // B32: nodes 0,1 are ends (order: end1,end2,mid)
+    let i1 = if nn == 3 { 1 } else { i1 };
+    let t0 = normalize([
+        xyz0[i1][0] - xyz0[0][0],
+        xyz0[i1][1] - xyz0[0][1],
+        xyz0[i1][2] - xyz0[0][2],
+    ])?;
+    let t = normalize([
+        xyz[i1][0] - xyz[0][0],
+        xyz[i1][1] - xyz[0][1],
+        xyz[i1][2] - xyz[0][2],
+    ])?;
+    let l0 = dist3(xyz0[0], xyz0[i1]).max(1e-18);
+    let l = dist3(xyz[0], xyz[i1]).max(1e-18);
+    let (n1, n2) = orthonormal(t, sec.n1)?;
+    let r = rotation_from_t(t0, t);
+    let th_chord = rotvec_from_r(r);
+    let mut udef = vec![0.0; nd];
+    for a in 0..nn {
+        let mut thg = [
+            ue.get(6 * a + 3).copied().unwrap_or(0.0),
+            ue.get(6 * a + 4).copied().unwrap_or(0.0),
+            ue.get(6 * a + 5).copied().unwrap_or(0.0),
+        ];
+        thg = [
+            thg[0] - th_chord[0],
+            thg[1] - th_chord[1],
+            thg[2] - th_chord[2],
+        ];
+        udef[6 * a + 3] = t[0] * thg[0] + t[1] * thg[1] + t[2] * thg[2];
+        udef[6 * a + 4] = n1[0] * thg[0] + n1[1] * thg[1] + n1[2] * thg[2];
+        udef[6 * a + 5] = n2[0] * thg[0] + n2[1] * thg[1] + n2[2] * thg[2];
+    }
+    udef[6 * i1] = l - l0;
+    if nn == 3 {
+        udef[12] = 0.5 * (l - l0);
+    }
+    let (ke_l, _) = stiffness(kind, xyz0, e, nu, sec)?;
+    let mut fe_l = vec![0.0; nd];
+    for i in 0..nd {
+        let mut s = 0.0;
+        for j in 0..nd {
+            s += ke_l[i * nd + j] * udef[j];
+        }
+        fe_l[i] = s;
+    }
+    let mut ke = vec![0.0; nd * nd];
+    let mut fe = vec![0.0; nd];
+    rotate_6(nn, &ke_l, &fe_l, t, n1, n2, &mut ke, &mut fe);
+    let nforce = e * sec.area * (l - l0) / l0;
+    let geom = nforce / l;
+    for a in [0usize, i1] {
+        for b in [0usize, i1] {
+            let sg = if a == b { geom } else { -geom };
+            for i in 0..3 {
+                for j in 0..3 {
+                    let pr = if i == j { 1.0 } else { 0.0 } - t[i] * t[j];
+                    ke[(6 * a + i) * nd + (6 * b + j)] += sg * pr;
+                }
+            }
+        }
+    }
+    let sig = if sec.area > 0.0 { nforce / sec.area } else { 0.0 };
+    let cauchy = [
+        sig * t[0] * t[0],
+        sig * t[1] * t[1],
+        sig * t[2] * t[2],
+        sig * t[0] * t[1],
+        sig * t[1] * t[2],
+        sig * t[2] * t[0],
+    ];
+    Ok((ke, fe, cauchy))
+}
+
+fn dist3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+}
+
+fn rotation_from_t(t0: [f64; 3], t: [f64; 3]) -> [[f64; 3]; 3] {
+    let c = dot(t0, t).clamp(-1.0, 1.0);
+    let mut axis = cross(t0, t);
+    let s = norm(axis);
+    if s < 1e-14 {
+        if c >= 0.0 {
+            return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        }
+        axis = if t0[2].abs() < 0.9 {
+            normalize(cross(t0, [0.0, 0.0, 1.0])).unwrap_or([1.0, 0.0, 0.0])
+        } else {
+            normalize(cross(t0, [0.0, 1.0, 0.0])).unwrap_or([1.0, 0.0, 0.0])
+        };
+        let e = axis;
+        return [
+            [2.0 * e[0] * e[0] - 1.0, 2.0 * e[0] * e[1], 2.0 * e[0] * e[2]],
+            [2.0 * e[1] * e[0], 2.0 * e[1] * e[1] - 1.0, 2.0 * e[1] * e[2]],
+            [2.0 * e[2] * e[0], 2.0 * e[2] * e[1], 2.0 * e[2] * e[2] - 1.0],
+        ];
+    }
+    axis = scale(axis, 1.0 / s);
+    let mut r = [[0.0; 3]; 3];
+    for i in 0..3 {
+        r[i][i] += c;
+        r[i][(i + 1) % 3] += -axis[(i + 2) % 3] * s;
+        r[i][(i + 2) % 3] += axis[(i + 1) % 3] * s;
+        for j in 0..3 {
+            r[i][j] += (1.0 - c) * axis[i] * axis[j];
+        }
+    }
+    r
+}
+
+fn rotvec_from_r(r: [[f64; 3]; 3]) -> [f64; 3] {
+    let c = ((r[0][0] + r[1][1] + r[2][2] - 1.0) * 0.5).clamp(-1.0, 1.0);
+    let ang = c.acos();
+    if ang.abs() < 1e-14 {
+        return [0.0, 0.0, 0.0];
+    }
+    let s = ang.sin();
+    if s.abs() < 1e-14 {
+        return [0.0, 0.0, 0.0];
+    }
+    [
+        ang * (r[2][1] - r[1][2]) / (2.0 * s),
+        ang * (r[0][2] - r[2][0]) / (2.0 * s),
+        ang * (r[1][0] - r[0][1]) / (2.0 * s),
+    ]
+}
+
+fn rotate_6(
+    nn: usize,
+    ke_l: &[f64],
+    fe_l: &[f64],
+    t: [f64; 3],
+    n1: [f64; 3],
+    n2: [f64; 3],
+    ke: &mut [f64],
+    fe: &mut [f64],
+) {
+    let nd = 6 * nn;
+    let q = [
+        [t[0], n1[0], n2[0]],
+        [t[1], n1[1], n2[1]],
+        [t[2], n1[2], n2[2]],
+    ];
+    let mut tfull = vec![0.0; nd * nd];
+    for a in 0..nn {
+        for blk in 0..2 {
+            let o = 6 * a + 3 * blk;
+            for i in 0..3 {
+                for j in 0..3 {
+                    tfull[(o + i) * nd + (o + j)] = q[i][j];
+                }
+            }
+        }
+    }
+    let mut tmp = vec![0.0; nd * nd];
+    for i in 0..nd {
+        for j in 0..nd {
+            let mut s = 0.0;
+            for k in 0..nd {
+                s += tfull[i * nd + k] * ke_l[k * nd + j];
+            }
+            tmp[i * nd + j] = s;
+        }
+    }
+    for i in 0..nd {
+        for j in 0..nd {
+            let mut s = 0.0;
+            for k in 0..nd {
+                s += tmp[i * nd + k] * tfull[j * nd + k];
+            }
+            ke[i * nd + j] = s;
+        }
+        let mut s = 0.0;
+        for k in 0..nd {
+            s += tfull[i * nd + k] * fe_l[k];
+        }
+        fe[i] = s;
+    }
+}
+

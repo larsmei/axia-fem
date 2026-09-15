@@ -5,7 +5,7 @@ use crate::error::{err, Result};
 use crate::model::{
     Amplitude, AnalysisStep, BeamSection, Boundary, Cflux, Cload, ContactPair, Coupling, Dflux,
     Dload, ElemKind, Element, Equation, Film, FluxKind, InitCond, InitKind, Material, Model,
-    RigidBody, Surface, SurfaceInteraction, ThermalBc, Tie, Transform,
+    HyperKind, RigidBody, Surface, SurfaceInteraction, ThermalBc, Tie, Transform,
 };
 
 fn strip_comment(line: &str) -> &str {
@@ -33,7 +33,39 @@ fn parse_keyword(line: &str) -> (String, HashMap<String, String>) {
             params.insert(p.to_string(), String::new());
         }
     }
+    let kw = unglue_keyword(&kw);
     (kw, params)
+}
+
+/// CalculiX akzeptiert `*SOLIDSECTION` und `*SOLID SECTION`.
+fn unglue_keyword(kw: &str) -> String {
+    const TABLE: &[(&str, &str)] = &[
+        ("*SOLIDSECTION", "*SOLID SECTION"),
+        ("*SHELLSECTION", "*SHELL SECTION"),
+        ("*MEMBRANESECTION", "*MEMBRANE SECTION"),
+        ("*BEAMSECTION", "*BEAM SECTION"),
+        ("*BEAMGENERALSECTION", "*BEAM GENERAL SECTION"),
+        ("*RIGIDBODY", "*RIGID BODY"),
+        ("*CONTACTPAIR", "*CONTACT PAIR"),
+        ("*SURFACEINTERACTION", "*SURFACE INTERACTION"),
+        ("*INITIALCONDITIONS", "*INITIAL CONDITIONS"),
+        ("*ENDSTEP", "*END STEP"),
+        ("*ELPRINT", "*EL PRINT"),
+        ("*NODEPRINT", "*NODE PRINT"),
+        ("*ELFILE", "*EL FILE"),
+        ("*NODEFILE", "*NODE FILE"),
+        ("*NODEOUTPUT", "*NODE OUTPUT"),
+        ("*ELOUTPUT", "*EL OUTPUT"),
+        ("*PHYSICALCONSTANTS", "*PHYSICAL CONSTANTS"),
+        ("*TRANSFORM", "*TRANSFORM"),
+    ];
+    let u = kw.to_ascii_uppercase();
+    for &(a, b) in TABLE {
+        if u == a {
+            return b.to_string();
+        }
+    }
+    kw.to_string()
 }
 
 fn tokenize_data(line: &str) -> Vec<String> {
@@ -1746,6 +1778,51 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                     elset,
                     crate::model::GapSection { clearance, k, dir },
                 );
+            }
+            "*HYPERELASTIC" | "*HYPERFOAM" => {
+                let (toks, ni) = collect_tokens(&lines, i + 1);
+                i = ni;
+                let name = current_material
+                    .clone()
+                    .unwrap_or_else(|| "MATERIAL-1".into());
+                let m = model.materials.entry(name).or_default();
+                let vals: Vec<f64> = toks.iter().filter_map(|t| parse_f64_inner(t)).collect();
+                if kw == "*HYPERFOAM" {
+                    m.hyper = HyperKind::Hyperfoam;
+                    let n = params
+                        .get("N")
+                        .and_then(|s| s.parse::<u8>().ok())
+                        .unwrap_or(1)
+                        .clamp(1, 2);
+                    m.h_n = n;
+                    for (i, v) in vals.iter().copied().take(6).enumerate() {
+                        m.h[i] = v;
+                    }
+                } else {
+                    let typ = params
+                        .keys()
+                        .find(|k| k.contains("NEO") || k.contains("OGDEN") || k.contains("MOONEY"))
+                        .cloned()
+                        .unwrap_or_default();
+                    if typ.contains("OGDEN") {
+                        m.hyper = HyperKind::Ogden;
+                        let n = params
+                            .get("N")
+                            .and_then(|s| s.parse::<u8>().ok())
+                            .unwrap_or(1)
+                            .clamp(1, 2);
+                        m.h_n = n;
+                        for (i, v) in vals.iter().copied().take(6).enumerate() {
+                            m.h[i] = v;
+                        }
+                    } else {
+                        m.hyper = HyperKind::NeoHooke;
+                        m.h_n = 1;
+                        m.h[0] = vals.first().copied().unwrap_or(1.0);
+                        m.h[1] = vals.get(1).copied().unwrap_or(0.0);
+                    }
+                }
+                m.set_equiv_from_hyper();
             }
             "*PLASTIC" => {
                 let (toks, ni) = collect_tokens(&lines, i + 1);
