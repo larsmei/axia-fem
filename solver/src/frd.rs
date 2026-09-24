@@ -199,11 +199,11 @@ pub fn write_frd_frames(model: &Model, frames: &[FrdFrame]) -> String {
     };
     let h: String = heading.chars().take(66).collect();
     o.push_str(&format!("    1C{h}\n"));
-    o.push_str("    1UDATE              15.September.2026\n");
+    o.push_str("    1UDATE              24.September.2026\n");
     o.push_str("    1UTIME              21:00:00\n");
     o.push_str("    1UHOST              axia\n");
     o.push_str("    1UPGM               Axia FEM\n");
-    o.push_str("    1UVERSION           1.21.0\n");
+    o.push_str("    1UVERSION           1.22.0\n");
     o.push_str("    1UCODE              CalculiX-compatible Axia FEM\n");
 
     let out_nodes = frd_output_nodes(model);

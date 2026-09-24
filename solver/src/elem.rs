@@ -344,6 +344,7 @@ pub fn element_ke(
     nu: f64,
     thickness: f64,
     section: Option<&BeamSection>,
+    directors: Option<&[[f64; 3]]>,
 ) -> Result<KeFe> {
     match kind {
         ElemKind::Hex8 => {
@@ -519,12 +520,17 @@ pub fn element_ke(
                 volume: area * thickness,
             })
         }
-        ElemKind::Shell4
-        | ElemKind::Shell4R
-        | ElemKind::Shell3
-        | ElemKind::Shell8
-        | ElemKind::Shell8R
-        | ElemKind::Shell6 => {
+        ElemKind::Shell4 | ElemKind::Shell4R => {
+            let (ke, area) = crate::mitc4::s4_ke(xyz, e, nu, thickness, directors)?;
+            let ndof = 24;
+            Ok(KeFe {
+                ke,
+                fe: vec![0.0; ndof],
+                ndof,
+                volume: area * thickness,
+            })
+        }
+        ElemKind::Shell3 | ElemKind::Shell8 | ElemKind::Shell8R | ElemKind::Shell6 => {
             let (ke, area) = shell::stiffness(kind, xyz, e, nu, thickness)?;
             let ndof = 6 * kind.nnodes();
             Ok(KeFe {
@@ -628,6 +634,7 @@ pub fn element_nodal_stress(
     nu: f64,
     section: Option<&BeamSection>,
     thickness: f64,
+    directors: Option<&[[f64; 3]]>,
 ) -> Result<Vec<[f64; 6]>> {
     match kind {
         ElemKind::Hex8 => hex8_nodal_stress(xyz, ue, e, nu),
@@ -659,12 +666,12 @@ pub fn element_nodal_stress(
         ElemKind::Tri6Ps | ElemKind::Tri6Pe => {
             quadratic::tri6_nodal_stress(xyz, ue, e, nu, kind.is_plane_strain())
         }
-        ElemKind::Shell4
-        | ElemKind::Shell4R
-        | ElemKind::Shell3
-        | ElemKind::Shell8
-        | ElemKind::Shell8R
-        | ElemKind::Shell6 => shell::nodal_stress(kind, xyz, ue, e, nu, thickness),
+        ElemKind::Shell4 | ElemKind::Shell4R => {
+            crate::mitc4::s4_stress(xyz, ue, e, nu, thickness, directors)
+        }
+        ElemKind::Shell3 | ElemKind::Shell8 | ElemKind::Shell8R | ElemKind::Shell6 => {
+            shell::nodal_stress(kind, xyz, ue, e, nu, thickness)
+        }
         ElemKind::Mem3 | ElemKind::Mem4 | ElemKind::Mem4R | ElemKind::Mem6 | ElemKind::Mem8 => {
             shell::membrane_nodal_stress(kind, xyz, ue, e, nu, thickness)
         }

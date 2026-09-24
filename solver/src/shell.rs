@@ -1,5 +1,5 @@
 //! Reissner–Mindlin shells, Abaqus-compatible:
-//! S4 / S4R (MITC4), S3 (DKT + CST), S8 / S8R (SRI), S6.
+//! S4 / S4R (curved MITC4), S3 (DKT + CST), S8 / S8R (SRI), S6.
 //!
 //! 6 DOF per node in global axes: u1,u2,u3, ur1,ur2,ur3.
 //! Local: membrane plane-stress + bending + transverse shear + drilling.
@@ -243,56 +243,6 @@ fn add_drill(ke: &mut [f64], nd: usize, nn: usize, e: f64, h: f64, area: f64) {
     }
 }
 
-/// MITC4 covariant shear B (2 × 24) at (ξ,η).
-fn mitc4_bgamma(xy: &[[f64; 2]], xi: f64, eta: f64) -> Result<(Vec<f64>, f64)> {
-    let nn = 4usize;
-    let n = 24usize;
-    let mut bcov = vec![0.0; 2 * n];
-    // γ_ξζ from tying (0, ±1)
-    for (eta_t, coeff) in [(1.0, 0.5 * (1.0 + eta)), (-1.0, 0.5 * (1.0 - eta))] {
-        let (nshp, dn) = quad4_shape(0.0, eta_t);
-        let mut xxi = 0.0;
-        let mut yxi = 0.0;
-        for a in 0..nn {
-            xxi += dn[a][0] * xy[a][0];
-            yxi += dn[a][0] * xy[a][1];
-        }
-        for a in 0..nn {
-            // γ_ξζ = w,ξ + x,ξ θy − y,ξ θx
-            bcov[0 * n + 6 * a + 2] += coeff * dn[a][0];
-            bcov[0 * n + 6 * a + 3] += coeff * (-nshp[a] * yxi);
-            bcov[0 * n + 6 * a + 4] += coeff * (nshp[a] * xxi);
-        }
-    }
-    for (xi_t, coeff) in [(1.0, 0.5 * (1.0 + xi)), (-1.0, 0.5 * (1.0 - xi))] {
-        let (nshp, dn) = quad4_shape(xi_t, 0.0);
-        let mut xet = 0.0;
-        let mut yet = 0.0;
-        for a in 0..nn {
-            xet += dn[a][1] * xy[a][0];
-            yet += dn[a][1] * xy[a][1];
-        }
-        for a in 0..nn {
-            bcov[1 * n + 6 * a + 2] += coeff * dn[a][1];
-            bcov[1 * n + 6 * a + 3] += coeff * (-nshp[a] * yet);
-            bcov[1 * n + 6 * a + 4] += coeff * (nshp[a] * xet);
-        }
-    }
-    let (_, dn) = quad4_shape(xi, eta);
-    let (j, det, _) = jac_xy(xy, &dn, nn)?;
-    // [γxz; γyz] = J^{-T} [γ_ξζ; γ_ηζ]
-    let (inv, _) = invert2(j)?;
-    // J^{-T}[i][k] = inv[k][i]
-    let mut bg = vec![0.0; 2 * n];
-    for col in 0..n {
-        let gxi = bcov[col];
-        let get = bcov[n + col];
-        bg[col] = inv[0][0] * gxi + inv[1][0] * get;
-        bg[n + col] = inv[0][1] * gxi + inv[1][1] * get;
-    }
-    Ok((bg, det))
-}
-
 fn cartesian_shear_b(nshp: &[f64], dndx: &[[f64; 2]], nn: usize) -> Vec<f64> {
     // γxz = w,x + θy ; γyz = w,y − θx
     let n = 6 * nn;
@@ -304,38 +254,6 @@ fn cartesian_shear_b(nshp: &[f64], dndx: &[[f64; 2]], nn: usize) -> Vec<f64> {
         b[1 * n + 6 * a + 3] = -nshp[a];
     }
     b
-}
-
-fn s4_local(xy: &[[f64; 2]], e: f64, nu: f64, h: f64) -> Result<(Vec<f64>, f64)> {
-    let nn = 4usize;
-    let nd = 24usize;
-    let mut ke = vec![0.0; nd * nd];
-    let dm0 = d_plane_stress(e, nu)?;
-    let mut dm = [0.0; 9];
-    let mut db = [0.0; 9];
-    for i in 0..9 {
-        dm[i] = dm0[i] * h;
-        db[i] = dm0[i] * h * h * h / 12.0;
-    }
-    let ds = ds_mat(e, nu, h);
-    let mut area = 0.0;
-    for &xi in &[-G2, G2] {
-        for &eta in &[-G2, G2] {
-            let (nshp, dn) = quad4_shape(xi, eta);
-            let (_, det, dndx) = jac_xy(xy, &dn, nn)?;
-            if det <= 0.0 {
-                return err("S4: negative Jakobideterminante.");
-            }
-            add_membrane(&mut ke, nd, nn, &dndx, &dm, det);
-            add_bending(&mut ke, nd, nn, &dndx, &db, det);
-            let (bg, _) = mitc4_bgamma(xy, xi, eta)?;
-            add_shear(&mut ke, nd, &bg, &ds, det, nn);
-            let _ = nshp;
-            area += det;
-        }
-    }
-    add_drill(&mut ke, nd, nn, e, h, area);
-    Ok((ke, area))
 }
 
 fn s8_local(xy: &[[f64; 2]], e: f64, nu: f64, h: f64, reduced_shear: bool) -> Result<(Vec<f64>, f64)> {
@@ -590,9 +508,7 @@ pub fn stiffness(kind: ElemKind, xyz: &[[f64; 3]], e: f64, nu: f64, h: f64) -> R
     let xy = project_xy(xyz, e1, e2, nn);
     let (mut ke, area) = match kind {
         ElemKind::Shell4 | ElemKind::Shell4R => {
-            let mut p = [[0.0; 2]; 4];
-            p.copy_from_slice(&xy[..4]);
-            s4_local(&p, e, nu, h)?
+            return crate::mitc4::s4_ke(xyz, e, nu, h, None);
         }
         ElemKind::Shell8 | ElemKind::Shell8R => s8_local(&xy, e, nu, h, kind.reduced_int())?,
         ElemKind::Shell3 => {
@@ -695,14 +611,7 @@ pub fn nodal_stress(
     let mut out = vec![[0.0; 6]; nn];
     match kind {
         ElemKind::Shell4 | ElemKind::Shell4R => {
-            for a in 0..4 {
-                let (nshp, dn) = quad4_shape(QUAD_XI[a][0], QUAD_XI[a][1]);
-                let mut p = [[0.0; 2]; 4];
-                p.copy_from_slice(&xy[..4]);
-                let (_, _, dndx) = jac_xy(&p, &dn, 4)?;
-                let sl = local_fiber_stress(&dndx, &nshp, &ul, &dm0, h, 4, e, nu);
-                out[a] = tensor_rotate(sl, e1, e2, e3);
-            }
+            return crate::mitc4::s4_stress(xyz, ue, e, nu, h, None);
         }
         ElemKind::Shell8 | ElemKind::Shell8R => {
             const Q8: [[f64; 2]; 8] = [

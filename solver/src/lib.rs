@@ -14,6 +14,7 @@ mod heat;
 mod inp;
 mod linalg;
 mod material;
+mod mitc4;
 mod model;
 mod nlgeom;
 mod plastic;

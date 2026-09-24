@@ -57,6 +57,78 @@ fn elem_xyz(model: &Model, nodes: &[i32]) -> Result<Vec<[f64; 3]>> {
     Ok(xyz)
 }
 
+/// Area-weighted average of shell-facet normals. Flat plates keep a constant
+/// director; a faceted sphere gets the smoothed radial field MITC4 needs.
+fn shell_nodal_normals(model: &Model) -> Vec<[f64; 3]> {
+    let mut acc = vec![[0.0; 3]; model.coords.len()];
+    for el in &model.elements {
+        let ncorn = match el.kind {
+            ElemKind::Shell4 | ElemKind::Shell4R => 4,
+            ElemKind::Shell3 => 3,
+            _ => continue,
+        };
+        let Ok(xyz) = elem_xyz(model, &el.nodes) else {
+            continue;
+        };
+        if xyz.len() < ncorn {
+            continue;
+        }
+        let e1 = [
+            xyz[1][0] - xyz[0][0],
+            xyz[1][1] - xyz[0][1],
+            xyz[1][2] - xyz[0][2],
+        ];
+        let last = ncorn - 1;
+        let e2 = [
+            xyz[last][0] - xyz[0][0],
+            xyz[last][1] - xyz[0][1],
+            xyz[last][2] - xyz[0][2],
+        ];
+        let c = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        for a in 0..ncorn {
+            let Ok(ni) = model.node_index(el.nodes[a]) else {
+                continue;
+            };
+            acc[ni][0] += c[0];
+            acc[ni][1] += c[1];
+            acc[ni][2] += c[2];
+        }
+    }
+    for v in &mut acc {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if n > 1e-14 {
+            v[0] /= n;
+            v[1] /= n;
+            v[2] /= n;
+        }
+    }
+    acc
+}
+
+fn elem_dirs<'a>(
+    el: &crate::model::Element,
+    model: &Model,
+    normals: &'a [[f64; 3]],
+) -> Option<Vec<[f64; 3]>> {
+    if !matches!(el.kind, ElemKind::Shell4 | ElemKind::Shell4R) {
+        return None;
+    }
+    let mut d = Vec::with_capacity(4);
+    for a in 0..4 {
+        let ni = model.node_index(el.nodes[a]).ok()?;
+        let v = normals.get(ni).copied()?;
+        if v[0] * v[0] + v[1] * v[1] + v[2] * v[2] < 0.25 {
+            return None;
+        }
+        d.push(v);
+    }
+    Some(d)
+}
+
 fn dof_of(ndn: usize, node_index: usize, dir: usize) -> usize {
     ndn * node_index + dir
 }
@@ -278,7 +350,7 @@ fn assemble_nl_element(
         } else {
             model.thickness_for(el)
         };
-        let kef = element_ke(el.kind, xyz0, mat.e, mat.nu, th, None)?;
+        let kef = element_ke(el.kind, xyz0, mat.e, mat.nu, th, None, None)?;
         let n = kef.ndof;
         let mut fe = vec![0.0; n];
         for i in 0..n {
@@ -407,6 +479,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     }
     pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
 
+    let shell_n = shell_nodal_normals(&model);
     let mut f_full = vec![0.0; ndof];
     let mut m_full = vec![0.0; ndof];
 
@@ -436,7 +509,8 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         } else {
             None
         };
-        let mut kef = element_ke(el.kind, &xyz, mat.e, mat.nu, th, sec.as_ref())?;
+        let dirs = elem_dirs(el, &model, &shell_n);
+        let mut kef = element_ke(el.kind, &xyz, mat.e, mat.nu, th, sec.as_ref(), dirs.as_deref())?;
         if !model.node_transform.is_empty() {
             constraint::transform_ke(
                 &mut kef.ke,
@@ -743,7 +817,16 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                 ue[a * local_dim + d] = u_full[dof_of(ndn, ni, d)];
             }
         }
-        let sn = element_nodal_stress(el.kind, &xyz, &ue, mat.e, mat.nu, sec.as_ref(), th)?;
+        let sn = element_nodal_stress(
+            el.kind,
+            &xyz,
+            &ue,
+            mat.e,
+            mat.nu,
+            sec.as_ref(),
+            th,
+            elem_dirs(el, &model, &shell_n).as_deref(),
+        )?;
         for a in 0..nn {
             let ni = model.node_index(el.nodes[a])?;
             for c in 0..6 {
@@ -2057,6 +2140,7 @@ fn recover_elastic_fields(
             }
         }
     }
+    let shell_n = shell_nodal_normals(model);
     let mut acc = vec![[0.0; 6]; nnode];
     let mut cnt = vec![0.0; nnode];
     let mut stress_gp = Vec::new();
@@ -2081,7 +2165,16 @@ fn recover_elastic_fields(
                 ue[a * local_dim + d] = u_full.get(dof_of(ndn, ni, d)).copied().unwrap_or(0.0);
             }
         }
-        let sn = element_nodal_stress(el.kind, &xyz, &ue, mat.e, mat.nu, sec.as_ref(), th)?;
+        let sn = element_nodal_stress(
+            el.kind,
+            &xyz,
+            &ue,
+            mat.e,
+            mat.nu,
+            sec.as_ref(),
+            th,
+            elem_dirs(el, model, &shell_n).as_deref(),
+        )?;
         for a in 0..nn {
             let ni = model.node_index(el.nodes[a])?;
             for c in 0..6 {
@@ -2294,6 +2387,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         prescribed.insert(dof_of(ndn, ni, bc.dof), bc.value);
     }
     pin_unused_dofs(&model, ndn, nnode, &mut prescribed)?;
+    let shell_n = shell_nodal_normals(&model);
     let mut trips: Vec<(usize, usize, f64)> = Vec::new();
     let mut c_trips_unused: Vec<(usize, usize, f64)> = Vec::new();
     let mut m_unused = vec![0.0; ndof];
@@ -2328,7 +2422,8 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         } else {
             None
         };
-        let mut kef = element_ke(el.kind, &xyz, mat.e, mat.nu, th, sec.as_ref())?;
+        let dirs = elem_dirs(el, &model, &shell_n);
+        let mut kef = element_ke(el.kind, &xyz, mat.e, mat.nu, th, sec.as_ref(), dirs.as_deref())?;
         if !model.node_transform.is_empty() {
             constraint::transform_ke(
                 &mut kef.ke,
