@@ -19,6 +19,8 @@ mod nlgeom;
 mod plastic;
 mod quadratic;
 mod shell;
+#[cfg(test)]
+mod nafems;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod sparse_native;
