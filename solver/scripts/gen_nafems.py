@@ -256,12 +256,232 @@ def gen_t4(nx=24, ny=40, th=0.02):
     return path, probe, n, eid
 
 
+def gen_le1_cps6(nr=6, nt=16):
+    """LE1 with CPS6: each parametric quad becomes two quadratic triangles."""
+    ai, bi, ao, bo = 2000.0, 1000.0, 3250.0, 2750.0
+    ni, nj = 2 * nr, 2 * nt
+    coords = {}
+    nid = {}
+    n = 0
+    for i in range(ni + 1):
+        for j in range(nj + 1):
+            n += 1
+            s = i / ni
+            th = (j / nj) * math.pi / 2.0
+            x, y = ellipse(s, th, ai, bi, ao, bo)
+            nid[(i, j)] = n
+            coords[n] = (x, y, 0.0)
+    elems = []
+    outer = []
+    eid = 0
+    for ie in range(nr):
+        for je in range(nt):
+            i0, j0 = 2 * ie, 2 * je
+
+            def g(di, dj, i0=i0, j0=j0):
+                return nid[(i0 + di, j0 + dj)]
+
+            # CCW. Outer edge of the first triangle is P2 (nodes 2-3-5).
+            t1 = [g(0, 0), g(2, 0), g(2, 2), g(1, 0), g(2, 1), g(1, 1)]
+            t2 = [g(0, 0), g(2, 2), g(0, 2), g(1, 1), g(1, 2), g(0, 1)]
+            eid += 1
+            elems.append((eid, t1))
+            if ie == nr - 1:
+                outer.append(eid)
+            eid += 1
+            elems.append((eid, t2))
+    d = nid[(0, 0)]
+    path = OUT / "le1_cps6.inp"
+    with path.open("w") as fh:
+        fh.write("*HEADING\n")
+        fh.write("NAFEMS LE1 elliptic membrane, quadratic triangles CPS6\n")
+        fh.write("Target: syy(D) = 92.7 MPa\n")
+        fh.write(f"** mesh {nr} x {nt} quads x 2 CPS6, node D = {d}\n")
+        write_nodes(fh, range(1, n + 1), coords)
+        fh.write("*ELEMENT, TYPE=CPS6, ELSET=MEM\n")
+        for e, c in elems:
+            fh.write(str(e) + ", " + ", ".join(map(str, c)) + "\n")
+        write_set(fh, "ELSET", "OUTER", outer)
+        write_set(fh, "NSET", "D", [d])
+        ysym = [nid[(i, 0)] for i in range(ni + 1)]
+        xsym = [nid[(i, nj)] for i in range(ni + 1)]
+        write_set(fh, "NSET", "YS", ysym)
+        write_set(fh, "NSET", "XS", xsym)
+        fh.write("*MATERIAL, NAME=STEEL\n*ELASTIC\n210000, 0.3\n")
+        fh.write("*SOLID SECTION, ELSET=MEM, MATERIAL=STEEL\n100\n")
+        fh.write("*BOUNDARY\nYS, 2, 2\nXS, 1, 1\n")
+        fh.write("*STEP\n*STATIC\n*DLOAD\nOUTER, P2, -10\n")
+        fh.write("*NODE FILE\nU\n*EL FILE\nS\n*END STEP\n")
+    return path, d, n, eid
+
+
+def gen_le3(n=12):
+    """Hemispherical shell, quarter. Not written by main().
+
+    S4R locks: n=24 gives ux(A)=0.070 m against the NAFEMS target 0.185 m.
+    R=10 m, t=0.04 m, E=68.25 GPa, 2 kN at A and C.
+    """
+    R = 10.0
+    coords = {}
+    nid = {}
+    nnode = 1
+    coords[1] = (0.0, 0.0, R)
+    nid["pole"] = 1
+    for i in range(1, n + 1):
+        th = (i / n) * math.pi / 2.0
+        for j in range(n + 1):
+            ph = (j / n) * math.pi / 2.0
+            nnode += 1
+            nid[(i, j)] = nnode
+            coords[nnode] = (
+                R * math.sin(th) * math.cos(ph),
+                R * math.sin(th) * math.sin(ph),
+                R * math.cos(th),
+            )
+    tris = []
+    quads = []
+    eid = 0
+    for j in range(n):
+        eid += 1
+        tris.append((eid, [1, nid[(1, j)], nid[(1, j + 1)]]))
+    for i in range(1, n):
+        for j in range(n):
+            eid += 1
+            quads.append(
+                (
+                    eid,
+                    [
+                        nid[(i, j)],
+                        nid[(i + 1, j)],
+                        nid[(i + 1, j + 1)],
+                        nid[(i, j + 1)],
+                    ],
+                )
+            )
+    a = nid[(n, 0)]
+    c = nid[(n, n)]
+    edge_ae = [1] + [nid[(i, 0)] for i in range(1, n + 1)]
+    edge_ce = [1] + [nid[(i, n)] for i in range(1, n + 1)]
+    path = OUT / "le3_s4r.inp"
+    with path.open("w") as fh:
+        fh.write("*HEADING\n")
+        fh.write("NAFEMS LE3 hemispherical shell, point loads (quarter)\n")
+        fh.write("Target: ux(A) = 0.185 m\n")
+        fh.write(f"** S3 fan + S4R {n}x{n}, A={a} C={c} E=1\n")
+        write_nodes(fh, range(1, nnode + 1), coords)
+        fh.write("*ELEMENT, TYPE=S3, ELSET=HEMI\n")
+        for e, c3 in tris:
+            fh.write(f"{e}, {c3[0]}, {c3[1]}, {c3[2]}\n")
+        fh.write("*ELEMENT, TYPE=S4R, ELSET=HEMI\n")
+        for e, c4 in quads:
+            fh.write(f"{e}, {c4[0]}, {c4[1]}, {c4[2]}, {c4[3]}\n")
+        write_set(fh, "NSET", "A", [a])
+        write_set(fh, "NSET", "C", [c])
+        write_set(fh, "NSET", "AE", edge_ae)
+        write_set(fh, "NSET", "CE", edge_ce)
+        fh.write("*MATERIAL, NAME=AL\n*ELASTIC\n6.825e10, 0.3\n")
+        fh.write("*SHELL SECTION, ELSET=HEMI, MATERIAL=AL\n0.04\n")
+        fh.write("*BOUNDARY\n")
+        fh.write("AE, 2, 2\nAE, 4, 4\nAE, 6, 6\n")
+        fh.write("CE, 1, 1\nCE, 5, 5\nCE, 6, 6\n")
+        fh.write("1, 3, 3\n")
+        fh.write("*STEP\n*STATIC\n*CLOAD\n")
+        fh.write(f"{a}, 1, 2000\n{c}, 2, -2000\n")
+        fh.write("*NODE FILE\nU\n*END STEP\n")
+    return path, a, nnode, eid
+
+
+def gen_le6(n=8):
+    """Skew plate, S8. Side 1 m, skew 30 deg, t=0.01 m, p=-0.7 kPa.
+
+    Target: max principal stress 0.802 MPa on the lower surface at the centre.
+    """
+    c30 = math.cos(math.pi / 6.0)
+    s30 = 0.5
+    ni = nj = 2 * n
+    coords = {}
+    nid = {}
+    nnode = 0
+    for i in range(ni + 1):
+        for j in range(nj + 1):
+            if (i % 2) and (j % 2):
+                continue
+            nnode += 1
+            xi = i / ni
+            eta = j / nj
+            # bilinear map of the parallelogram
+            x = (1.0 - eta) * xi * 1.0 + eta * (c30 + xi * 1.0)
+            y = eta * s30
+            nid[(i, j)] = nnode
+            coords[nnode] = (x, y, 0.0)
+    elems = []
+    eid = 0
+    for ie in range(n):
+        for je in range(n):
+            i0, j0 = 2 * ie, 2 * je
+
+            def g(di, dj, i0=i0, j0=j0):
+                return nid[(i0 + di, j0 + dj)]
+
+            eid += 1
+            elems.append(
+                (
+                    eid,
+                    [
+                        g(0, 0),
+                        g(2, 0),
+                        g(2, 2),
+                        g(0, 2),
+                        g(1, 0),
+                        g(2, 1),
+                        g(1, 2),
+                        g(0, 1),
+                    ],
+                )
+            )
+    centre = nid[(n, n)]  # both even when n is even? n elements, index n is even if n even
+    # n=8, centre parametric i=8, j=8, both even. Yes.
+    bound = []
+    for i in range(ni + 1):
+        for j in (0, nj):
+            if (i, j) in nid:
+                bound.append(nid[(i, j)])
+    for j in range(1, nj):
+        for i in (0, ni):
+            if (i, j) in nid:
+                bound.append(nid[(i, j)])
+    a = nid[(0, 0)]
+    b = nid[(ni, 0)]
+    path = OUT / "le6_s8.inp"
+    with path.open("w") as fh:
+        fh.write("*HEADING\n")
+        fh.write("NAFEMS LE6 skew plate, normal pressure, S8\n")
+        fh.write("Target: max principal stress at E (lower surface) = 0.802 MPa\n")
+        fh.write(f"** S8 {n}x{n}, centre node E = {centre}\n")
+        write_nodes(fh, range(1, nnode + 1), coords)
+        fh.write("*ELEMENT, TYPE=S8, ELSET=PLATE\n")
+        for e, c in elems:
+            fh.write(str(e) + ", " + ", ".join(map(str, c)) + "\n")
+        write_set(fh, "NSET", "E", [centre])
+        write_set(fh, "NSET", "EDGE", bound)
+        write_set(fh, "NSET", "A", [a])
+        write_set(fh, "NSET", "B", [b])
+        fh.write("*MATERIAL, NAME=STEEL\n*ELASTIC\n2.1e11, 0.3\n")
+        fh.write("*SHELL SECTION, ELSET=PLATE, MATERIAL=STEEL\n0.01\n")
+        fh.write("*BOUNDARY\nEDGE, 3, 3\nA, 1, 2\nB, 2, 2\n")
+        fh.write("*STEP\n*STATIC\n*DLOAD\nPLATE, P, -700\n")
+        fh.write("*NODE FILE\nU\n*EL FILE\nS\n*END STEP\n")
+    return path, centre, nnode, eid
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     for label, rec in (
         ("LE1", gen_le1()),
+        ("LE1t", gen_le1_cps6(8, 24)),
         ("LE10", gen_le10()),
         ("LE10f", gen_le10(8, 12, 4, "le10_c3d20_fine.inp")),
+        ("LE6", gen_le6(24)),
         ("T4", gen_t4()),
     ):
         path, probe, nnode, nelem = rec

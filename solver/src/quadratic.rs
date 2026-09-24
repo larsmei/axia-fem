@@ -472,6 +472,39 @@ pub fn quad8_edge_pressure(xy: &[[f64; 2]], face: i32, p: f64, thickness: f64) -
     Ok(fe)
 }
 
+/// CPS6/CPE6 edge pressure. P1 = edge 1-2, P2 = 2-3, P3 = 3-1.
+/// Positive pressure points into a CCW element.
+pub fn tri6_edge_pressure(xy: &[[f64; 2]], face: i32, p: f64, thickness: f64) -> Result<Vec<f64>> {
+    let edges: [[usize; 3]; 3] = [[0, 1, 3], [1, 2, 4], [2, 0, 5]];
+    if !(1..=3).contains(&face) {
+        return err(format!("Ungültige CPS6-Kante P{face}"));
+    }
+    let e = (face - 1) as usize;
+    let mut fe = vec![0.0; 12];
+    for &(xi, w) in &[(-G2, 1.0), (G2, 1.0)] {
+        let n1 = 0.5 * xi * (xi - 1.0);
+        let n2 = 0.5 * xi * (xi + 1.0);
+        let n3 = 1.0 - xi * xi;
+        let dn1 = xi - 0.5;
+        let dn2 = xi + 0.5;
+        let dn3 = -2.0 * xi;
+        let a = edges[e][0];
+        let b = edges[e][1];
+        let m = edges[e][2];
+        let dx = dn1 * xy[a][0] + dn2 * xy[b][0] + dn3 * xy[m][0];
+        let dy = dn1 * xy[a][1] + dn2 * xy[b][1] + dn3 * xy[m][1];
+        let fx = p * thickness * (-dy) * w;
+        let fy = p * thickness * dx * w;
+        fe[2 * a] += n1 * fx;
+        fe[2 * a + 1] += n1 * fy;
+        fe[2 * b] += n2 * fx;
+        fe[2 * b + 1] += n2 * fy;
+        fe[2 * m] += n3 * fx;
+        fe[2 * m + 1] += n3 * fy;
+    }
+    Ok(fe)
+}
+
 // ---- C3D10 / CPS6 ----------------------------------------------------------
 
 fn tet10_shape(r: f64, s: f64, t: f64) -> ([f64; 10], [[f64; 3]; 10]) {

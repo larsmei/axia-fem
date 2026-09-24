@@ -107,4 +107,65 @@ mod tests {
         );
         assert!((t - target).abs() < 0.5, "T4 T={t} C, target {target}");
     }
+
+    fn principals(s: &[f64; 6]) -> [f64; 3] {
+        // In-plane principals plus σzz. Plate bending lives in xx/yy/xy.
+        let mid = 0.5 * (s[0] + s[1]);
+        let rad = (0.5 * (s[0] - s[1])).hypot(s[3]);
+        let mut p = [mid + rad, mid - rad, s[2]];
+        p.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        p
+    }
+
+    /// LE1 on quadratic triangles (CPS6).
+    #[test]
+    fn nafems_le1_cps6() {
+        let inp = load("le1_cps6.inp");
+        let out = solve_native(&inp).expect("LE1 CPS6");
+        let ids = node_of_set(&inp, "D");
+        let ni = out.model.node_index(ids[0]).unwrap();
+        let syy = out.stress[ni][1];
+        let target = 92.7;
+        let err = (syy - target) / target;
+        println!(
+            "NAFEMS LE1 CPS6 syy(D)={syy:.3} MPa  target={target}  err={:.2}%",
+            err * 100.0
+        );
+        assert!(
+            err.abs() < 0.06,
+            "LE1 CPS6 syy(D)={syy} (err {:.1}%)",
+            err * 100.0
+        );
+    }
+
+    /// LE6 skew plate, S8. Lower-surface principal stress 0.802 MPa.
+    /// The shell recovery stores the z=+t/2 fibre; pure bending flips the sign
+    /// on the opposite face, so the tensile principal is −σ_min.
+    #[test]
+    fn nafems_le6_skew_plate() {
+        let inp = load("le6_s8.inp");
+        let out = solve_native(&inp).expect("LE6");
+        let ids = node_of_set(&inp, "E");
+        let ni = out.model.node_index(ids[0]).unwrap();
+        let s = out.stress[ni];
+        let p = principals(&s);
+        let tensile = p[0].max(-p[2]).max(-p[1]);
+        let target = 0.802e6;
+        let err = (tensile - target) / target;
+        let uz = out.u[ni][2];
+        println!(
+            "NAFEMS LE6  σ1={:.4} MPa (fibre principals {:.3}/{:.3}/{:.3} MPa)  target=0.802  err={:.2}%  uz={uz:.6} m",
+            tensile / 1e6,
+            p[0] / 1e6,
+            p[1] / 1e6,
+            p[2] / 1e6,
+            err * 100.0
+        );
+        assert!(
+            err.abs() < 0.08,
+            "LE6 σ1={:.4} MPa (err {:.1}%)",
+            tensile / 1e6,
+            err * 100.0
+        );
+    }
 }

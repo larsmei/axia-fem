@@ -993,6 +993,17 @@ fn apply_pressure(
             let fe = quadratic::quad8_edge_pressure(&p, face, mag, th)?;
             scatter_fe(&fe, gdofs, 2, local_dim, f_full);
         }
+        ElemKind::Tri6Ps | ElemKind::Tri6Pe => {
+            if face <= 0 {
+                return Ok(());
+            }
+            let mut p = [[0.0; 2]; 6];
+            for i in 0..6 {
+                p[i] = [xyz[i][0], xyz[i][1]];
+            }
+            let fe = quadratic::tri6_edge_pressure(&p, face, mag, th)?;
+            scatter_fe(&fe, gdofs, 2, local_dim, f_full);
+        }
         ElemKind::Cax4
         | ElemKind::Cax4R
         | ElemKind::Cax8
