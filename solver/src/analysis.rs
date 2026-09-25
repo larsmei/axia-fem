@@ -220,6 +220,7 @@ fn solve_independent(model: Model, t0: f64) -> Result<SolveOutput> {
         m.cloads = all_c[c0..c1].to_vec();
         m.dloads = all_d[d0..d1].to_vec();
         m.bcs = all_b[b0..b1].to_vec();
+        install_case_temp(&mut m, i);
         let out = solve_one(m, t0)?;
         let label = labels
             .get(i)
@@ -246,6 +247,13 @@ fn solve_independent(model: Model, t0: f64) -> Result<SolveOutput> {
     Ok(out)
 }
 
+fn install_case_temp(model: &mut Model, i: usize) {
+    if i < model.case_grid_temp.len() && model.case_grid_temp.len() == model.case_elem_temp.len() {
+        model.temperatures = model.case_grid_temp[i].clone();
+        model.elem_temp = model.case_elem_temp[i].clone();
+    }
+}
+
 fn solve_sequence(model: Model, t0: f64) -> Result<SolveOutput> {
     let steps = model.steps.clone();
     let all_c = model.cloads.clone();
@@ -254,7 +262,7 @@ fn solve_sequence(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut last: Option<SolveOutput> = None;
     let mut u_prev: Vec<[f64; 3]> = Vec::new();
     let mut f_prev: Vec<f64> = Vec::new();
-    for st in &steps {
+    for (i, st) in steps.iter().enumerate() {
         let mut m = model.clone();
         m.procedure = st.procedure.clone();
         let c0 = st.cload_from.min(all_c.len());
@@ -266,6 +274,7 @@ fn solve_sequence(model: Model, t0: f64) -> Result<SolveOutput> {
         m.cloads = all_c[c0..c1].to_vec();
         m.dloads = all_d[d0..d1].to_vec();
         m.bcs = all_b[b0..b1].to_vec();
+        install_case_temp(&mut m, i);
         m.steps.clear();
         m.u_start = u_prev.clone();
         m.f_start = f_prev.clone();
@@ -558,6 +567,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         if el.kind.is_special() {
             scatter_special(&model, el, &xyz, ndn, &mut m_full, &mut trips, &mut c_trips)?;
             apply_point_grav(&model, el, ndn, &mut f_full)?;
+            apply_spin_point(&model, el, &xyz, ndn, &mut f_full)?;
             continue;
         }
         let mat = if el.kind.needs_material() {
@@ -742,19 +752,76 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                     )?;
                     scatter_fe(&fe, &gdofs, 6, local_dim, &mut f_full);
                 }
+                Dload::Spin {
+                    origin,
+                    omega,
+                    alpha,
+                    scale,
+                } => {
+                    let a = spin_accel(*omega, *alpha, *origin, centroid(&xyz));
+                    let bx = mat.density * scale * a[0];
+                    let by = mat.density * scale * a[1];
+                    let bz = mat.density * scale * a[2];
+                    if el.kind.is_beam() {
+                        if let Some(sec) = sec.as_ref() {
+                            let fe = beam::body_force(el.kind, &xyz, sec, bx, by, bz)?;
+                            scatter_fe(&fe, &gdofs, 6, local_dim, &mut f_full);
+                        }
+                    } else if el.kind.is_shell() {
+                        let fe = shell::body_force(el.kind, &xyz, bx, by, bz, th)?;
+                        scatter_fe(&fe, &gdofs, 6, local_dim, &mut f_full);
+                    } else {
+                        apply_body(
+                            &model,
+                            el.kind,
+                            &xyz,
+                            bx,
+                            by,
+                            bz,
+                            th,
+                            &gdofs,
+                            local_dim,
+                            &mut f_full,
+                        )?;
+                    }
+                }
                 _ => {}
             }
         }
         if mat.alpha.abs() > 0.0 {
-            let mut tsum = 0.0;
-            for &id in &el.nodes {
-                tsum += model.temperature_at(id);
-            }
-            let dt_th = tsum / nn as f64 - mat.tref;
+            let dt_th = if let Some(&te) = model.elem_temp.get(&el.id) {
+                te - mat.tref
+            } else {
+                let mut tsum = 0.0;
+                for &id in &el.nodes {
+                    tsum += model.temperature_at(id);
+                }
+                tsum / nn as f64 - mat.tref
+            };
             if dt_th.abs() > 0.0 {
                 if el.kind.is_truss() {
                     let fe = extra::truss_thermal_force(&xyz, mat.e, th, mat.alpha, dt_th);
                     scatter_fe(&fe, &gdofs, 3, local_dim, &mut f_full);
+                } else if el.kind.is_beam() {
+                    if let Some(sec) = sec.as_ref() {
+                        let fe = beam_thermal_axial(&xyz, mat.e, sec.area, mat.alpha, dt_th);
+                        scatter_fe(&fe, &gdofs, 6, local_dim, &mut f_full);
+                    }
+                } else if matches!(
+                    el.kind,
+                    ElemKind::Shell4
+                        | ElemKind::Shell4R
+                        | ElemKind::Shell3
+                        | ElemKind::Mem4
+                        | ElemKind::Mem4R
+                        | ElemKind::Mem3
+                ) {
+                    let fe = shell::thermal_membrane(el.kind, &xyz, mat.e, mat.nu, th, mat.alpha * dt_th)?;
+                    for a in 0..nn {
+                        for d in 0..3 {
+                            f_full[gdofs[a * local_dim + d]] += fe[3 * a + d];
+                        }
+                    }
                 } else if matches!(el.kind, ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R) {
                     let fe = extra::hex8_thermal_force(&xyz, mat.e, mat.nu, mat.alpha, dt_th)?;
                     scatter_fe(&fe, &gdofs, 3, local_dim, &mut f_full);
@@ -1830,6 +1897,119 @@ fn average_abs_force(f: &[f64]) -> f64 {
     }
 }
 
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn centroid(xyz: &[[f64; 3]]) -> [f64; 3] {
+    if xyz.is_empty() {
+        return [0.0; 3];
+    }
+    let n = xyz.len() as f64;
+    let mut c = [0.0; 3];
+    for p in xyz {
+        c[0] += p[0];
+        c[1] += p[1];
+        c[2] += p[2];
+    }
+    [c[0] / n, c[1] / n, c[2] / n]
+}
+
+/// d'Alembert acceleration: −ω×(ω×r) − α×r, outward for a fixed spinning body.
+fn spin_accel(omega: [f64; 3], alpha: [f64; 3], origin: [f64; 3], p: [f64; 3]) -> [f64; 3] {
+    let r = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+    let inward = cross3(omega, cross3(omega, r));
+    let tang = cross3(alpha, r);
+    [-(inward[0] + tang[0]), -(inward[1] + tang[1]), -(inward[2] + tang[2])]
+}
+
+fn beam_thermal_axial(xyz: &[[f64; 3]], e: f64, area: f64, alpha: f64, dt: f64) -> Vec<f64> {
+    let nnode = xyz.len().max(1);
+    let mut fe = vec![0.0; 6 * nnode];
+    if nnode < 2 {
+        return fe;
+    }
+    let i1 = nnode - 1;
+    let mut d = [
+        xyz[i1][0] - xyz[0][0],
+        xyz[i1][1] - xyz[0][1],
+        xyz[i1][2] - xyz[0][2],
+    ];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-18);
+    d[0] /= len;
+    d[1] /= len;
+    d[2] /= len;
+    let n = e * area * alpha * dt;
+    for k in 0..3 {
+        fe[k] -= n * d[k];
+        fe[6 * i1 + k] += n * d[k];
+    }
+    fe
+}
+
+/// RFORCE on concentrated mass and rotary inertia.
+fn apply_spin_point(
+    model: &Model,
+    el: &crate::model::Element,
+    xyz: &[[f64; 3]],
+    ndn: usize,
+    f: &mut [f64],
+) -> Result<()> {
+    if el.kind != ElemKind::Mass && el.kind != ElemKind::RotaryI {
+        return Ok(());
+    }
+    let ni = model.node_index(el.nodes[0])?;
+    let at = xyz.first().copied().unwrap_or([0.0; 3]);
+    for dl in &model.dloads {
+        let Dload::Spin {
+            origin,
+            omega,
+            alpha,
+            scale,
+        } = dl
+        else {
+            continue;
+        };
+        if el.kind == ElemKind::Mass {
+            let m = model.mass_for(el)?;
+            let arm = model.mass_arms.get(&el.id).copied().unwrap_or([0.0; 3]);
+            let p = [at[0] + arm[0], at[1] + arm[1], at[2] + arm[2]];
+            let a = spin_accel(*omega, *alpha, *origin, p);
+            let fg = [m * scale * a[0], m * scale * a[1], m * scale * a[2]];
+            for d in 0..3.min(ndn) {
+                f[dof_of(ndn, ni, d)] += fg[d];
+            }
+            if ndn >= 6 {
+                let mom = cross3(arm, fg);
+                for d in 0..3 {
+                    f[dof_of(ndn, ni, 3 + d)] += mom[d];
+                }
+            }
+        } else if ndn >= 6 {
+            let ijk = model.rotary_for(el)?;
+            let iw = [
+                ijk[0] * omega[0],
+                ijk[1] * omega[1],
+                ijk[2] * omega[2],
+            ];
+            let wiw = cross3(*omega, iw);
+            let ia = [
+                ijk[0] * alpha[0],
+                ijk[1] * alpha[1],
+                ijk[2] * alpha[2],
+            ];
+            for d in 0..3 {
+                f[dof_of(ndn, ni, 3 + d)] -= scale * (ia[d] + wiw[d]);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// GRAV on *MASS: F = m · mag · dir̂. Concentrated mass has no continuum density.
 fn apply_point_grav(
     model: &Model,
@@ -2406,6 +2586,7 @@ fn assemble_fext_u(
     for el in &model.elements {
         if el.kind.is_special() {
             apply_point_grav(model, el, ndn, &mut f)?;
+            apply_spin_point(model, el, &elem_xyz(model, &el.nodes)?, ndn, &mut f)?;
             continue;
         }
         let xyz = elem_xyz(model, &el.nodes)?;

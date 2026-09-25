@@ -1121,6 +1121,75 @@ pub fn membrane_nodal_stress(
     Ok(out)
 }
 
+pub fn thermal_membrane(
+    kind: ElemKind,
+    xyz: &[[f64; 3]],
+    e: f64,
+    nu: f64,
+    h: f64,
+    alpha_dt: f64,
+) -> Result<Vec<f64>> {
+    let nn = kind.nnodes().min(xyz.len());
+    let mut fg = vec![0.0; 3 * nn];
+    if nn < 3 || alpha_dt.abs() == 0.0 || h.abs() == 0.0 {
+        return Ok(fg);
+    }
+    let (e1, e2, _e3) = local_frame(xyz, nn)?;
+    let xy = project_xy(xyz, e1, e2, nn);
+    let dm0 = d_plane_stress(e, nu)?;
+    let eps = [alpha_dt, alpha_dt, 0.0];
+    let mut nforce = [0.0; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            nforce[i] += dm0[i * 3 + j] * h * eps[j];
+        }
+    }
+    let mut fl = vec![0.0; 2 * nn];
+    let mut add = |dndx: &[[f64; 2]], w: f64, fl: &mut [f64]| {
+        for a in 0..nn {
+            fl[2 * a] += (dndx[a][0] * nforce[0] + dndx[a][1] * nforce[2]) * w;
+            fl[2 * a + 1] += (dndx[a][1] * nforce[1] + dndx[a][0] * nforce[2]) * w;
+        }
+    };
+    if nn == 3 {
+        let x1 = xy[0][0];
+        let y1 = xy[0][1];
+        let x2 = xy[1][0];
+        let y2 = xy[1][1];
+        let x3 = xy[2][0];
+        let y3 = xy[2][1];
+        let two_a = x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2);
+        if two_a <= 0.0 {
+            return err("S3: nicht-positive Fläche.");
+        }
+        let dndx = [
+            [(y2 - y3) / two_a, (x3 - x2) / two_a],
+            [(y3 - y1) / two_a, (x1 - x3) / two_a],
+            [(y1 - y2) / two_a, (x2 - x1) / two_a],
+        ];
+        add(&dndx, 0.5 * two_a, &mut fl);
+    } else if nn == 4 {
+        for &xi in &[-G2, G2] {
+            for &eta in &[-G2, G2] {
+                let (_n, dn) = quad4_shape(xi, eta);
+                let (_, det, dndx) = jac_xy(&xy, &dn, 4)?;
+                if det <= 0.0 {
+                    return err("S4: negative Jakobideterminante.");
+                }
+                add(&dndx, det, &mut fl);
+            }
+        }
+    }
+    for a in 0..nn {
+        let fx = fl[2 * a];
+        let fy = fl[2 * a + 1];
+        fg[3 * a] = e1[0] * fx + e2[0] * fy;
+        fg[3 * a + 1] = e1[1] * fx + e2[1] * fy;
+        fg[3 * a + 2] = e1[2] * fx + e2[2] * fy;
+    }
+    Ok(fg)
+}
+
 pub fn membrane_pressure(kind: ElemKind, xyz: &[[f64; 3]], p: f64) -> Result<Vec<f64>> {
     let nn = kind.nnodes();
     let mut fe6 = pressure_force(

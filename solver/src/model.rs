@@ -702,6 +702,14 @@ pub enum Dload {
         p2: [f64; 3],
         elems: Vec<i32>,
     },
+    /// MYSTRAN `RFORCE`. `omega` and `alpha` are rad/time and rad/time².
+    /// `scale` multiplies the resulting inertia force (LOAD combination).
+    Spin {
+        origin: [f64; 3],
+        omega: [f64; 3],
+        alpha: [f64; 3],
+        scale: f64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -990,6 +998,11 @@ pub struct Model {
     pub elset_dashpot: HashMap<String, f64>,
     pub elset_gap: HashMap<String, GapSection>,
     pub temperatures: HashMap<i32, f64>,
+    /// Element temperature (TEMPP1/TEMPRB) overriding the grid average. Keyed by element id.
+    pub elem_temp: HashMap<i32, f64>,
+    /// Per SUBCASE grid temperatures. Empty for CalculiX.
+    pub case_grid_temp: Vec<HashMap<i32, f64>>,
+    pub case_elem_temp: Vec<HashMap<i32, f64>>,
     pub plastic: HashMap<String, Vec<(f64, f64)>>, // material -> [(peeq, sy)]
     pub interactions: HashMap<String, SurfaceInteraction>,
     pub contact_pairs: Vec<ContactPair>,
@@ -1074,6 +1087,9 @@ impl Model {
             elset_dashpot: HashMap::new(),
             elset_gap: HashMap::new(),
             temperatures: HashMap::new(),
+            elem_temp: HashMap::new(),
+            case_grid_temp: Vec::new(),
+            case_elem_temp: Vec::new(),
             plastic: HashMap::new(),
             interactions: HashMap::new(),
             contact_pairs: Vec::new(),

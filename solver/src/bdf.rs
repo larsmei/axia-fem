@@ -87,7 +87,8 @@ pub const RECOGNIZED_BULK: &[&str] = &[
     "BAROR", "CQUAD4", "CQUAD4K", "CTRIA3", "CTRIA3K", "CTETRA", "CHEXA", "CPENTA", "CELAS1",
     "CELAS2", "CELAS3", "CELAS4", "PELAS", "CMASS1", "CMASS2", "CMASS3", "CMASS4", "PMASS", "CONM2",
     "CSHEAR", "PSHEAR", "CBUSH", "PBUSH", "RBE2", "RBE3", "FORCE", "MOMENT", "PLOAD2", "PLOAD4",
-    "GRAV", "LOAD", "SPC", "SPC1", "SPCADD", "MPC", "MPCADD",
+    "GRAV", "LOAD", "RFORCE", "SPC", "SPC1", "SPCADD", "MPC", "MPCADD", "TEMP", "TEMPD",
+    "TEMPP1", "TEMPRB",
 ];
 
 pub fn parse_with_base(text: &str, base: Option<&Path>) -> Result<Model> {
@@ -236,6 +237,7 @@ struct CaseCtrl {
     load: Option<i32>,
     method: Option<i32>,
     mpc: Option<i32>,
+    temp: Option<i32>,
 }
 
 fn parse_cases(lines: &[String]) -> Vec<CaseCtrl> {
@@ -247,6 +249,7 @@ fn parse_cases(lines: &[String]) -> Vec<CaseCtrl> {
         load: None,
         method: None,
         mpc: None,
+        temp: None,
     };
     let mut cases: Vec<CaseCtrl> = Vec::new();
     let mut cur: Option<CaseCtrl> = None;
@@ -268,6 +271,7 @@ fn parse_cases(lines: &[String]) -> Vec<CaseCtrl> {
             "LOAD" => dest.load = v.split_whitespace().next().and_then(|s| parse_i32(s).ok()),
             "METHOD" => dest.method = v.split_whitespace().next().and_then(|s| parse_i32(s).ok()),
             "MPC" => dest.mpc = v.split_whitespace().next().and_then(|s| parse_i32(s).ok()),
+            "TEMP" => dest.temp = v.split_whitespace().next().and_then(|s| parse_i32(s).ok()),
             // ECHO=SORT/UNSORT/NONE/BOTH changes the punch, not the solution.
             "ECHO" | "DISPLACEMENT" | "SPCFORCES" | "STRESS" | "FORCE" | "ELFORCE" | "OLOAD"
             | "STRAIN" | "MAXLINES" => {}
@@ -295,7 +299,14 @@ fn assemble_cards(lines: &[String]) -> Result<Vec<Vec<String>>> {
                 return err(format!("Fortsetzungszeile ohne Karte: {line}"));
             }
             let extra = continuation_fields(line, large)?;
-            cards.last_mut().unwrap().extend(extra);
+            let card = cards.last_mut().unwrap();
+            // A continuation begins at the next 8-field (or 4-field) boundary.
+            let width = if large { 4 } else { 8 };
+            let data = card.len().saturating_sub(1);
+            if data < width {
+                card.extend(std::iter::repeat(String::new()).take(width - data));
+            }
+            card.extend(extra);
             continue;
         }
         let (fields, is_large) = split_card(line)?;
@@ -389,6 +400,7 @@ struct MatRec {
     nu: f64,
     rho: f64,
     alpha: f64,
+    tref: f64,
 }
 
 #[derive(Clone)]
@@ -511,6 +523,13 @@ enum LoadItem {
         s: f64,
         parts: Vec<(f64, i32)>,
     },
+    Rforce {
+        gid: i32,
+        cid: i32,
+        v: f64,
+        n: [f64; 3],
+        acc: f64,
+    },
 }
 
 struct Cord {
@@ -567,6 +586,9 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     let mut props: HashMap<i32, Prop> = HashMap::new();
     let mut elements: Vec<BuiltEl> = Vec::new();
     let mut loads: HashMap<i32, Vec<LoadItem>> = HashMap::new();
+    let mut temp_grids: HashMap<i32, HashMap<i32, f64>> = HashMap::new();
+    let mut tempd: HashMap<i32, f64> = HashMap::new();
+    let mut temp_elem: HashMap<i32, HashMap<i32, f64>> = HashMap::new();
     let mut spc: HashMap<i32, Vec<SpcTerm>> = HashMap::new();
     let mut spcadd: HashMap<i32, Vec<i32>> = HashMap::new();
     let mut rbes: Vec<(i32, i32, Vec<usize>, Vec<i32>)> = Vec::new();
@@ -692,6 +714,7 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                         nu,
                         rho,
                         alpha,
+                        tref: field_f64(d, 6).unwrap_or(0.0),
                     },
                 );
             }
@@ -1250,6 +1273,104 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 }
                 loads.entry(sid).or_default().push(LoadItem::Combo { s, parts });
             }
+            "RFORCE" => {
+                let sid = req_i32(d, 0, "RFORCE")?;
+                let gid = field_i32(d, 1).unwrap_or(0);
+                let cid = field_i32(d, 2).unwrap_or(0);
+                let v = field_f64(d, 3).unwrap_or(0.0);
+                let n = [
+                    field_f64(d, 4).unwrap_or(0.0),
+                    field_f64(d, 5).unwrap_or(0.0),
+                    field_f64(d, 6).unwrap_or(0.0),
+                ];
+                let acc = field_f64(d, 8).unwrap_or(0.0);
+                loads.entry(sid).or_default().push(LoadItem::Rforce {
+                    gid,
+                    cid,
+                    v,
+                    n,
+                    acc,
+                });
+            }
+            "TEMP" => {
+                let sid = req_i32(d, 0, "TEMP")?;
+                let slot = temp_grids.entry(sid).or_default();
+                let mut i = 1;
+                while i + 1 < d.len() {
+                    if d[i].is_empty() {
+                        i += 1;
+                        continue;
+                    }
+                    let g = parse_i32(&d[i]).map_err(|_| {
+                        crate::error::FemError(format!("TEMP {sid}: Gitter '{}' ungültig.", d[i]))
+                    })?;
+                    let t = parse_f64(&d[i + 1]).unwrap_or(0.0);
+                    slot.insert(g, t);
+                    i += 2;
+                }
+            }
+            "TEMPD" => {
+                let mut i = 0;
+                while i + 1 < d.len() {
+                    if d[i].is_empty() {
+                        i += 1;
+                        continue;
+                    }
+                    let sid = parse_i32(&d[i]).map_err(|_| {
+                        crate::error::FemError(format!("TEMPD: Set '{}' ungültig.", d[i]))
+                    })?;
+                    let t = parse_f64(&d[i + 1]).unwrap_or(0.0);
+                    tempd.insert(sid, t);
+                    i += 2;
+                }
+            }
+            "TEMPP1" => {
+                let sid = req_i32(d, 0, "TEMPP1")?;
+                let eid1 = req_i32(d, 1, "TEMPP1 EID")?;
+                let tbar = field_f64(d, 2).unwrap_or(0.0);
+                let tprime = field_f64(d, 3).unwrap_or(0.0);
+                if tprime.abs() > 0.0 {
+                    return err(format!(
+                        "TEMPP1 {sid}: Temperaturgradient TPRIME wird nicht gerechnet."
+                    ));
+                }
+                let mut eids = vec![eid1];
+                eids.extend(expand_ids(&d[4..]));
+                let slot = temp_elem.entry(sid).or_default();
+                for eid in eids {
+                    slot.insert(eid, tbar);
+                }
+            }
+            "TEMPRB" => {
+                let sid = req_i32(d, 0, "TEMPRB")?;
+                let eid1 = req_i32(d, 1, "TEMPRB EID")?;
+                let ta = field_f64(d, 2).unwrap_or(0.0);
+                let tb = if field(d, 3).is_empty() {
+                    ta
+                } else {
+                    field_f64(d, 3).unwrap_or(ta)
+                };
+                let grads = [
+                    field_f64(d, 4).unwrap_or(0.0),
+                    field_f64(d, 5).unwrap_or(0.0),
+                    field_f64(d, 6).unwrap_or(0.0),
+                    field_f64(d, 7).unwrap_or(0.0),
+                ];
+                if grads.iter().any(|g| g.abs() > 0.0) {
+                    return err(format!(
+                        "TEMPRB {sid}: Temperaturgradienten werden nicht gerechnet."
+                    ));
+                }
+                let mut eids = vec![eid1];
+                if d.len() > 8 {
+                    eids.extend(expand_ids(&d[8..]));
+                }
+                let slot = temp_elem.entry(sid).or_default();
+                let tavg = 0.5 * (ta + tb);
+                for eid in eids {
+                    slot.insert(eid, tavg);
+                }
+            }
             "SPC" => {
                 let sid = req_i32(d, 0, "SPC")?;
                 let g = req_i32(d, 1, "SPC G")?;
@@ -1693,6 +1814,32 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 &mut HashSet::new(),
             )?;
         }
+        let (grids_t, elems_t) = if let Some(sid) = case.temp {
+            let mut grids_t: HashMap<i32, f64> = HashMap::new();
+            if let Some(&td) = tempd.get(&sid) {
+                for id in &model.node_ids {
+                    grids_t.insert(*id, td);
+                }
+            }
+            if let Some(g) = temp_grids.get(&sid) {
+                for (id, t) in g {
+                    grids_t.insert(*id, *t);
+                }
+            }
+            let elems_t = temp_elem.get(&sid).cloned().unwrap_or_default();
+            if grids_t.is_empty() && elems_t.is_empty() && !tempd.contains_key(&sid) && !temp_grids.contains_key(&sid)
+            {
+                return err(format!("Temperaturset {sid} fehlt."));
+            }
+            require_temperatures(&model, &grids_t, &elems_t)?;
+            (grids_t, elems_t)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+        model.case_grid_temp.push(grids_t.clone());
+        model.case_elem_temp.push(elems_t.clone());
+        model.temperatures = grids_t;
+        model.elem_temp = elems_t;
         let label = if !case.label.is_empty() {
             case.label.clone()
         } else if !case.subtitle.is_empty() {
@@ -1791,6 +1938,7 @@ fn bind_mat(model: &mut Model, mats: &HashMap<i32, MatRec>, elset: &str, mid: i3
         nu: m.nu,
         density: m.rho * wtmass,
         alpha: m.alpha,
+        tref: m.tref,
         ..Material::default()
     });
     model.elset_material.insert(elset.to_string(), name);
@@ -2378,6 +2526,32 @@ fn resolve_spc<'a>(
     Ok(out)
 }
 
+fn require_temperatures(
+    model: &Model,
+    grids: &HashMap<i32, f64>,
+    elems: &HashMap<i32, f64>,
+) -> Result<()> {
+    for el in &model.elements {
+        let structural = el.kind.is_truss()
+            || el.kind.is_beam()
+            || el.kind.is_shell()
+            || el.kind.is_membrane()
+            || el.kind.is_continuum3d();
+        if !structural || elems.contains_key(&el.id) {
+            continue;
+        }
+        for n in &el.nodes {
+            if !grids.contains_key(n) {
+                return err(format!(
+                    "Element {}: Knoten {n} ohne Temperatur (TEMP/TEMPD).",
+                    el.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_load(
     model: &mut Model,
     sid: i32,
@@ -2434,6 +2608,29 @@ fn apply_load(
                 let shell = kind.map(|k| k.is_shell() || k.is_membrane()).unwrap_or(false);
                 let mag = if shell { -scale * *p } else { scale * *p };
                 push_pressure(model, *eid, mag, *g1, *g34, elem_kind, elem_nodes)?;
+            }
+            LoadItem::Rforce { gid, cid, v, n, acc } => {
+                let origin = if *gid == 0 {
+                    [0.0; 3]
+                } else {
+                    grid_xyz_opt(model, *gid).ok_or_else(|| {
+                        crate::error::FemError(format!("RFORCE: Gitter {gid} fehlt."))
+                    })?
+                };
+                let dir = vec_in_basic(*cid, *n, cords, origin)?;
+                let ln = norm3(dir);
+                if ln < 1e-15 {
+                    return err("RFORCE: Drehachse hat die Länge null.");
+                }
+                let axis = scale3(dir, 1.0 / ln);
+                let w = 2.0 * std::f64::consts::PI * *v;
+                let al = 2.0 * std::f64::consts::PI * *acc;
+                model.dloads.push(Dload::Spin {
+                    origin,
+                    omega: scale3(axis, w),
+                    alpha: scale3(axis, al),
+                    scale,
+                });
             }
         }
     }
@@ -3427,5 +3624,143 @@ ENDDATA
         let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
         let ux = out.u[out.model.node_index(2).unwrap()][0];
         assert!((ux - 0.005).abs() < 1e-10, "ux={ux}");
+    }
+
+    #[test]
+    fn spc_enforced_displacement_stretches_the_rod() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,10.,0.,0.
+CROD,1,1,1,2
+PROD,1,1,2.
+MAT1,1,100.,,,
+SPC,1,1,123,0.
+SPC,1,2,1,0.2
+SPC,1,2,23,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let i = out.model.node_index(2).unwrap();
+        assert!((out.u[i][0] - 0.2).abs() < 1e-8, "ux {}", out.u[i][0]);
+        let ea_l = 100.0 * 2.0 / 10.0;
+        assert!((out.rf[i][0] - ea_l * 0.2).abs() < 1e-6, "rx {}", out.rf[i][0]);
+    }
+
+    #[test]
+    fn temp_elongates_the_rod() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+TEMP = 4
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,10.,0.,0.
+CROD,1,1,1,2
+PROD,1,1,2.
+MAT1,1,100.,,,0.,0.001,10.
+TEMPD,4,10.
+TEMP,4,1,10.,2,30.
+SPC,1,1,123,0.
+SPC,1,2,23,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let ux = out.u[out.model.node_index(2).unwrap()][0];
+        let expect = 0.001 * 10.0 * 10.0;
+        assert!((ux - expect).abs() < 1e-8, "ux={ux} expect={expect}");
+    }
+
+    #[test]
+    fn temprb_average_elongates_the_bar() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+TEMP = 3
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,8.,0.,0.
+CBAR,1,1,1,2,0.,1.,0.
+PBAR,1,1,2.,1.,1.,1.
+MAT1,1,50.,,,0.,0.002,0.
+TEMPRB,3,1,40.,20.
+SPC,1,1,123456,0.
+SPC,1,2,23456,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let ux = out.u[out.model.node_index(2).unwrap()][0];
+        let expect = 0.002 * 30.0 * 8.0;
+        assert!((ux - expect).abs() < 1e-8, "ux={ux} expect={expect}");
+    }
+
+    #[test]
+    fn tempp1_membrane_reaction_is_eat() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+TEMP = 7
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,4.,0.,0.
+GRID,3,,4.,2.,0.
+GRID,4,,0.,2.,0.
+CQUAD4,1,1,1,2,3,4
+PSHELL,1,1,0.2,1
+MAT1,1,1000.,,,0.,1.0-4,0.
+TEMPP1,7,1,20.,0.
+SPC1,1,123456,1,THRU,4
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let nxx = 1000.0 * 0.2 * 1.0e-4 * 20.0;
+        let mut rx = 0.0;
+        for id in [2, 3] {
+            rx += out.rf[out.model.node_index(id).unwrap()][0];
+        }
+        assert!((rx + nxx * 2.0).abs() < 1e-6 * nxx.max(1.0), "rx={rx}");
+    }
+
+    #[test]
+    fn tempp1_gradient_is_rejected() {
+        let deck = r#"
+SOL 101
+CEND
+TEMP = 1
+BEGIN BULK
+GRID,1,,0,0,0
+TEMPP1,1,9,10.,2.
+ENDDATA
+"#;
+        let err = parse_with_base(deck, None).unwrap_err();
+        assert!(err.to_string().contains("TPRIME"), "{err}");
+    }
+
+    #[test]
+    fn rforce_is_mass_times_omega_squared_r() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,1,,3.,0.,0.
+CONM2,1,1,0,2.
+RFORCE,1,0,0,1.,0.,0.,1.
+SPC,1,1,123456,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let i = out.model.node_index(1).unwrap();
+        let w2 = (2.0 * std::f64::consts::PI).powi(2);
+        let fx = 2.0 * w2 * 3.0;
+        assert!((out.rf[i][0] + fx).abs() / fx < 1e-6, "rx {} fx {fx}", out.rf[i][0]);
+        assert!(out.rf[i][1].abs() < 1e-8, "ry {}", out.rf[i][1]);
     }
 }
