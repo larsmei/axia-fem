@@ -345,6 +345,7 @@ pub fn element_ke(
     thickness: f64,
     section: Option<&BeamSection>,
     directors: Option<&[[f64; 3]]>,
+    bend: f64,
 ) -> Result<KeFe> {
     match kind {
         ElemKind::Hex8 => {
@@ -459,7 +460,11 @@ pub fn element_ke(
             let sec = section.ok_or_else(|| {
                 crate::error::FemError("Balkenelement ohne *BEAM SECTION.".into())
             })?;
-            let (ke, len) = beam::stiffness(kind, xyz, e, nu, sec)?;
+            let (ke, len) = if sec.cbar && kind == ElemKind::Beam31 {
+                beam::cbar_stiffness(xyz, e, nu, sec)?
+            } else {
+                beam::stiffness(kind, xyz, e, nu, sec)?
+            };
             let ndof = 6 * kind.nnodes();
             Ok(KeFe {
                 ke,
@@ -521,7 +526,7 @@ pub fn element_ke(
             })
         }
         ElemKind::Shell4 | ElemKind::Shell4R => {
-            let (ke, area) = crate::mitc4::s4_ke(xyz, e, nu, thickness, directors)?;
+            let (ke, area) = crate::mitc4::s4_ke_bi(xyz, e, nu, thickness, directors, bend)?;
             let ndof = 24;
             Ok(KeFe {
                 ke,
@@ -531,7 +536,7 @@ pub fn element_ke(
             })
         }
         ElemKind::Shell3 | ElemKind::Shell8 | ElemKind::Shell8R | ElemKind::Shell6 => {
-            let (ke, area) = shell::stiffness(kind, xyz, e, nu, thickness)?;
+            let (ke, area) = shell::stiffness_bend(kind, xyz, e, nu, thickness, bend)?;
             let ndof = 6 * kind.nnodes();
             Ok(KeFe {
                 ke,

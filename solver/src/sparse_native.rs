@@ -1559,16 +1559,6 @@ fn try_faer_lu(csr: &Csr, rhs: &[f64]) -> Result<Vec<f64>> {
     Ok(extract_col(&x, n))
 }
 
-fn try_faer(csr: &Csr, rhs: &[f64]) -> Result<(Vec<f64>, &'static str)> {
-    match try_faer_llt(csr, rhs) {
-        Ok(x) => Ok((x, "faer (supernodal LLT)")),
-        Err(llt_e) => match try_faer_lu(csr, rhs) {
-            Ok(x) => Ok((x, "faer (supernodal LU)")),
-            Err(lu_e) => err(format!("{llt_e}; {lu_e}")),
-        },
-    }
-}
-
 fn pack(csr: &Csr, rhs: &[f64], x: Vec<f64>, name: &str) -> SparseSolve {
     let residual = residual(csr, &x, rhs);
     SparseSolve {
@@ -1660,9 +1650,23 @@ pub fn solve_kff(csr: &Csr, rhs: &[f64]) -> Result<SparseSolve> {
             ));
         }
         SparseBackend::Faer => {
-            let (x, name) = try_faer(csr, rhs)?;
-            announce(name);
-            return Ok(pack(csr, rhs, x, name));
+            if let Ok(x) = try_faer_llt(csr, rhs) {
+                let s = pack(csr, rhs, x, "faer (supernodal LLT)");
+                if residual_ok(&s, rhs) {
+                    announce("faer (supernodal LLT)");
+                    return Ok(s);
+                }
+            }
+            if let Ok(x) = try_faer_lu(csr, rhs) {
+                let s = pack(csr, rhs, x, "faer (supernodal LU)");
+                if residual_ok(&s, rhs) {
+                    announce("faer (supernodal LU)");
+                    return Ok(s);
+                }
+            }
+            return err(
+                "Steifigkeitsmatrix ist singulär — Randbedingungen unzureichend (Starrkörperbewegung oder entartete Elemente).",
+            );
         }
         SparseBackend::Rivrs => {
             let name = "rivrs-sparse (LDLT)";
@@ -1694,8 +1698,15 @@ pub fn solve_kff(csr: &Csr, rhs: &[f64]) -> Result<SparseSolve> {
 
     match try_faer_lu(csr, rhs) {
         Ok(x) => {
-            announce("faer (supernodal LU)");
-            return Ok(pack(csr, rhs, x, "faer (supernodal LU)"));
+            let s = pack(csr, rhs, x, "faer (supernodal LU)");
+            if residual_ok(&s, rhs) {
+                announce("faer (supernodal LU)");
+                return Ok(s);
+            }
+            eprintln!(
+                "axia: faer LU residual {:.3e} too large, refusing",
+                s.residual
+            );
         }
         Err(e) => {
             eprintln!("axia: faer LU failed ({e}), trying rivrs-sparse");

@@ -418,7 +418,7 @@ fn assemble_nl_element(
         } else {
             model.thickness_for(el)
         };
-        let kef = element_ke(el.kind, xyz0, mat.e, mat.nu, th, None, None)?;
+        let kef = element_ke(el.kind, xyz0, mat.e, mat.nu, th, None, None, 1.0)?;
         let n = kef.ndof;
         let mut fe = vec![0.0; n];
         for i in 0..n {
@@ -578,7 +578,16 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
             None
         };
         let dirs = elem_dirs(el, &model, &shell_n);
-        let mut kef = element_ke(el.kind, &xyz, mat.e, mat.nu, th, sec.as_ref(), dirs.as_deref())?;
+        let mut kef = element_ke(
+            el.kind,
+            &xyz,
+            mat.e,
+            mat.nu,
+            th,
+            sec.as_ref(),
+            dirs.as_deref(),
+            model.bend_scale(el),
+        )?;
         if !model.node_transform.is_empty() {
             constraint::transform_ke(
                 &mut kef.ke,
@@ -753,6 +762,8 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
             }
         }
     }
+
+    assemble_mystran(&model, ndn, &mut trips, &mut m_full)?;
 
     let t_cload = if matches!(model.procedure, Procedure::Dynamic { .. }) {
         0.0
@@ -1342,6 +1353,239 @@ fn remap_rot_node_bcs(model: &mut Model) {
     }
 }
 
+fn mystran_touch_nodes(model: &Model) -> Vec<i32> {
+    let mut ids = Vec::new();
+    for s in model.dof_springs.iter().chain(model.dof_masses.iter()) {
+        ids.push(s.n1);
+        if let Some(n) = s.n2 {
+            ids.push(n);
+        }
+    }
+    for b in &model.bushes {
+        ids.push(b.n1);
+        if let Some(n) = b.n2 {
+            ids.push(n);
+        }
+    }
+    for s in &model.shears {
+        ids.extend(s.n);
+    }
+    ids
+}
+
+fn mystran_live_dofs(model: &Model) -> HashSet<(i32, usize)> {
+    let mut live = HashSet::new();
+    for s in model.dof_springs.iter().chain(model.dof_masses.iter()) {
+        if s.c1 >= 3 {
+            live.insert((s.n1, s.c1));
+        }
+        if let Some(n) = s.n2 {
+            if s.c2 >= 3 {
+                live.insert((n, s.c2));
+            }
+        }
+    }
+    for b in &model.bushes {
+        for c in 3..6 {
+            if b.k[c].abs() > 0.0 {
+                live.insert((b.n1, c));
+                if let Some(n) = b.n2 {
+                    live.insert((n, c));
+                }
+            }
+        }
+    }
+    live
+}
+
+fn assemble_mystran(
+    model: &Model,
+    ndn: usize,
+    trips: &mut Vec<(usize, usize, f64)>,
+    m_full: &mut [f64],
+) -> Result<()> {
+    for s in &model.dof_springs {
+        scatter_link(model, ndn, s.n1, s.c1, s.n2, s.c2, s.k, trips, None)?;
+    }
+    for s in &model.dof_masses {
+        scatter_link(model, ndn, s.n1, s.c1, s.n2, s.c2, s.k, trips, Some(m_full))?;
+    }
+    for b in &model.bushes {
+        assemble_bush(model, ndn, b, trips)?;
+    }
+    for s in &model.shears {
+        let mut xyz = [[0.0; 3]; 4];
+        for i in 0..4 {
+            xyz[i] = model.coords[model.node_index(s.n[i])?];
+        }
+        let ke = shell::shear_panel(&xyz, s.g, s.t)?;
+        let mut gd = [0usize; 12];
+        for a in 0..4 {
+            let ni = model.node_index(s.n[a])?;
+            for d in 0..3.min(ndn) {
+                gd[3 * a + d] = dof_of(ndn, ni, d);
+            }
+        }
+        let lim = 3.min(ndn);
+        for a in 0..4 {
+            for b in 0..4 {
+                for i in 0..lim {
+                    for j in 0..lim {
+                        let v = ke[(3 * a + i) * 12 + (3 * b + j)];
+                        if v.abs() > 0.0 {
+                            trips.push((gd[3 * a + i], gd[3 * b + j], v));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scatter_link(
+    model: &Model,
+    ndn: usize,
+    n1: i32,
+    c1: usize,
+    n2: Option<i32>,
+    c2: usize,
+    k: f64,
+    trips: &mut Vec<(usize, usize, f64)>,
+    mass: Option<&mut [f64]>,
+) -> Result<()> {
+    if k == 0.0 || c1 >= ndn {
+        return Ok(());
+    }
+    let i = dof_of(ndn, model.node_index(n1)?, c1);
+    let j = if let Some(n2) = n2 {
+        if c2 >= ndn {
+            return Ok(());
+        }
+        Some(dof_of(ndn, model.node_index(n2)?, c2))
+    } else {
+        None
+    };
+    if let Some(m) = mass {
+        m[i] += k;
+        if let Some(j) = j {
+            if j != i {
+                m[j] += k;
+            }
+        }
+        return Ok(());
+    }
+    match j {
+        None => trips.push((i, i, k)),
+        Some(j) if j == i => trips.push((i, i, k)),
+        Some(j) => {
+            trips.push((i, i, k));
+            trips.push((j, j, k));
+            trips.push((i, j, -k));
+            trips.push((j, i, -k));
+        }
+    }
+    Ok(())
+}
+
+fn assemble_bush(
+    model: &Model,
+    ndn: usize,
+    b: &crate::model::BushEl,
+    trips: &mut Vec<(usize, usize, f64)>,
+) -> Result<()> {
+    let p1 = model.coords[model.node_index(b.n1)?];
+    let p2 = match b.n2 {
+        Some(n) => Some(model.coords[model.node_index(n)?]),
+        None => None,
+    };
+    let mut x = b.x;
+    let xn = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt();
+    if xn < 1e-12 {
+        if let Some(p2) = p2 {
+            x = [p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]];
+        }
+    }
+    let xn = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt();
+    if xn < 1e-12 {
+        x = [1.0, 0.0, 0.0];
+    } else {
+        x = [x[0] / xn, x[1] / xn, x[2] / xn];
+    }
+    let mut y = b.y;
+    let d = y[0] * x[0] + y[1] * x[1] + y[2] * x[2];
+    y = [y[0] - d * x[0], y[1] - d * x[1], y[2] - d * x[2]];
+    let yn = (y[0] * y[0] + y[1] * y[1] + y[2] * y[2]).sqrt();
+    if yn < 1e-12 {
+        let alt = if x[2].abs() < 0.9 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let d = alt[0] * x[0] + alt[1] * x[1] + alt[2] * x[2];
+        y = [alt[0] - d * x[0], alt[1] - d * x[1], alt[2] - d * x[2]];
+    }
+    let yn = (y[0] * y[0] + y[1] * y[1] + y[2] * y[2]).sqrt().max(1e-30);
+    y = [y[0] / yn, y[1] / yn, y[2] / yn];
+    let z = [
+        x[1] * y[2] - x[2] * y[1],
+        x[2] * y[0] - x[0] * y[2],
+        x[0] * y[1] - x[1] * y[0],
+    ];
+    let r = [
+        [x[0], y[0], z[0]],
+        [x[1], y[1], z[1]],
+        [x[2], y[2], z[2]],
+    ];
+    let mut kg = [0.0; 36];
+    for blk in 0..2 {
+        let o = blk * 3;
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut s = 0.0;
+                for a in 0..3 {
+                    s += r[i][a] * b.k[o + a] * r[j][a];
+                }
+                kg[(o + i) * 6 + (o + j)] = s;
+            }
+        }
+    }
+    let n1 = model.node_index(b.n1)?;
+    let lim = 6.min(ndn);
+    let mut g1 = [0usize; 6];
+    for d in 0..lim {
+        g1[d] = dof_of(ndn, n1, d);
+    }
+    if let Some(n2id) = b.n2 {
+        let n2 = model.node_index(n2id)?;
+        let mut g2 = [0usize; 6];
+        for d in 0..lim {
+            g2[d] = dof_of(ndn, n2, d);
+        }
+        for i in 0..lim {
+            for j in 0..lim {
+                let v = kg[i * 6 + j];
+                if v.abs() > 0.0 {
+                    trips.push((g1[i], g1[j], v));
+                    trips.push((g2[i], g2[j], v));
+                    trips.push((g1[i], g2[j], -v));
+                    trips.push((g2[i], g1[j], -v));
+                }
+            }
+        }
+    } else {
+        for i in 0..lim {
+            for j in 0..lim {
+                let v = kg[i * 6 + j];
+                if v.abs() > 0.0 {
+                    trips.push((g1[i], g1[j], v));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Pin unused rotational DOFs on continuum nodes, and uz on planar 2D/truss models.
 fn pin_unused_dofs(
     model: &Model,
@@ -1358,6 +1602,7 @@ fn pin_unused_dofs(
                 }
             }
         }
+        let live = mystran_live_dofs(model);
         for rb in &model.rigid_bodies {
             if let Ok(i) = model.node_index(rb.ref_node) {
                 struct_node[i] = true;
@@ -1380,6 +1625,9 @@ fn pin_unused_dofs(
         for ni in 0..nnode {
             if !struct_node[ni] {
                 for r in 3..6 {
+                    if live.contains(&(model.node_ids[ni], r)) {
+                        continue;
+                    }
                     prescribed.entry(dof_of(ndn, ni, r)).or_insert(0.0);
                 }
             }
@@ -1394,6 +1642,11 @@ fn pin_unused_dofs(
                 if let Ok(i) = model.node_index(id) {
                     attached[i] = true;
                 }
+            }
+        }
+        for id in mystran_touch_nodes(model) {
+            if let Ok(i) = model.node_index(id) {
+                attached[i] = true;
             }
         }
         let mut keep = vec![false; nnode];
@@ -1445,7 +1698,11 @@ fn pin_unused_dofs(
             !model.coords.is_empty() && model.coords.iter().all(|c| (c[2] - z0).abs() <= 1e-12);
         let has_solid = model.elements.iter().any(|e| e.kind.is_continuum3d());
         if planar && !has_solid && !model.has_beams() && !model.has_shells() {
+            let live = mystran_live_dofs(model);
             for ni in 0..nnode {
+                if live.contains(&(model.node_ids[ni], 2)) {
+                    continue;
+                }
                 prescribed.entry(dof_of(ndn, ni, 2)).or_insert(0.0);
             }
         }
@@ -1596,6 +1853,19 @@ fn apply_point_grav(
             }
             for d in 0..3.min(ndn) {
                 f[dof_of(ndn, ni, d)] += m * *mag * ndir[d];
+            }
+            if let Some(arm) = model.mass_arms.get(&el.id) {
+                if ndn >= 6 {
+                    let fg = [m * *mag * ndir[0], m * *mag * ndir[1], m * *mag * ndir[2]];
+                    let mom = [
+                        arm[1] * fg[2] - arm[2] * fg[1],
+                        arm[2] * fg[0] - arm[0] * fg[2],
+                        arm[0] * fg[1] - arm[1] * fg[0],
+                    ];
+                    for d in 0..3 {
+                        f[dof_of(ndn, ni, 3 + d)] += mom[d];
+                    }
+                }
             }
         }
     }
@@ -2547,7 +2817,16 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
             None
         };
         let dirs = elem_dirs(el, &model, &shell_n);
-        let mut kef = element_ke(el.kind, &xyz, mat.e, mat.nu, th, sec.as_ref(), dirs.as_deref())?;
+        let mut kef = element_ke(
+            el.kind,
+            &xyz,
+            mat.e,
+            mat.nu,
+            th,
+            sec.as_ref(),
+            dirs.as_deref(),
+            model.bend_scale(el),
+        )?;
         if !model.node_transform.is_empty() {
             constraint::transform_ke(
                 &mut kef.ke,

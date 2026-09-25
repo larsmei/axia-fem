@@ -315,7 +315,7 @@ fn tri3_shape() -> ([f64; 3], [[f64; 2]; 3]) {
 }
 
 /// DKT bending 9×9 (w, θx, θy) plus CST membrane, 1-pt shear.
-fn s3_local(xy: &[[f64; 2]; 3], e: f64, nu: f64, h: f64) -> Result<(Vec<f64>, f64)> {
+fn s3_local(xy: &[[f64; 2]; 3], e: f64, nu: f64, h: f64, bend: f64) -> Result<(Vec<f64>, f64)> {
     let x1 = xy[0][0];
     let y1 = xy[0][1];
     let x2 = xy[1][0];
@@ -340,7 +340,7 @@ fn s3_local(xy: &[[f64; 2]; 3], e: f64, nu: f64, h: f64) -> Result<(Vec<f64>, f6
     let mut db = [0.0; 9];
     for i in 0..9 {
         dm[i] = dm0[i] * h;
-        db[i] = dm0[i] * h * h * h / 12.0;
+        db[i] = dm0[i] * h * h * h / 12.0 * bend;
     }
     add_membrane(&mut ke, nd, 3, &dndx, &dm, area);
 
@@ -497,6 +497,17 @@ fn s6_local(xy: &[[f64; 2]], e: f64, nu: f64, h: f64) -> Result<(Vec<f64>, f64)>
 }
 
 pub fn stiffness(kind: ElemKind, xyz: &[[f64; 3]], e: f64, nu: f64, h: f64) -> Result<(Vec<f64>, f64)> {
+    stiffness_bend(kind, xyz, e, nu, h, 1.0)
+}
+
+pub fn stiffness_bend(
+    kind: ElemKind,
+    xyz: &[[f64; 3]],
+    e: f64,
+    nu: f64,
+    h: f64,
+    bend: f64,
+) -> Result<(Vec<f64>, f64)> {
     let nn = kind.nnodes();
     if xyz.len() < nn {
         return err("Schale: zu wenige Knoten.");
@@ -508,13 +519,13 @@ pub fn stiffness(kind: ElemKind, xyz: &[[f64; 3]], e: f64, nu: f64, h: f64) -> R
     let xy = project_xy(xyz, e1, e2, nn);
     let (mut ke, area) = match kind {
         ElemKind::Shell4 | ElemKind::Shell4R => {
-            return crate::mitc4::s4_ke(xyz, e, nu, h, None);
+            return crate::mitc4::s4_ke_bi(xyz, e, nu, h, None, bend);
         }
         ElemKind::Shell8 | ElemKind::Shell8R => s8_local(&xy, e, nu, h, kind.reduced_int())?,
         ElemKind::Shell3 => {
             let mut p = [[0.0; 2]; 3];
             p.copy_from_slice(&xy[..3]);
-            s3_local(&p, e, nu, h)?
+            s3_local(&p, e, nu, h, bend)?
         }
         ElemKind::Shell6 => s6_local(&xy, e, nu, h)?,
         _ => return err("Kein Schalenelement."),
@@ -522,6 +533,101 @@ pub fn stiffness(kind: ElemKind, xyz: &[[f64; 3]], e: f64, nu: f64, h: f64) -> R
     rotate_ke(&mut ke, nn, e1, e2, e3);
     let _ = e3;
     Ok((ke, area))
+}
+
+/// Nastran CSHEAR: in-plane shear only, bilinear quad, 2×2 Gauss.
+pub fn shear_panel(xyz: &[[f64; 3]], g: f64, t: f64) -> Result<Vec<f64>> {
+    if xyz.len() < 4 || t <= 0.0 {
+        return err("CSHEAR braucht vier Knoten und eine positive Dicke.");
+    }
+    let (e1, e2, _e3) = local_frame(xyz, 4)?;
+    let xy = project_xy(xyz, e1, e2, 4);
+    let mut kl = [0.0; 64];
+    let gp = 0.5773502691896257;
+    for &xi in &[-gp, gp] {
+        for &eta in &[-gp, gp] {
+            let (n, dnxi, dneta) = q4_shape(xi, eta);
+            let _ = n;
+            let mut j = [[0.0; 2]; 2];
+            for a in 0..4 {
+                j[0][0] += dnxi[a] * xy[a][0];
+                j[0][1] += dneta[a] * xy[a][0];
+                j[1][0] += dnxi[a] * xy[a][1];
+                j[1][1] += dneta[a] * xy[a][1];
+            }
+            let det = j[0][0] * j[1][1] - j[0][1] * j[1][0];
+            if det.abs() < 1e-18 {
+                return err("CSHEAR ist entartet.");
+            }
+            let inv00 = j[1][1] / det;
+            let inv01 = -j[0][1] / det;
+            let inv10 = -j[1][0] / det;
+            let inv11 = j[0][0] / det;
+            let mut b = [0.0; 8];
+            for a in 0..4 {
+                let dx = inv00 * dnxi[a] + inv01 * dneta[a];
+                let dy = inv10 * dnxi[a] + inv11 * dneta[a];
+                b[2 * a] = dy;
+                b[2 * a + 1] = dx;
+            }
+            let w = g * t * det.abs();
+            for i in 0..8 {
+                for j in 0..8 {
+                    kl[i * 8 + j] += b[i] * w * b[j];
+                }
+            }
+        }
+    }
+    let mut r = [[0.0; 2]; 3];
+    for i in 0..3 {
+        r[i][0] = e1[i];
+        r[i][1] = e2[i];
+    }
+    let mut ke = vec![0.0; 144];
+    for a in 0..4 {
+        for b in 0..4 {
+            let mut k2 = [[0.0; 2]; 2];
+            for p in 0..2 {
+                for q in 0..2 {
+                    k2[p][q] = kl[(2 * a + p) * 8 + (2 * b + q)];
+                }
+            }
+            for i in 0..3 {
+                for j in 0..3 {
+                    let mut s = 0.0;
+                    for p in 0..2 {
+                        for q in 0..2 {
+                            s += r[i][p] * k2[p][q] * r[j][q];
+                        }
+                    }
+                    ke[(3 * a + i) * 12 + (3 * b + j)] += s;
+                }
+            }
+        }
+    }
+    Ok(ke)
+}
+
+fn q4_shape(xi: f64, eta: f64) -> ([f64; 4], [f64; 4], [f64; 4]) {
+    let n = [
+        0.25 * (1.0 - xi) * (1.0 - eta),
+        0.25 * (1.0 + xi) * (1.0 - eta),
+        0.25 * (1.0 + xi) * (1.0 + eta),
+        0.25 * (1.0 - xi) * (1.0 + eta),
+    ];
+    let dnxi = [
+        -0.25 * (1.0 - eta),
+        0.25 * (1.0 - eta),
+        0.25 * (1.0 + eta),
+        -0.25 * (1.0 + eta),
+    ];
+    let dneta = [
+        -0.25 * (1.0 - xi),
+        -0.25 * (1.0 + xi),
+        0.25 * (1.0 + xi),
+        0.25 * (1.0 - xi),
+    ];
+    (n, dnxi, dneta)
 }
 
 fn tensor_rotate(sl: [f64; 6], e1: [f64; 3], e2: [f64; 3], e3: [f64; 3]) -> [f64; 6] {

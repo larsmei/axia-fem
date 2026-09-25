@@ -501,6 +501,13 @@ pub struct BeamSection {
     pub jtor: f64,
     pub k11: f64,
     pub k22: f64,
+    /// Closed-form Nastran CBAR (Hermitian + shear) instead of one-point B31.
+    pub cbar: bool,
+    pub rel_a: u8,
+    pub rel_b: u8,
+    /// Grid-to-beam-end offsets in the basic system.
+    pub off_a: [f64; 3],
+    pub off_b: [f64; 3],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -525,6 +532,11 @@ impl BeamSection {
             jtor: torsion_rect(a, b),
             k11: 5.0 / 6.0,
             k22: 5.0 / 6.0,
+            cbar: false,
+            rel_a: 0,
+            rel_b: 0,
+            off_a: [0.0; 3],
+            off_b: [0.0; 3],
         }
     }
 
@@ -543,6 +555,11 @@ impl BeamSection {
             jtor: std::f64::consts::PI * r4 / 2.0,
             k11: 0.9,
             k22: 0.9,
+            cbar: false,
+            rel_a: 0,
+            rel_b: 0,
+            off_a: [0.0; 3],
+            off_b: [0.0; 3],
         }
     }
 
@@ -565,6 +582,11 @@ impl BeamSection {
             jtor: std::f64::consts::PI / 2.0 * (ro4 - ri4),
             k11: 0.5,
             k22: 0.5,
+            cbar: false,
+            rel_a: 0,
+            rel_b: 0,
+            off_a: [0.0; 3],
+            off_b: [0.0; 3],
         }
     }
 
@@ -600,6 +622,11 @@ impl BeamSection {
             jtor: torsion_rect(a, b) - torsion_rect(ai.max(1e-16), bi.max(1e-16)),
             k11: 0.5,
             k22: 0.5,
+            cbar: false,
+            rel_a: 0,
+            rel_b: 0,
+            off_a: [0.0; 3],
+            off_b: [0.0; 3],
         }
     }
 
@@ -618,6 +645,11 @@ impl BeamSection {
             jtor: jtor.abs().max(1e-30),
             k11: 5.0 / 6.0,
             k22: 5.0 / 6.0,
+            cbar: false,
+            rel_a: 0,
+            rel_b: 0,
+            off_a: [0.0; 3],
+            off_b: [0.0; 3],
         }
     }
 }
@@ -901,6 +933,34 @@ impl Procedure {
     }
 }
 
+/// Scalar spring or mass between one component and another, or ground (`n2` empty).
+#[derive(Clone, Debug)]
+pub struct DofLink {
+    pub n1: i32,
+    pub c1: usize,
+    pub n2: Option<i32>,
+    pub c2: usize,
+    pub k: f64,
+}
+
+/// CBUSH diagonal stiffness in a bush frame. `x` and `y` are basic hints.
+#[derive(Clone, Debug)]
+pub struct BushEl {
+    pub n1: i32,
+    pub n2: Option<i32>,
+    pub k: [f64; 6],
+    pub x: [f64; 3],
+    pub y: [f64; 3],
+}
+
+/// CSHEAR panel. `g` is the shear modulus, `t` the thickness.
+#[derive(Clone, Debug)]
+pub struct ShearEl {
+    pub n: [i32; 4],
+    pub g: f64,
+    pub t: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Model {
     pub heading: String,
@@ -972,6 +1032,16 @@ pub struct Model {
     pub output_basic: bool,
     /// MYSTRAN stores FORCE in the basic system. CalculiX CLOAD is already in the nodal system.
     pub cloads_basic: bool,
+    /// PSHELL 12I/T³. Missing means 1.
+    pub elset_bend: HashMap<String, f64>,
+    pub dof_springs: Vec<DofLink>,
+    pub dof_masses: Vec<DofLink>,
+    pub bushes: Vec<BushEl>,
+    pub shears: Vec<ShearEl>,
+    /// CONM2 offset from the grid to the mass, basic coordinates, keyed by element id.
+    pub mass_arms: HashMap<i32, [f64; 3]>,
+    /// Force 6 DOF per node even without beams or shells (rotational springs, inertia).
+    pub use_six: bool,
 }
 
 impl Model {
@@ -1038,6 +1108,13 @@ impl Model {
             case_labels: Vec::new(),
             output_basic: true,
             cloads_basic: false,
+            elset_bend: HashMap::new(),
+            dof_springs: Vec::new(),
+            dof_masses: Vec::new(),
+            bushes: Vec::new(),
+            shears: Vec::new(),
+            mass_arms: HashMap::new(),
+            use_six: false,
         }
     }
 
@@ -1056,6 +1133,7 @@ impl Model {
     pub fn ndof_node(&self) -> usize {
         if self.has_beams()
             || self.has_shells()
+            || self.use_six
             || self.elements.iter().any(|e| e.kind == ElemKind::RotaryI)
             || !self.rigid_bodies.is_empty()
             || self.couplings.iter().any(|c| c.kinematic)
@@ -1260,6 +1338,10 @@ impl Model {
             "Keine *BEAM SECTION für Element {} (ELSET={})",
             el.id, el.elset
         ))
+    }
+
+    pub fn bend_scale(&self, el: &Element) -> f64 {
+        self.elset_bend.get(&el.elset).copied().unwrap_or(1.0)
     }
 
     pub fn spring_k_for(&self, el: &Element) -> crate::error::Result<f64> {

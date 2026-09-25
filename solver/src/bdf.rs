@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use crate::error::{err, Result};
 use crate::mystran_manifest::{self, CardStatus};
 use crate::model::{
-    AnalysisStep, BeamSection, Boundary, Cload, Dload, ElemKind, Element, Equation, Material, Model,
-    Procedure, RigidBody,
+    AnalysisStep, BeamSection, Boundary, BushEl, Cload, Dload, DofLink, ElemKind, Element, Equation,
+    Material, Model, Procedure, RigidBody, ShearEl,
 };
 
 pub fn is_mystran_deck(text: &str) -> bool {
@@ -84,8 +84,10 @@ pub fn is_mystran_deck(text: &str) -> bool {
 pub const RECOGNIZED_BULK: &[&str] = &[
     "PARAM", "DEBUG", "EIGRL", "GRDSET", "GRID", "CORD1C", "CORD1R", "CORD1S", "CORD2C", "CORD2R",
     "CORD2S", "MAT1", "PSHELL", "PSOLID", "PROD", "PBAR", "PBARL", "CROD", "CONROD", "CBAR", "CBEAM",
-    "CQUAD4", "CTRIA3", "CTETRA", "CHEXA", "CPENTA", "CELAS2", "CONM2", "RBE2", "RBE3", "FORCE",
-    "MOMENT", "PLOAD2", "PLOAD4", "GRAV", "LOAD", "SPC", "SPC1", "SPCADD", "MPC", "MPCADD",
+    "BAROR", "CQUAD4", "CQUAD4K", "CTRIA3", "CTRIA3K", "CTETRA", "CHEXA", "CPENTA", "CELAS1",
+    "CELAS2", "CELAS3", "CELAS4", "PELAS", "CMASS1", "CMASS2", "CMASS3", "CMASS4", "PMASS", "CONM2",
+    "CSHEAR", "PSHEAR", "CBUSH", "PBUSH", "RBE2", "RBE3", "FORCE", "MOMENT", "PLOAD2", "PLOAD4",
+    "GRAV", "LOAD", "SPC", "SPC1", "SPCADD", "MPC", "MPCADD",
 ];
 
 pub fn parse_with_base(text: &str, base: Option<&Path>) -> Result<Model> {
@@ -395,6 +397,7 @@ enum Prop {
         mid: i32,
         t: f64,
         membrane: bool,
+        bend: f64,
     },
     Solid {
         mid: i32,
@@ -413,6 +416,13 @@ enum Prop {
         k1: f64,
         k2: f64,
     },
+    Bush {
+        k: [f64; 6],
+    },
+    Shear {
+        mid: i32,
+        t: f64,
+    },
 }
 
 struct BarEl {
@@ -421,6 +431,28 @@ struct BarEl {
     ga: i32,
     gb: i32,
     n1: [f64; 3],
+    rel_a: u8,
+    rel_b: u8,
+    off_a: [f64; 3],
+    off_b: [f64; 3],
+    offt: String,
+}
+
+struct Baror {
+    n1: [f64; 3],
+    rel_a: u8,
+    rel_b: u8,
+    off_a: [f64; 3],
+    off_b: [f64; 3],
+    offt: String,
+}
+
+struct BushRaw {
+    n1: i32,
+    n2: Option<i32>,
+    pid: i32,
+    nvec: [f64; 3],
+    cid: i32,
 }
 
 enum BuiltEl {
@@ -442,6 +474,9 @@ enum BuiltEl {
         eid: i32,
         g: i32,
         m: f64,
+        cid: i32,
+        arm: [f64; 3],
+        inertia: [f64; 6],
     },
     Spring {
         eid: i32,
@@ -540,6 +575,22 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     let mut mpcs: HashMap<i32, Vec<Vec<(i32, usize, f64)>>> = HashMap::new();
     let mut mpcadd: HashMap<i32, Vec<i32>> = HashMap::new();
     let mut rbe3s: Vec<(i32, i32, Vec<usize>, Vec<(f64, Vec<usize>, Vec<i32>)>)> = Vec::new();
+    let mut pelas: HashMap<i32, f64> = HashMap::new();
+    let mut pmass: HashMap<i32, f64> = HashMap::new();
+    let mut baror = Baror {
+        n1: [0.0, 1.0, 0.0],
+        rel_a: 0,
+        rel_b: 0,
+        off_a: [0.0; 3],
+        off_b: [0.0; 3],
+        offt: "GGG".into(),
+    };
+    let mut bushes: Vec<BushRaw> = Vec::new();
+    let mut raw_springs: Vec<DofLink> = Vec::new();
+    let mut raw_masses: Vec<DofLink> = Vec::new();
+    let mut spring_pid: Vec<(usize, i32)> = Vec::new();
+    let mut mass_pid: Vec<(usize, i32)> = Vec::new();
+    let mut shear_raw: Vec<(i32, [i32; 4])> = Vec::new();
 
     for c in cards {
         let name = c.first().map(|s| s.as_str()).unwrap_or("");
@@ -652,15 +703,8 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 let t = field_f64(d, 2).unwrap_or(0.0);
                 let mid2_raw = field(d, 3);
                 let membrane = mid2_raw == "-1";
-                let bend = field_f64(d, 4);
-                if let Some(b) = bend {
-                    if (b - 1.0).abs() > 1e-3 {
-                        model.warn(format!(
-                            "PSHELL {pid}: 12I/T³={b} wird als 1 behandelt (keine entkoppelte Biegung)."
-                        ));
-                    }
-                }
-                props.insert(pid, Prop::Shell { mid, t, membrane });
+                let bend = field_f64(d, 4).unwrap_or(1.0);
+                props.insert(pid, Prop::Shell { mid, t, membrane, bend });
             }
             "PSOLID" => {
                 let pid = req_i32(d, 0, "PSOLID")?;
@@ -701,13 +745,17 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
             "PBARL" => {
                 let pid = req_i32(d, 0, "PBARL")?;
                 let mid = req_i32(d, 1, "PBARL MID")?;
-                let typ = field(d, 3).to_ascii_uppercase();
-                let dims: Vec<f64> = d.iter().skip(4).filter(|s| !s.is_empty()).filter_map(|s| parse_f64(s).ok()).collect();
-                let (area, i1, i2, j) = section_library(&typ, &dims).ok_or_else(|| {
+                let (typ, dims) = pbarl_type_dims(d);
+                let (area, i1, i2, i12, j) = section_library(&typ, &dims).ok_or_else(|| {
                     crate::error::FemError(format!(
-                        "PBARL {pid}: Typ '{typ}' nicht unterstützt (ROD, TUBE, BAR)."
+                        "PBARL {pid}: Typ '{typ}' nicht unterstützt (ROD, TUBE, TUBE2, BAR, BOX, I, T, L)."
                     ))
                 })?;
+                if i12.abs() > 1e-12 * (i1 * i2).sqrt().max(1.0) {
+                    model.warn(format!(
+                        "PBARL {pid}: Produktträgheit I12 wird nicht in die Biegung gekoppelt."
+                    ));
+                }
                 props.insert(
                     pid,
                     Prop::Bar {
@@ -715,7 +763,7 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                         area,
                         i1,
                         i2,
-                        i12: 0.0,
+                        i12,
                         j,
                         k1: 0.0,
                         k2: 0.0,
@@ -741,31 +789,90 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
             }
             "CBAR" | "CBEAM" => {
                 let eid = req_i32(d, 0, name)?;
-                let pid = req_i32(d, 1, name)?;
+                let pid = field_i32(d, 1).unwrap_or(0);
                 let ga = req_i32(d, 2, name)?;
                 let gb = req_i32(d, 3, name)?;
-                let n1 = bar_orient_fields(d);
-                elements.push(BuiltEl::Bar(BarEl { eid, pid, ga, gb, n1 }));
+                let mut n1 = bar_orient_fields(d);
+                if !g0_flag(&n1) && n1[0].abs() + n1[1].abs() + n1[2].abs() < 1e-15 {
+                    n1 = baror.n1;
+                }
+                let (mut offt, base) = cbar_tail_base(d);
+                if field(d, 7).is_empty() || (!field(d, 7).chars().any(|c| c.is_ascii_alphabetic()) && base == 7)
+                {
+                    offt = baror.offt.clone();
+                }
+                let rel_a = if field(d, base).is_empty() {
+                    baror.rel_a
+                } else {
+                    pin_bits(field(d, base))
+                };
+                let rel_b = if field(d, base + 1).is_empty() {
+                    baror.rel_b
+                } else {
+                    pin_bits(field(d, base + 1))
+                };
+                let mut off_a = vec3_at(d, base + 2);
+                let mut off_b = vec3_at(d, base + 5);
+                if off_a == [0.0; 3] && field(d, base + 2).is_empty() {
+                    off_a = baror.off_a;
+                }
+                if off_b == [0.0; 3] && field(d, base + 5).is_empty() {
+                    off_b = baror.off_b;
+                }
+                elements.push(BuiltEl::Bar(BarEl {
+                    eid,
+                    pid,
+                    ga,
+                    gb,
+                    n1,
+                    rel_a,
+                    rel_b,
+                    off_a,
+                    off_b,
+                    offt,
+                }));
             }
-            "CQUAD4" => {
+            "BAROR" => {
+                let n1 = bar_orient_fields_at(d, 2);
+                if g0_flag(&n1) || n1[0].abs() + n1[1].abs() + n1[2].abs() > 1e-15 {
+                    baror.n1 = n1;
+                }
+                let (offt, base) = cbar_tail_base_at(d, 5);
+                if !field(d, base).is_empty() {
+                    baror.rel_a = pin_bits(field(d, base));
+                }
+                if !field(d, base + 1).is_empty() {
+                    baror.rel_b = pin_bits(field(d, base + 1));
+                }
+                if !field(d, base + 2).is_empty() {
+                    baror.off_a = vec3_at(d, base + 2);
+                }
+                if !field(d, base + 5).is_empty() {
+                    baror.off_b = vec3_at(d, base + 5);
+                }
+                if !offt.is_empty() {
+                    baror.offt = offt;
+                }
+            }
+            "CQUAD4" | "CQUAD4K" => {
                 if field_f64(d, 6).unwrap_or(0.0).abs() > 1e-8 {
                     warn_theta = true;
                 }
                 elements.push(BuiltEl::Std {
-                    eid: req_i32(d, 0, "CQUAD4")?,
+                    eid: req_i32(d, 0, name)?,
                     kind: ElemKind::Shell4,
                     nodes: vec![
-                        req_i32(d, 2, "CQUAD4")?,
-                        req_i32(d, 3, "CQUAD4")?,
-                        req_i32(d, 4, "CQUAD4")?,
-                        req_i32(d, 5, "CQUAD4")?,
+                        req_i32(d, 2, name)?,
+                        req_i32(d, 3, name)?,
+                        req_i32(d, 4, name)?,
+                        req_i32(d, 5, name)?,
                     ],
-                    pid: req_i32(d, 1, "CQUAD4 PID")?,
+                    pid: req_i32(d, 1, name)?,
                 });
             }
-            "CTRIA3" => {
+            "CTRIA3" | "CTRIA3K" => {
                 elements.push(BuiltEl::Std {
-                    eid: req_i32(d, 0, "CTRIA3")?,
+                    eid: req_i32(d, 0, name)?,
                     kind: ElemKind::Shell3,
                     nodes: vec![
                         req_i32(d, 2, "CTRIA3")?,
@@ -823,26 +930,169 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                     pid,
                 });
             }
-            "CELAS2" => {
-                let eid = req_i32(d, 0, "CELAS2")?;
-                let k = field_f64(d, 1).unwrap_or(0.0);
-                let g1 = field_i32(d, 2).unwrap_or(0);
-                let g2 = field_i32(d, 4).unwrap_or(0);
-                if g1 == 0 || g2 == 0 {
-                    model.warn(format!("CELAS2 {eid}: Feder gegen Erde wird nicht unterstützt."));
+            "CELAS1" | "CELAS2" => {
+                let eid = req_i32(d, 0, name)?;
+                let (k, g1_at, c1_at, g2_at, c2_at, pid_k) = if name == "CELAS1" {
+                    let pid = req_i32(d, 1, "CELAS1 PID")?;
+                    (0.0, 2, 3, 4, 5, Some(pid))
                 } else {
-                    elements.push(BuiltEl::Spring { eid, g1, g2, k });
+                    (field_f64(d, 1).unwrap_or(0.0), 2, 3, 4, 5, None)
+                };
+                let _ = eid;
+                let n0 = raw_springs.len();
+                push_grid_link(&mut raw_springs, d, g1_at, c1_at, g2_at, c2_at, k, &mut model.use_six);
+                if let Some(pid) = pid_k {
+                    if raw_springs.len() > n0 {
+                        spring_pid.push((raw_springs.len() - 1, pid));
+                    }
+                }
+            }
+            "CELAS3" | "CELAS4" => {
+                let _eid = req_i32(d, 0, name)?;
+                let (k, s1, s2, pid_k) = if name == "CELAS3" {
+                    let pid = req_i32(d, 1, "CELAS3 PID")?;
+                    (0.0, field_i32(d, 2), field_i32(d, 3), Some(pid))
+                } else {
+                    (field_f64(d, 1).unwrap_or(0.0), field_i32(d, 2), field_i32(d, 3), None)
+                };
+                if let Some(s1) = s1 {
+                    raw_springs.push(DofLink {
+                        n1: s1,
+                        c1: 0,
+                        n2: s2.filter(|s| *s != 0),
+                        c2: 0,
+                        k,
+                    });
+                    if let Some(pid) = pid_k {
+                        spring_pid.push((raw_springs.len() - 1, pid));
+                    }
+                }
+            }
+            "PELAS" => {
+                let pid = req_i32(d, 0, "PELAS")?;
+                pelas.insert(pid, field_f64(d, 1).unwrap_or(0.0));
+                if d.len() > 4 {
+                    if let Some(pid2) = field_i32(d, 4) {
+                        pelas.insert(pid2, field_f64(d, 5).unwrap_or(0.0));
+                    }
+                }
+            }
+            "CMASS1" | "CMASS2" => {
+                let _eid = req_i32(d, 0, name)?;
+                let (m, a, b, c, e, pid_m) = if name == "CMASS1" {
+                    let pid = req_i32(d, 1, "CMASS1 PID")?;
+                    (0.0, 2, 3, 4, 5, Some(pid))
+                } else {
+                    (field_f64(d, 1).unwrap_or(0.0), 2, 3, 4, 5, None)
+                };
+                let n0 = raw_masses.len();
+                push_grid_link(&mut raw_masses, d, a, b, c, e, m * wtmass, &mut model.use_six);
+                if let Some(pid) = pid_m {
+                    if raw_masses.len() > n0 {
+                        mass_pid.push((raw_masses.len() - 1, pid));
+                    }
+                }
+            }
+            "CMASS3" | "CMASS4" => {
+                let _eid = req_i32(d, 0, name)?;
+                let (m, s1, s2, pid_m) = if name == "CMASS3" {
+                    let pid = req_i32(d, 1, "CMASS3 PID")?;
+                    (0.0, field_i32(d, 2), field_i32(d, 3), Some(pid))
+                } else {
+                    (field_f64(d, 1).unwrap_or(0.0), field_i32(d, 2), field_i32(d, 3), None)
+                };
+                if let Some(s1) = s1 {
+                    raw_masses.push(DofLink {
+                        n1: s1,
+                        c1: 0,
+                        n2: s2.filter(|s| *s != 0),
+                        c2: 0,
+                        k: m * wtmass,
+                    });
+                    if let Some(pid) = pid_m {
+                        mass_pid.push((raw_masses.len() - 1, pid));
+                    }
+                }
+            }
+            "PMASS" => {
+                let mut i = 0;
+                while i + 1 < d.len() {
+                    if let Some(pid) = field_i32(d, i) {
+                        pmass.insert(pid, field_f64(d, i + 1).unwrap_or(0.0));
+                    }
+                    i += 2;
                 }
             }
             "CONM2" => {
                 let eid = req_i32(d, 0, "CONM2")?;
                 let g = req_i32(d, 1, "CONM2 G")?;
-                let m = field_f64(d, 3).unwrap_or(0.0);
-                let off = field_f64(d, 4).unwrap_or(0.0).hypot(field_f64(d, 5).unwrap_or(0.0)).hypot(field_f64(d, 6).unwrap_or(0.0));
-                if off > 1e-12 {
-                    model.warn(format!("CONM2 {eid}: Offset wird ignoriert."));
+                let cid = field_i32(d, 2).unwrap_or(0);
+                let m = field_f64(d, 3).unwrap_or(0.0) * wtmass;
+                let arm = [
+                    field_f64(d, 4).unwrap_or(0.0),
+                    field_f64(d, 5).unwrap_or(0.0),
+                    field_f64(d, 6).unwrap_or(0.0),
+                ];
+                let inertia = [
+                    field_f64(d, 7).unwrap_or(0.0),
+                    field_f64(d, 8).unwrap_or(0.0),
+                    field_f64(d, 9).unwrap_or(0.0),
+                    field_f64(d, 10).unwrap_or(0.0),
+                    field_f64(d, 11).unwrap_or(0.0),
+                    field_f64(d, 12).unwrap_or(0.0),
+                ];
+                elements.push(BuiltEl::Mass {
+                    eid,
+                    g,
+                    m,
+                    cid,
+                    arm,
+                    inertia,
+                });
+            }
+            "CSHEAR" => {
+                let pid = req_i32(d, 1, "CSHEAR PID")?;
+                let n = [
+                    req_i32(d, 2, "CSHEAR")?,
+                    req_i32(d, 3, "CSHEAR")?,
+                    req_i32(d, 4, "CSHEAR")?,
+                    req_i32(d, 5, "CSHEAR")?,
+                ];
+                shear_raw.push((pid, n));
+            }
+            "PSHEAR" => {
+                let pid = req_i32(d, 0, "PSHEAR")?;
+                let mid = req_i32(d, 1, "PSHEAR MID")?;
+                let t = field_f64(d, 2).unwrap_or(0.0);
+                props.insert(pid, Prop::Shear { mid, t });
+            }
+            "PBUSH" => {
+                let pid = req_i32(d, 0, "PBUSH")?;
+                let mut k = [0.0; 6];
+                let mut i = 1;
+                while i < d.len() {
+                    let tag = field(d, i).to_ascii_uppercase();
+                    if matches!(tag.as_str(), "K" | "B" | "GE" | "R" | "T") {
+                        if tag == "K" {
+                            for a in 0..6 {
+                                k[a] = field_f64(d, i + 1 + a).unwrap_or(0.0);
+                            }
+                        }
+                        i += 7;
+                    } else {
+                        i += 1;
+                    }
                 }
-                elements.push(BuiltEl::Mass { eid, g, m });
+                props.insert(pid, Prop::Bush { k });
+            }
+            "CBUSH" => {
+                let _eid = req_i32(d, 0, "CBUSH")?;
+                let pid = req_i32(d, 1, "CBUSH PID")?;
+                let n1 = req_i32(d, 2, "CBUSH GA")?;
+                let n2 = field_i32(d, 3).filter(|g| *g != 0);
+                let nvec = bar_orient_fields(d);
+                let cid = field_i32(d, 7).unwrap_or(0);
+                bushes.push(BushRaw { n1, n2, pid, nvec, cid });
             }
             "RBE2" => {
                 let eid = req_i32(d, 0, "RBE2")?;
@@ -1048,6 +1298,18 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
             names.join(", ")
         ));
     }
+    for (i, pid) in spring_pid {
+        let k = pelas.get(&pid).copied().ok_or_else(|| {
+            crate::error::FemError(format!("PELAS {pid} fehlt."))
+        })?;
+        raw_springs[i].k = k;
+    }
+    for (i, pid) in mass_pid {
+        let m = pmass.get(&pid).copied().ok_or_else(|| {
+            crate::error::FemError(format!("PMASS {pid} fehlt."))
+        })?;
+        raw_masses[i].k = m * wtmass;
+    }
 
     let mut cords = resolve_cord_points(&cords_raw)?;
     let mut pending: Vec<_> = grids.clone();
@@ -1167,6 +1429,15 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 let mut sec = BeamSection::general(area, i2, i12, i1, j, n1);
                 sec.k11 = if k1 > 0.0 { k1 } else { 1.0e6 };
                 sec.k22 = if k2 > 0.0 { k2 } else { 1.0e6 };
+                sec.cbar = true;
+                sec.rel_a = b.rel_a;
+                sec.rel_b = b.rel_b;
+                let tvec = sub3(xb, xa);
+                let tn = norm3(tvec).max(1e-30);
+                let t = scale3(tvec, 1.0 / tn);
+                let n2 = cross3(t, n1);
+                sec.off_a = offset_in_basic(&b.offt, 1, b.off_a, t, n1, n2);
+                sec.off_b = offset_in_basic(&b.offt, 2, b.off_b, t, n1, n2);
                 model.elset_beam.insert(elset.clone(), sec);
                 model.elements.push(Element {
                     id: b.eid,
@@ -1177,7 +1448,7 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 elem_kind.insert(b.eid, ElemKind::Beam31);
                 elem_nodes.insert(b.eid, vec![b.ga, b.gb]);
             }
-            BuiltEl::Mass { eid, g, m } => {
+            BuiltEl::Mass { eid, g, m, cid, arm, inertia } => {
                 let elset = format!("MASS{eid}");
                 model.elset_mass.insert(elset.clone(), *m);
                 model.elements.push(Element {
@@ -1186,6 +1457,48 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                     nodes: vec![*g],
                     elset,
                 });
+                let arm_b = if *cid == 0 {
+                    *arm
+                } else {
+                    let c = cords.get(cid).ok_or_else(|| {
+                        crate::error::FemError(format!("CONM2 {eid}: CID {cid} fehlt."))
+                    })?;
+                    let r = disp_matrix(c, [0.0, 0.0, 0.0]);
+                    [
+                        r[0][0] * arm[0] + r[0][1] * arm[1] + r[0][2] * arm[2],
+                        r[1][0] * arm[0] + r[1][1] * arm[1] + r[1][2] * arm[2],
+                        r[2][0] * arm[0] + r[2][1] * arm[1] + r[2][2] * arm[2],
+                    ]
+                };
+                if arm_b.iter().any(|v| v.abs() > 1e-15) {
+                    model.mass_arms.insert(*eid, arm_b);
+                    model.use_six = true;
+                }
+                let (i11, i21, i22, i31, i32, i33) = (
+                    inertia[0], inertia[1], inertia[2], inertia[3], inertia[4], inertia[5],
+                );
+                if i21.abs() + i31.abs() + i32.abs() > 1e-12 {
+                    model.warn(format!(
+                        "CONM2 {eid}: Deviationsmomente werden auf der Drehmasse ignoriert."
+                    ));
+                }
+                let rx = arm_b[0];
+                let ry = arm_b[1];
+                let rz = arm_b[2];
+                let ixx = i11 + *m * (ry * ry + rz * rz);
+                let iyy = i22 + *m * (rx * rx + rz * rz);
+                let izz = i33 + *m * (rx * rx + ry * ry);
+                if ixx + iyy + izz > 1e-18 {
+                    let rset = format!("ROT{eid}");
+                    model.elset_rotary.insert(rset.clone(), [ixx, iyy, izz, 0.0, 0.0, 0.0]);
+                    model.elements.push(Element {
+                        id: eid + 1_000_000,
+                        kind: ElemKind::RotaryI,
+                        nodes: vec![*g],
+                        elset: rset,
+                    });
+                    model.use_six = true;
+                }
             }
             BuiltEl::Spring { eid, g1, g2, k } => {
                 let elset = format!("SPR{eid}");
@@ -1203,6 +1516,52 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     // G0 orientation: re-read bars whose n1.x is a grid id encoded as NaN-free sentinel.
     // Implemented in orient_g0 pass below if we stored g0 in n1[0] and n1[1] as a flag.
     apply_g0(&mut model, &elements)?;
+    for s in raw_springs {
+        ensure_grid(&mut model, s.n1);
+        if let Some(n) = s.n2 {
+            ensure_grid(&mut model, n);
+        }
+        model.dof_springs.push(s);
+    }
+    for s in raw_masses {
+        ensure_grid(&mut model, s.n1);
+        if let Some(n) = s.n2 {
+            ensure_grid(&mut model, n);
+        }
+        model.dof_masses.push(s);
+    }
+    for b in bushes {
+        let k = match props.get(&b.pid) {
+            Some(Prop::Bush { k }) => *k,
+            _ => {
+                return err(format!("CBUSH: PBUSH {} fehlt.", b.pid));
+            }
+        };
+        if k[3].abs() + k[4].abs() + k[5].abs() > 0.0 {
+            model.use_six = true;
+        }
+        let (x, y) = bush_axes(&b, &model, &cords)?;
+        model.bushes.push(BushEl {
+            n1: b.n1,
+            n2: b.n2,
+            k,
+            x,
+            y,
+        });
+    }
+    for (pid, n) in shear_raw {
+        let prop = props.get(&pid).ok_or_else(|| {
+            crate::error::FemError(format!("CSHEAR: PSHEAR {pid} fehlt."))
+        })?;
+        let Prop::Shear { mid, t } = *prop else {
+            return err(format!("CSHEAR: PID {pid} ist kein PSHEAR."));
+        };
+        let mat = mats.get(&mid).ok_or_else(|| {
+            crate::error::FemError(format!("PSHEAR {pid}: MAT1 {mid} fehlt."))
+        })?;
+        let g = mat.e / (2.0 * (1.0 + mat.nu).max(1e-6));
+        model.shears.push(ShearEl { n, g, t });
+    }
 
     let mut slave_nodes = HashSet::new();
     let mut ref_nodes = HashSet::new();
@@ -1362,7 +1721,11 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     if model.node_ids.is_empty() {
         return err("Keine GRID-Karten im MYSTRAN-Deck.");
     }
-    if model.elements.is_empty() {
+    if model.elements.is_empty()
+        && model.dof_springs.is_empty()
+        && model.bushes.is_empty()
+        && model.shears.is_empty()
+    {
         return err("Keine Elemente im MYSTRAN-Deck.");
     }
     model.compact();
@@ -1398,9 +1761,10 @@ fn bind_prop(
     })?;
     let elset = format!("PID{pid}");
     let membrane = match prop {
-        Prop::Shell { mid, t, membrane } => {
+        Prop::Shell { mid, t, membrane, bend } => {
             bind_mat(model, mats, &elset, *mid, wtmass)?;
             model.elset_thickness.insert(elset.clone(), *t);
+            model.elset_bend.insert(elset.clone(), *bend);
             *membrane
         }
         Prop::Solid { mid } => {
@@ -1412,7 +1776,7 @@ fn bind_prop(
             model.elset_thickness.insert(elset.clone(), *area);
             false
         }
-        Prop::Bar { .. } => false,
+        Prop::Bar { .. } | Prop::Bush { .. } | Prop::Shear { .. } => false,
     };
     Ok((elset, membrane))
 }
@@ -1461,6 +1825,23 @@ fn apply_g0(model: &mut Model, elements: &[BuiltEl]) -> Result<()> {
             sec.n1 = n1;
         }
     }
+    for el in elements {
+        let BuiltEl::Bar(b) = el else { continue };
+        let elset = format!("PID{}E{}", b.pid, b.eid);
+        let ia = model.node_index(b.ga)?;
+        let ib = model.node_index(b.gb)?;
+        let xa = model.coords[ia];
+        let xb = model.coords[ib];
+        let Some(sec) = model.elset_beam.get_mut(&elset) else {
+            continue;
+        };
+        let tvec = sub3(xb, xa);
+        let tn = norm3(tvec).max(1e-30);
+        let t = scale3(tvec, 1.0 / tn);
+        let n2 = cross3(t, sec.n1);
+        sec.off_a = offset_in_basic(&b.offt, 1, b.off_a, t, sec.n1, n2);
+        sec.off_b = offset_in_basic(&b.offt, 2, b.off_b, t, sec.n1, n2);
+    }
     Ok(())
 }
 
@@ -1469,19 +1850,330 @@ fn g0_flag(n1: &[f64; 3]) -> bool {
 }
 
 fn bar_orient_fields(d: &[String]) -> [f64; 3] {
-    let f5 = field(d, 4);
-    let f6 = field(d, 5);
-    let f7 = field(d, 6);
-    if !f5.is_empty() && f6.is_empty() && f7.is_empty() {
-        if let Ok(g0) = parse_i32(f5) {
+    bar_orient_fields_at(d, 4)
+}
+
+fn bar_orient_fields_at(d: &[String], i: usize) -> [f64; 3] {
+    let f0 = field(d, i);
+    let f1 = field(d, i + 1);
+    let f2 = field(d, i + 2);
+    if !f0.is_empty() && f1.is_empty() && f2.is_empty() {
+        if let Ok(g0) = parse_i32(f0) {
             return [g0 as f64, 0.0, f64::NAN];
         }
     }
     [
-        field_f64(d, 4).unwrap_or(0.0),
-        field_f64(d, 5).unwrap_or(0.0),
-        field_f64(d, 6).unwrap_or(0.0),
+        field_f64(d, i).unwrap_or(0.0),
+        field_f64(d, i + 1).unwrap_or(0.0),
+        field_f64(d, i + 2).unwrap_or(0.0),
     ]
+}
+
+fn cbar_tail_base(d: &[String]) -> (String, usize) {
+    cbar_tail_base_at(d, 7)
+}
+
+fn cbar_tail_base_at(d: &[String], offt_i: usize) -> (String, usize) {
+    let f = field(d, offt_i);
+    if f.chars().any(|c| c.is_ascii_alphabetic()) {
+        (f.to_ascii_uppercase(), offt_i + 1)
+    } else if f.is_empty() {
+        ("GGG".into(), offt_i + 1)
+    } else {
+        ("GGG".into(), offt_i)
+    }
+}
+
+fn vec3_at(d: &[String], i: usize) -> [f64; 3] {
+    [
+        field_f64(d, i).unwrap_or(0.0),
+        field_f64(d, i + 1).unwrap_or(0.0),
+        field_f64(d, i + 2).unwrap_or(0.0),
+    ]
+}
+
+fn pin_bits(s: &str) -> u8 {
+    let mut b = 0u8;
+    for c in s.chars() {
+        if let Some(d) = c.to_digit(10) {
+            if (1..=6).contains(&d) {
+                b |= 1 << (d - 1);
+            }
+        }
+    }
+    b
+}
+
+fn offset_in_basic(
+    offt: &str,
+    which: usize,
+    w: [f64; 3],
+    t: [f64; 3],
+    n1: [f64; 3],
+    n2: [f64; 3],
+) -> [f64; 3] {
+    let ch = offt.chars().nth(which).unwrap_or('G');
+    if ch == 'E' {
+        [
+            w[0] * t[0] + w[1] * n1[0] + w[2] * n2[0],
+            w[0] * t[1] + w[1] * n1[1] + w[2] * n2[1],
+            w[0] * t[2] + w[1] * n1[2] + w[2] * n2[2],
+        ]
+    } else {
+        w
+    }
+}
+
+fn push_grid_link(
+    out: &mut Vec<DofLink>,
+    d: &[String],
+    ig: usize,
+    ic: usize,
+    jg: usize,
+    jc: usize,
+    k: f64,
+    six: &mut bool,
+) {
+    let g1 = field_i32(d, ig).unwrap_or(0);
+    if g1 == 0 {
+        return;
+    }
+    let c1 = field_i32(d, ic).unwrap_or(1).clamp(1, 6) as usize - 1;
+    let g2 = field_i32(d, jg).filter(|g| *g != 0);
+    let c2 = field_i32(d, jc).unwrap_or(1).clamp(1, 6) as usize - 1;
+    if c1 >= 3 || (g2.is_some() && c2 >= 3) {
+        *six = true;
+    }
+    out.push(DofLink {
+        n1: g1,
+        c1,
+        n2: g2,
+        c2,
+        k,
+    });
+}
+
+fn ensure_grid(model: &mut Model, id: i32) {
+    if model.node_ids.contains(&id) {
+        return;
+    }
+    model.id_to_index.insert(id, model.coords.len());
+    model.node_ids.push(id);
+    model.coords.push([0.0, 0.0, 0.0]);
+}
+
+fn bush_axes(b: &BushRaw, model: &Model, cords: &HashMap<i32, Cord>) -> Result<([f64; 3], [f64; 3])> {
+    if b.cid != 0 {
+        let c = cords.get(&b.cid).ok_or_else(|| {
+            crate::error::FemError(format!("CBUSH: Koordinatensystem {} fehlt.", b.cid))
+        })?;
+        return Ok((c.ex, c.ey));
+    }
+    let ia = model.node_index(b.n1)?;
+    let pa = model.coords[ia];
+    let pb = if let Some(n2) = b.n2 {
+        Some(model.coords[model.node_index(n2)?])
+    } else {
+        None
+    };
+    let along = pb.map(|p| sub3(p, pa)).unwrap_or([0.0; 3]);
+    let separated = norm3(along) > 1e-10;
+    let orient = if g0_flag(&b.nvec) {
+        let g0 = b.nvec[0] as i32;
+        sub3(model.coords[model.node_index(g0)?], pa)
+    } else {
+        b.nvec
+    };
+    if separated {
+        Ok((along, orient))
+    } else if norm3(orient) > 1e-12 {
+        Ok((orient, [0.0, 1.0, 0.0]))
+    } else {
+        Ok(([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]))
+    }
+}
+
+fn pbarl_known(s: &str) -> bool {
+    matches!(
+        s,
+        "ROD" | "TUBE"
+            | "TUBE2"
+            | "BAR"
+            | "BOX"
+            | "BOX1"
+            | "I"
+            | "I1"
+            | "T"
+            | "T1"
+            | "T2"
+            | "L"
+            | "CHAN"
+            | "CHAN1"
+            | "CHAN2"
+            | "H"
+            | "HAT"
+            | "HEXA"
+            | "CROSS"
+            | "Z"
+    )
+}
+
+fn pbarl_type_dims(d: &[String]) -> (String, Vec<f64>) {
+    let f2 = field(d, 2).to_ascii_uppercase();
+    let f3 = field(d, 3).to_ascii_uppercase();
+    let (typ, skip) = if pbarl_known(&f3) || !pbarl_known(&f2) {
+        (f3, 4usize)
+    } else {
+        (f2, 3usize)
+    };
+    let dims = d
+        .iter()
+        .skip(skip)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| parse_f64(s).ok())
+        .collect();
+    (typ, dims)
+}
+
+fn section_library(typ: &str, dims: &[f64]) -> Option<(f64, f64, f64, f64, f64)> {
+    let pi = std::f64::consts::PI;
+    let need = |n: usize| -> Option<()> { if dims.len() >= n { Some(()) } else { None } };
+    // Returns PBAR (A, I1, I2, I12, J). I1 bends along the orientation (element y = DIM1),
+    // I2 bends along element z (DIM2). That is the swap of the pyNastran I1/I2 labels.
+    let pack = |a: f64, i_py1: f64, i_py2: f64, i12: f64, j: f64| {
+        Some((a, i_py2, i_py1, i12, j.max(1e-30)))
+    };
+    match typ {
+        "ROD" => {
+            need(1)?;
+            let r = dims[0];
+            let a = pi * r * r;
+            let i = pi * r.powi(4) / 4.0;
+            pack(a, i, i, 0.0, 2.0 * i)
+        }
+        "TUBE" => {
+            need(2)?;
+            let (ro, ri) = if dims[0] >= dims[1] {
+                (dims[0], dims[1])
+            } else {
+                (dims[1], dims[0])
+            };
+            let a = pi * (ro * ro - ri * ri);
+            let i = pi / 4.0 * (ro.powi(4) - ri.powi(4));
+            pack(a, i, i, 0.0, 2.0 * i)
+        }
+        "TUBE2" => {
+            need(2)?;
+            let ro = dims[0];
+            let ri = (ro - dims[1]).max(0.0);
+            let a = pi * (ro * ro - ri * ri);
+            let i = pi / 4.0 * (ro.powi(4) - ri.powi(4));
+            pack(a, i, i, 0.0, 2.0 * i)
+        }
+        "BAR" => {
+            need(2)?;
+            let b = dims[0];
+            let h = dims[1];
+            let sec = BeamSection::rect(b, h, [0.0, 1.0, 0.0]);
+            pack(sec.area, sec.i11, sec.i22, 0.0, sec.jtor)
+        }
+        "BOX" => {
+            need(4)?;
+            let b = dims[0];
+            let h = dims[1];
+            let t1 = dims[2];
+            let t2 = dims[3];
+            if b <= 2.0 * t2 || h <= 2.0 * t1 {
+                return None;
+            }
+            let bi = b - 2.0 * t2;
+            let hi = h - 2.0 * t1;
+            let a = b * h - bi * hi;
+            let i1 = (b * h.powi(3) - bi * hi.powi(3)) / 12.0;
+            let i2 = (h * b.powi(3) - hi * bi.powi(3)) / 12.0;
+            let am_b = (b - t2).max(0.0);
+            let am_h = (h - t1).max(0.0);
+            let den = b * t2 + h * t1 - t2 * t2 - t1 * t1;
+            let j = if den.abs() < 1e-18 {
+                1e-30
+            } else {
+                2.0 * t1 * t2 * am_b * am_b * am_h * am_h / den
+            };
+            pack(a, i1, i2, 0.0, j.abs())
+        }
+        "I" => {
+            need(6)?;
+            let h = dims[0];
+            let a = dims[1];
+            let b = dims[2];
+            let tw = dims[3];
+            let ta = dims[4];
+            let tb = dims[5];
+            let hw = h - (ta + tb);
+            if hw <= 0.0 {
+                return None;
+            }
+            let hf = h - 0.5 * (ta + tb);
+            let area = ta * a + hw * tw + b * tb;
+            if area <= 0.0 {
+                return None;
+            }
+            let yc = (0.5 * hw * (hw + ta) * tw + hf * tb * b) / area;
+            let i1 = (h * tb.powi(3) + a * ta.powi(3) + tw * hw.powi(3)) / 12.0
+                + (hf - yc).powi(2) * b * tb
+                + yc.powi(2) * a * ta
+                + (yc - 0.5 * (hw + ta)).powi(2) * hw * tw;
+            let i2 = (b.powi(3) * tb + ta * a.powi(3) + hw * tw.powi(3)) / 12.0;
+            let j = (a * ta.powi(3) + b * tb.powi(3) + hw * tw.powi(3)) / 3.0;
+            pack(area, i1, i2, 0.0, j)
+        }
+        "T" => {
+            need(4)?;
+            let d = dims[0];
+            let tf = dims[2];
+            let tw = dims[3];
+            let hw = dims[1] - tf;
+            if hw <= 0.0 {
+                return None;
+            }
+            let area = d * tf + hw * tw;
+            let yna = hw * tw * (hw + tf) / (2.0 * area.max(1e-30));
+            let i1 = (d * tf.powi(3) + tw * hw.powi(3)) / 12.0
+                + hw * tw * (yna + 0.5 * (hw + tf)).powi(2)
+                + d * tf * yna.powi(2);
+            let i2 = (tf * d.powi(3) + hw * tw.powi(3)) / 12.0;
+            let j = (d * tf.powi(3) + hw * tw.powi(3)) / 3.0;
+            pack(area, i1, i2, 0.0, j)
+        }
+        "L" => {
+            need(4)?;
+            let t1 = dims[2];
+            let t2 = dims[3];
+            let bb = dims[0] - 0.5 * t2;
+            let h = dims[1] - 0.5 * t1;
+            let h2 = dims[1] - t1;
+            let b1 = dims[0] - t2;
+            if h2 <= 0.0 || b1 <= 0.0 {
+                return None;
+            }
+            let area = (bb + 0.5 * t2) * t1 + h2 * t2;
+            let yc = t2 * h2 * (h2 + t1) / (2.0 * area.max(1e-30));
+            let zc = t1 * b1 * (b1 + t2) / (2.0 * area.max(1e-30));
+            let i1 = t1.powi(3) * (bb + 0.5 * t2) / 12.0
+                + t1 * (bb + 0.5 * t2) * yc.powi(2)
+                + t2 * h.powi(3) / 12.0
+                + h2 * t2 * (0.5 * (h2 + t1) - yc).powi(2);
+            let i2 = t2.powi(3) * h2 / 12.0
+                + t1 * (bb + 0.5 * t2).powi(3) / 12.0
+                + t1 * (bb + 0.5 * t2) * (0.5 * b1 - zc).powi(2);
+            let i12 = zc * yc * t1 * t2
+                - b1 * t1 * yc * (0.5 * (b1 + t2) - zc)
+                - h2 * t2 * zc * (0.5 * (h2 + t1) - yc);
+            let j = (dims[0] * t1.powi(3) + dims[1] * t2.powi(3)) / 3.0;
+            pack(area, i1, i2, i12, j)
+        }
+        _ => None,
+    }
 }
 
 fn beam_n1(xa: [f64; 3], xb: [f64; 3], v: [f64; 3]) -> [f64; 3] {
@@ -1495,34 +2187,6 @@ fn beam_n1(xa: [f64; 3], xb: [f64; 3], v: [f64; 3]) -> [f64; 3] {
     }
     let yn = norm3(y).max(1e-30);
     scale3(y, 1.0 / yn)
-}
-
-fn section_library(typ: &str, dims: &[f64]) -> Option<(f64, f64, f64, f64)> {
-    let pi = std::f64::consts::PI;
-    match typ {
-        "ROD" => {
-            let r = *dims.first()?;
-            let a = pi * r * r;
-            let i = pi * r.powi(4) / 4.0;
-            Some((a, i, i, 2.0 * i))
-        }
-        "TUBE" => {
-            let d1 = *dims.first()?;
-            let d2 = *dims.get(1)?;
-            let (ro, ri) = if d1 >= d2 { (d1, d2) } else { (d2, d1) };
-            let a = pi * (ro * ro - ri * ri);
-            let i = pi / 4.0 * (ro.powi(4) - ri.powi(4));
-            Some((a, i, i, 2.0 * i))
-        }
-        "BAR" => {
-            let w = *dims.first()?;
-            let h = *dims.get(1)?;
-            let sec = BeamSection::rect(w, h, [0.0, 1.0, 0.0]);
-            // i22 of rect is Nastran I1 (bending in the y-plane), i11 is I2.
-            Some((sec.area, sec.i22, sec.i11, sec.jtor))
-        }
-        _ => None,
-    }
 }
 
 fn resolve_cord_points(raw: &[RawCord]) -> Result<HashMap<i32, Cord>> {
@@ -2129,12 +2793,11 @@ ENDDATA
         let m = parse_with_base(deck, None).unwrap();
         let out = solve(m).unwrap();
         let i = out.model.node_index(11).unwrap();
-        // B31 is a one-point Timoshenko beam. With a huge shear factor the
-        // tip stiffness is 4EI/L³ (not the cubic 3EI/L³). I2=20 bends about
-        // local y, so Fz moves uz; I1=1e9 keeps uy at rest.
+        // CBAR is the Hermitian beam. With a huge shear factor the tip
+        // stiffness is 3EI/L³. I2=20 bends about local y, so Fz moves uz.
         let uz = out.u[i][2];
         let uy = out.u[i][1];
-        let expect = 5.0 * 100f64.powi(3) / (4.0 * 1000.0 * 20.0);
+        let expect = 5.0 * 100f64.powi(3) / (3.0 * 1000.0 * 20.0);
         assert!(uy.abs() < 1e-6, "uy={uy}");
         assert!(
             (uz - expect).abs() / expect < 1e-6,
@@ -2478,5 +3141,291 @@ ENDDATA
         let deck = "SOL 1\nCEND\nBEGIN BULK\nASET,1,123\nGRID,1,,0,0,0\nENDDATA\n";
         let err = parse_with_base(deck, None).unwrap_err();
         assert!(err.to_string().contains("ASET"), "{err}");
+    }
+
+    #[test]
+    fn cbar_root_pin_is_a_mechanism() {
+        let deck = r#"
+SOL 1
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,11,,0.,0.,0.
+GRID,12,,100.,0.,0.
+CBAR,1,10,11,12,0.,1.,0.
+,0,5
+PBAR,10,1,1.0,1.0+9,20.,1.0
+MAT1,1,1000.,,0.0
+SPC,1,12,123456,0.
+FORCE,2,11,,1.,0.,0.,1.
+LOAD,1,1.0,5.0,2
+ENDDATA
+"#;
+        let err = match solve(parse_with_base(deck, None).unwrap()) {
+            Err(e) => e,
+            Ok(out) => panic!("Stift am Einspannende muss ein Mechanismus sein, solver={}", out.solver),
+        };
+        assert!(err.to_string().contains("singul"), "{err}");
+    }
+
+    #[test]
+    fn cbar_axial_offset_shortens_the_member() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,10.,0.,0.
+CBAR,1,1,1,2,0.,1.,0.
+,0,0,0.,0.,0.,-2.,0.,0.
+PBAR,1,1,2.0,1.0,1.0,1.0
+MAT1,1,100.,,0.
+SPC,1,1,123456,0.
+SPC,1,2,23456,0.
+FORCE,1,2,,16.,1.,0.,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let ux = out.u[out.model.node_index(2).unwrap()][0];
+        let expect = 16.0 * 8.0 / (100.0 * 2.0);
+        assert!((ux - expect).abs() < 1e-8, "ux={ux} expect={expect}");
+    }
+
+    #[test]
+    fn baror_fills_a_blank_orientation() {
+        let deck = r#"
+SOL 1
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+BAROR,,,0.,1.,0.
+GRID,11,,0.,0.,0.
+GRID,12,,100.,0.,0.
+CBAR,1,10,11,12
+PBAR,10,1,1.0,1.0+9,20.,1.0
+MAT1,1,1000.,,0.0
+SPC,1,12,123456,0.
+FORCE,2,11,,1.,0.,0.,1.
+LOAD,1,1.0,5.0,2
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let uz = out.u[out.model.node_index(11).unwrap()][2];
+        let expect = 5.0 * 100f64.powi(3) / (3.0 * 1000.0 * 20.0);
+        assert!((uz - expect).abs() / expect < 1e-6, "uz={uz}");
+    }
+
+    #[test]
+    fn pbarl_bar_matches_its_pbar_fields() {
+        let deck = r#"
+SOL 1
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,100.,0.,0.
+CBAR,1,10,1,2,0.,1.,0.
+PBARL,10,1,,BAR,2.,4.
+MAT1,1,1000.,,0.
+SPC,1,2,123456,0.
+FORCE,1,1,,1.,0.,0.,1.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let uz = out.u[out.model.node_index(1).unwrap()][2];
+        let i2 = 2.0 * 4.0f64.powi(3) / 12.0;
+        let expect = 100f64.powi(3) / (3.0 * 1000.0 * i2);
+        assert!((uz - expect).abs() / expect < 1e-6, "uz={uz} expect={expect}");
+    }
+
+    #[test]
+    fn celas_is_force_over_stiffness() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+CELAS2,1,100.,1,1
+SPC,1,1,23456,0.
+FORCE,1,1,,5.,1.,0.,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let ux = out.u[out.model.node_index(1).unwrap()][0];
+        assert!((ux - 0.05).abs() < 1e-10, "ux={ux}");
+
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+PELAS,5,80.
+CELAS1,1,5,1,1
+SPC,1,1,23456,0.
+FORCE,1,1,,8.,1.,0.,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let ux = out.u[out.model.node_index(1).unwrap()][0];
+        assert!((ux - 0.1).abs() < 1e-10, "celas1 ux={ux}");
+    }
+
+    #[test]
+    fn cmass_celas_sdof_frequency() {
+        let deck = r#"
+SOL 103
+CEND
+METHOD = 1
+SPC = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+CELAS2,1,100.,1,1
+CMASS2,1,4.,1,1
+SPC,1,1,23456,0.
+EIGRL,1,,,1
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let f = out.frequencies[0];
+        let expect = 5.0 / (2.0 * std::f64::consts::PI);
+        assert!((f - expect).abs() / expect < 1e-4, "f={f} expect={expect}");
+    }
+
+    #[test]
+    fn conm2_offset_makes_a_gravity_moment() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+CONM2,1,1,0,2.0,0.5,0.,0.
+SPC,1,1,123456,0.
+GRAV,1,0,10.,0.,0.,-1.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let i = out.model.node_index(1).unwrap();
+        assert!((out.rf[i][2] - 20.0).abs() < 1e-8, "fz {}", out.rf[i][2]);
+        assert!((out.rm[i][1] + 10.0).abs() < 1e-8, "my {}", out.rm[i][1]);
+    }
+
+    #[test]
+    fn pshell_twelve_i_scales_bending() {
+        let plate = |bi: &str| {
+            format!(
+                r#"
+SOL 101
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,10.,0.,0.
+GRID,3,,10.,1.,0.
+GRID,4,,0.,1.,0.
+CQUAD4,1,1,1,2,3,4
+PSHELL,1,1,0.05,1,{bi}
+MAT1,1,1.0+7,,0.
+SPC,1,1,123456,0.
+SPC,1,4,123456,0.
+FORCE,1,2,,0.5,0.,0.,1.
+FORCE,1,3,,0.5,0.,0.,1.
+ENDDATA
+"#
+            )
+        };
+        let u = |bi: &str| {
+            let out = solve(parse_with_base(&plate(bi), None).unwrap()).unwrap();
+            out.u[out.model.node_index(2).unwrap()][2]
+        };
+        let u1 = u("1.");
+        let u8 = u("8.");
+        let ratio = u1 / u8;
+        assert!((ratio - 8.0).abs() / 8.0 < 0.02, "u1={u1} u8={u8} ratio={ratio}");
+    }
+
+    #[test]
+    fn cquad4k_is_the_same_shell() {
+        let deck = r#"
+SOL 1
+CEND
+BEGIN BULK
+GRID,1,,0,0,0
+GRID,2,,1,0,0
+GRID,3,,1,1,0
+GRID,4,,0,1,0
+CQUAD4K,1,1,1,2,3,4
+CTRIA3K,2,1,1,2,3
+PSHELL,1,1,0.1,1
+MAT1,1,1.0+6,,0.3
+ENDDATA
+"#;
+        let m = parse_with_base(deck, None).unwrap();
+        assert_eq!(m.elements[0].kind, ElemKind::Shell4);
+        assert_eq!(m.elements[1].kind, ElemKind::Shell3);
+    }
+
+    #[test]
+    fn cshear_rectangle_is_gtab() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,2.,0.,0.
+GRID,3,,2.,1.,0.
+GRID,4,,0.,1.,0.
+CSHEAR,1,1,1,2,3,4
+PSHEAR,1,1,0.1
+MAT1,1,100.,,0.
+SPC,1,1,123,0.
+SPC,1,2,123,0.
+SPC,1,3,23,0.
+SPC,1,4,23,0.
+FORCE,1,3,,1.,1.,0.,0.
+FORCE,1,4,,1.,1.,0.,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let ux = out.u[out.model.node_index(3).unwrap()][0];
+        let g = 50.0;
+        let k = g * 0.1 * 2.0 / 1.0;
+        let expect = 2.0 / k;
+        assert!((ux - expect).abs() / expect < 1e-6, "ux={ux} expect={expect}");
+    }
+
+    #[test]
+    fn cbush_axial_is_force_over_k() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,1.,0.,0.
+PBUSH,1,K,1000.
+CBUSH,1,1,1,2
+SPC,1,1,123456,0.
+SPC,1,2,23456,0.
+FORCE,1,2,,5.,1.,0.,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let ux = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((ux - 0.005).abs() < 1e-10, "ux={ux}");
     }
 }

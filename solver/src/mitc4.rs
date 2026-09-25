@@ -296,6 +296,18 @@ pub fn s4_ke(
     h: f64,
     directors: Option<&[[f64; 3]]>,
 ) -> Result<(Vec<f64>, f64)> {
+    s4_ke_bi(xyz, e, nu, h, directors, 1.0)
+}
+
+/// `bi` is Nastran PSHELL 12I/T³. 1 recovers the homogeneous plate.
+pub fn s4_ke_bi(
+    xyz: &[[f64; 3]],
+    e: f64,
+    nu: f64,
+    h: f64,
+    directors: Option<&[[f64; 3]]>,
+    bi: f64,
+) -> Result<(Vec<f64>, f64)> {
     if xyz.len() < 4 {
         return err("S4: zu wenige Knoten.");
     }
@@ -312,7 +324,7 @@ pub fn s4_ke(
     let mut db = [0.0; 9];
     for i in 0..9 {
         dm[i] = dm0[i] * h;
-        db[i] = dm0[i] * h * h * h / 12.0;
+        db[i] = dm0[i] * h * h * h / 12.0 * bi;
     }
     let gsh = e / (2.0 * (1.0 + nu)) * K_SHEAR * h;
     let ds = [gsh, 0.0, 0.0, gsh];

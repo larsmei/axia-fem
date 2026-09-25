@@ -217,6 +217,204 @@ pub fn stiffness(
     Ok((ke, length))
 }
 
+/// Nastran CBAR: Hermitian bending with Timoshenko shear, exact on a straight member.
+/// Local DOF per node: u_t, u_n1, u_n2, θ_t, θ_n1, θ_n2.
+pub fn cbar_stiffness(
+    xyz: &[[f64; 3]],
+    e: f64,
+    nu: f64,
+    sec: &BeamSection,
+) -> Result<(Vec<f64>, f64)> {
+    if xyz.len() < 2 {
+        return err("CBAR braucht zwei Knoten.");
+    }
+    if e <= 0.0 {
+        return err(format!("Ungültiger E-Modul E={e}"));
+    }
+    let p0 = [
+        xyz[0][0] + sec.off_a[0],
+        xyz[0][1] + sec.off_a[1],
+        xyz[0][2] + sec.off_a[2],
+    ];
+    let p1 = [
+        xyz[1][0] + sec.off_b[0],
+        xyz[1][1] + sec.off_b[1],
+        xyz[1][2] + sec.off_b[2],
+    ];
+    let dx = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+    let len = norm(dx);
+    if len < 1e-18 {
+        return err("CBAR hat die Länge null.");
+    }
+    let t = scale(dx, 1.0 / len);
+    let (n1, n2) = orthonormal(t, sec.n1)?;
+    let g = e / (2.0 * (1.0 + nu).max(1e-6));
+    let mut kl = [0.0; 144];
+    let ea = e * sec.area / len;
+    kl[0 * 12 + 0] = ea;
+    kl[0 * 12 + 6] = -ea;
+    kl[6 * 12 + 0] = -ea;
+    kl[6 * 12 + 6] = ea;
+    let gj = g * sec.jtor / len;
+    kl[3 * 12 + 3] = gj;
+    kl[3 * 12 + 9] = -gj;
+    kl[9 * 12 + 3] = -gj;
+    kl[9 * 12 + 9] = gj;
+    // Deflection along n1, rotation about n2 (θ_euler = θ_n2), inertia I22, shear k11.
+    add_timoshenko(&mut kl, e * sec.i22, sec.k11 * g * sec.area, len, [1, 5, 7, 11], [1.0, 1.0, 1.0, 1.0]);
+    // Deflection along n2, θ_euler = −θ_n1, inertia I11, shear k22.
+    add_timoshenko(&mut kl, e * sec.i11, sec.k22 * g * sec.area, len, [2, 4, 8, 10], [1.0, -1.0, 1.0, -1.0]);
+    condense_releases(&mut kl, sec.rel_a, sec.rel_b);
+    let mut r = [[0.0; 3]; 3];
+    for i in 0..3 {
+        r[i][0] = t[i];
+        r[i][1] = n1[i];
+        r[i][2] = n2[i];
+    }
+    let mut ke = vec![0.0; 144];
+    // u_g = R u_l, K_g = T K_l T^T
+    let mut tl = [0.0; 144];
+    for node in 0..2 {
+        for blk in 0..2 {
+            let o = node * 6 + blk * 3;
+            for i in 0..3 {
+                for j in 0..3 {
+                    tl[(o + i) * 12 + (o + j)] = r[i][j];
+                }
+            }
+        }
+    }
+    let mut tmp = [0.0; 144];
+    for i in 0..12 {
+        for j in 0..12 {
+            let mut s = 0.0;
+            for k in 0..12 {
+                s += tl[i * 12 + k] * kl[k * 12 + j];
+            }
+            tmp[i * 12 + j] = s;
+        }
+    }
+    for i in 0..12 {
+        for j in 0..12 {
+            let mut s = 0.0;
+            for k in 0..12 {
+                s += tmp[i * 12 + k] * tl[j * 12 + k];
+            }
+            ke[i * 12 + j] = s;
+        }
+    }
+    apply_end_offsets(&mut ke, sec.off_a, sec.off_b);
+    Ok((ke, len))
+}
+
+fn add_timoshenko(kl: &mut [f64], ei: f64, ks: f64, len: f64, idx: [usize; 4], sign: [f64; 4]) {
+    if ei.abs() < 1e-30 {
+        return;
+    }
+    let phi = if ks.abs() < 1e-18 {
+        0.0
+    } else {
+        (12.0 * ei / (ks * len * len)).clamp(0.0, 1.0e6)
+    };
+    let c = ei / ((1.0 + phi) * len * len * len);
+    let l = len;
+    let kel = [
+        [12.0 * c, 6.0 * l * c, -12.0 * c, 6.0 * l * c],
+        [6.0 * l * c, (4.0 + phi) * l * l * c, -6.0 * l * c, (2.0 - phi) * l * l * c],
+        [-12.0 * c, -6.0 * l * c, 12.0 * c, -6.0 * l * c],
+        [6.0 * l * c, (2.0 - phi) * l * l * c, -6.0 * l * c, (4.0 + phi) * l * l * c],
+    ];
+    for a in 0..4 {
+        for b in 0..4 {
+            let v = sign[a] * kel[a][b] * sign[b];
+            kl[idx[a] * 12 + idx[b]] += v;
+        }
+    }
+}
+
+fn condense_releases(kl: &mut [f64], rel_a: u8, rel_b: u8) {
+    let mut free = Vec::new();
+    for i in 0..6 {
+        if rel_a & (1 << i) != 0 {
+            free.push(i);
+        }
+        if rel_b & (1 << i) != 0 {
+            free.push(6 + i);
+        }
+    }
+    for &s in &free {
+        let kss = kl[s * 12 + s];
+        if kss.abs() < 1e-18 {
+            continue;
+        }
+        for i in 0..12 {
+            if i == s {
+                continue;
+            }
+            let kis = kl[i * 12 + s];
+            if kis.abs() == 0.0 {
+                continue;
+            }
+            for j in 0..12 {
+                if j == s {
+                    continue;
+                }
+                kl[i * 12 + j] -= kis * kl[s * 12 + j] / kss;
+            }
+        }
+        for i in 0..12 {
+            kl[i * 12 + s] = 0.0;
+            kl[s * 12 + i] = 0.0;
+        }
+    }
+}
+
+fn apply_end_offsets(ke: &mut [f64], wa: [f64; 3], wb: [f64; 3]) {
+    let za = wa[0].abs() + wa[1].abs() + wa[2].abs();
+    let zb = wb[0].abs() + wb[1].abs() + wb[2].abs();
+    if za + zb < 1e-18 {
+        return;
+    }
+    // u_beam = u_grid + θ_grid × w, θ_beam = θ_grid. w points from the grid to the beam end.
+    let mut t = [0.0; 144];
+    for n in 0..2 {
+        let w = if n == 0 { wa } else { wb };
+        let o = n * 6;
+        for i in 0..6 {
+            t[(o + i) * 12 + (o + i)] = 1.0;
+        }
+        let s = [
+            [0.0, w[2], -w[1]],
+            [-w[2], 0.0, w[0]],
+            [w[1], -w[0], 0.0],
+        ];
+        for i in 0..3 {
+            for j in 0..3 {
+                t[(o + i) * 12 + (o + 3 + j)] = s[i][j];
+            }
+        }
+    }
+    let mut tmp = [0.0; 144];
+    for i in 0..12 {
+        for j in 0..12 {
+            let mut s = 0.0;
+            for k in 0..12 {
+                s += ke[i * 12 + k] * t[k * 12 + j];
+            }
+            tmp[i * 12 + j] = s;
+        }
+    }
+    for i in 0..12 {
+        for j in 0..12 {
+            let mut s = 0.0;
+            for k in 0..12 {
+                s += t[k * 12 + i] * tmp[k * 12 + j];
+            }
+            ke[i * 12 + j] = s;
+        }
+    }
+}
+
 fn strains_at(
     kind: ElemKind,
     xyz: &[[f64; 3]],
