@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{err, Result};
 use crate::mystran_manifest::{self, CardStatus};
 use crate::model::{
-    AnalysisStep, BeamSection, Boundary, Cload, Dload, ElemKind, Element, Material, Model,
+    AnalysisStep, BeamSection, Boundary, Cload, Dload, ElemKind, Element, Equation, Material, Model,
     Procedure, RigidBody,
 };
 
@@ -82,10 +82,10 @@ pub fn is_mystran_deck(text: &str) -> bool {
 
 /// Bulk names the parser accepts. Kept in lockstep with the manifest.
 pub const RECOGNIZED_BULK: &[&str] = &[
-    "PARAM", "DEBUG", "EIGRL", "GRDSET", "GRID", "CORD2R", "MAT1", "PSHELL", "PSOLID", "PROD",
-    "PBAR", "PBARL", "CROD", "CONROD", "CBAR", "CBEAM", "CQUAD4", "CTRIA3", "CTETRA", "CHEXA",
-    "CPENTA", "CELAS2", "CONM2", "RBE2", "FORCE", "MOMENT", "PLOAD2", "PLOAD4", "GRAV", "LOAD",
-    "SPC", "SPC1", "SPCADD",
+    "PARAM", "DEBUG", "EIGRL", "GRDSET", "GRID", "CORD1C", "CORD1R", "CORD1S", "CORD2C", "CORD2R",
+    "CORD2S", "MAT1", "PSHELL", "PSOLID", "PROD", "PBAR", "PBARL", "CROD", "CONROD", "CBAR", "CBEAM",
+    "CQUAD4", "CTRIA3", "CTETRA", "CHEXA", "CPENTA", "CELAS2", "CONM2", "RBE2", "RBE3", "FORCE",
+    "MOMENT", "PLOAD2", "PLOAD4", "GRAV", "LOAD", "SPC", "SPC1", "SPCADD", "MPC", "MPCADD",
 ];
 
 pub fn parse_with_base(text: &str, base: Option<&Path>) -> Result<Model> {
@@ -233,6 +233,7 @@ struct CaseCtrl {
     spc: Option<i32>,
     load: Option<i32>,
     method: Option<i32>,
+    mpc: Option<i32>,
 }
 
 fn parse_cases(lines: &[String]) -> Vec<CaseCtrl> {
@@ -243,6 +244,7 @@ fn parse_cases(lines: &[String]) -> Vec<CaseCtrl> {
         spc: None,
         load: None,
         method: None,
+        mpc: None,
     };
     let mut cases: Vec<CaseCtrl> = Vec::new();
     let mut cur: Option<CaseCtrl> = None;
@@ -263,6 +265,7 @@ fn parse_cases(lines: &[String]) -> Vec<CaseCtrl> {
             "SPC" => dest.spc = v.split_whitespace().next().and_then(|s| parse_i32(s).ok()),
             "LOAD" => dest.load = v.split_whitespace().next().and_then(|s| parse_i32(s).ok()),
             "METHOD" => dest.method = v.split_whitespace().next().and_then(|s| parse_i32(s).ok()),
+            "MPC" => dest.mpc = v.split_whitespace().next().and_then(|s| parse_i32(s).ok()),
             // ECHO=SORT/UNSORT/NONE/BOTH changes the punch, not the solution.
             "ECHO" | "DISPLACEMENT" | "SPCFORCES" | "STRESS" | "FORCE" | "ELFORCE" | "OLOAD"
             | "STRAIN" | "MAXLINES" => {}
@@ -480,6 +483,33 @@ struct Cord {
     ex: [f64; 3],
     ey: [f64; 3],
     ez: [f64; 3],
+    kind: CKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CKind {
+    R,
+    C,
+    S,
+}
+
+#[derive(Clone)]
+enum RawCord {
+    Points {
+        cid: i32,
+        rid: i32,
+        kind: CKind,
+        a: [f64; 3],
+        b: [f64; 3],
+        c: [f64; 3],
+    },
+    Grids {
+        cid: i32,
+        kind: CKind,
+        g1: i32,
+        g2: i32,
+        g3: i32,
+    },
 }
 
 struct SpcTerm {
@@ -497,7 +527,7 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     let mut grd_cp: Option<i32> = None;
     let mut grd_cd: Option<i32> = None;
     let mut grd_ps = String::new();
-    let mut cords_raw: Vec<(i32, i32, [f64; 3], [f64; 3], [f64; 3])> = Vec::new();
+    let mut cords_raw: Vec<RawCord> = Vec::new();
     let mut mats: HashMap<i32, MatRec> = HashMap::new();
     let mut props: HashMap<i32, Prop> = HashMap::new();
     let mut elements: Vec<BuiltEl> = Vec::new();
@@ -507,7 +537,9 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     let mut rbes: Vec<(i32, i32, Vec<usize>, Vec<i32>)> = Vec::new();
     let mut unknown: HashMap<String, usize> = HashMap::new();
     let mut warn_theta = false;
-    let mut warn_cd = false;
+    let mut mpcs: HashMap<i32, Vec<Vec<(i32, usize, f64)>>> = HashMap::new();
+    let mut mpcadd: HashMap<i32, Vec<i32>> = HashMap::new();
+    let mut rbe3s: Vec<(i32, i32, Vec<usize>, Vec<(f64, Vec<usize>, Vec<i32>)>)> = Vec::new();
 
     for c in cards {
         let name = c.first().map(|s| s.as_str()).unwrap_or("");
@@ -549,18 +581,36 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 } else {
                     field(d, 6).to_string()
                 };
-                if cd != 0 {
-                    warn_cd = true;
-                }
                 grids.push((id, cp, x, cd, ps));
             }
-            "CORD2R" => {
-                let cid = req_i32(d, 0, "CORD2R")?;
-                let rid = field_i32(d, 1).unwrap_or(0);
-                let a = pt(d, 2)?;
-                let b = pt(d, 5)?;
-                let cpt = pt(d, 8)?;
-                cords_raw.push((cid, rid, a, b, cpt));
+            "CORD2R" | "CORD2C" | "CORD2S" => {
+                let kind = match name {
+                    "CORD2C" => CKind::C,
+                    "CORD2S" => CKind::S,
+                    _ => CKind::R,
+                };
+                cords_raw.push(RawCord::Points {
+                    cid: req_i32(d, 0, name)?,
+                    rid: field_i32(d, 1).unwrap_or(0),
+                    kind,
+                    a: pt(d, 2)?,
+                    b: pt(d, 5)?,
+                    c: pt(d, 8)?,
+                });
+            }
+            "CORD1R" | "CORD1C" | "CORD1S" => {
+                let kind = match name {
+                    "CORD1C" => CKind::C,
+                    "CORD1S" => CKind::S,
+                    _ => CKind::R,
+                };
+                cords_raw.push(RawCord::Grids {
+                    cid: req_i32(d, 0, name)?,
+                    kind,
+                    g1: req_i32(d, 1, name)?,
+                    g2: req_i32(d, 2, name)?,
+                    g3: req_i32(d, 3, name)?,
+                });
             }
             "MAT1" => {
                 let mid = req_i32(d, 0, "MAT1")?;
@@ -801,6 +851,79 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 let dep = expand_ids(&d[3..]);
                 rbes.push((eid, gn, cm, dep));
             }
+            "RBE3" => {
+                let eid = req_i32(d, 0, "RBE3")?;
+                let gref = req_i32(d, 1, "RBE3 REF")?;
+                let refc = comps(field(d, 2));
+                let mut groups = Vec::new();
+                let mut i = 3;
+                while i < d.len() {
+                    if d[i].is_empty() {
+                        i += 1;
+                        continue;
+                    }
+                    let wt = parse_f64(&d[i]).unwrap_or(0.0);
+                    let cm = comps(field(d, i + 1));
+                    i += 2;
+                    let mut gs = Vec::new();
+                    while i < d.len() {
+                        if d[i].is_empty() {
+                            i += 1;
+                            continue;
+                        }
+                        let next_is_wt = i + 1 < d.len()
+                            && d[i].contains(['.', '+', 'E', 'e'])
+                            && comps(field(d, i + 1)).iter().all(|c| (1..=6).contains(c))
+                            && !field(d, i + 1).is_empty();
+                        if next_is_wt && !gs.is_empty() {
+                            break;
+                        }
+                        if let Ok(g) = parse_i32(&d[i]) {
+                            gs.push(g);
+                        }
+                        i += 1;
+                    }
+                    if !gs.is_empty() {
+                        groups.push((wt, cm, gs));
+                    }
+                }
+                rbe3s.push((eid, gref, refc, groups));
+            }
+            "MPC" => {
+                let sid = req_i32(d, 0, "MPC")?;
+                let mut i = 1;
+                let mut terms = Vec::new();
+                while i + 2 < d.len() {
+                    if d[i].is_empty() {
+                        i += 1;
+                        continue;
+                    }
+                    let g = match parse_i32(&d[i]) {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    let c = comps(field(d, i + 1));
+                    let a = parse_f64(&d[i + 2]).unwrap_or(0.0);
+                    let dof = c.first().copied().unwrap_or(1);
+                    if (1..=6).contains(&dof) {
+                        terms.push((g, dof - 1, a));
+                    }
+                    i += 3;
+                }
+                if terms.len() >= 2 {
+                    mpcs.entry(sid).or_default().push(terms);
+                }
+            }
+            "MPCADD" => {
+                let sid = req_i32(d, 0, "MPCADD")?;
+                let ids: Vec<i32> = d
+                    .iter()
+                    .skip(1)
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| parse_i32(s).ok())
+                    .collect();
+                mpcadd.insert(sid, ids);
+            }
             "FORCE" | "MOMENT" => {
                 let sid = req_i32(d, 0, name)?;
                 let g = req_i32(d, 1, name)?;
@@ -917,9 +1040,6 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     if warn_theta {
         model.warn("CQUAD4-Materialwinkel wird ignoriert (isotropes MITC4).");
     }
-    if warn_cd {
-        model.warn("GRID CD≠0 wird ignoriert — Freiheitsgrade bleiben im Basissystem.");
-    }
     if !unknown.is_empty() {
         let mut names: Vec<_> = unknown.keys().cloned().collect();
         names.sort();
@@ -929,28 +1049,65 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
         ));
     }
 
-    let cords = resolve_cords(&cords_raw)?;
+    let mut cords = resolve_cord_points(&cords_raw)?;
+    let mut pending: Vec<_> = grids.clone();
     let mut seen_n = HashSet::new();
-    for (id, cp, x, _cd, ps) in &grids {
-        if !seen_n.insert(*id) {
-            return err(format!("GRID {id} doppelt."));
+    let mut guard = 0;
+    while !pending.is_empty() {
+        guard += 1;
+        if guard > pending.len() + cords_raw.len() + 2 {
+            return err(format!(
+                "GRID/CORD1 nicht auflösbar (System oder Bezugsgitter fehlt): GRID {}",
+                pending[0].0
+            ));
         }
-        let xb = if *cp == 0 {
-            *x
-        } else {
-            let c = cords.get(cp).ok_or_else(|| {
-                crate::error::FemError(format!("GRID {id}: Koordinatensystem {cp} fehlt."))
-            })?;
-            [
-                c.o[0] + x[0] * c.ex[0] + x[1] * c.ey[0] + x[2] * c.ez[0],
-                c.o[1] + x[0] * c.ex[1] + x[1] * c.ey[1] + x[2] * c.ez[1],
-                c.o[2] + x[0] * c.ex[2] + x[1] * c.ey[2] + x[2] * c.ez[2],
-            ]
-        };
-        model.id_to_index.insert(*id, model.coords.len());
-        model.node_ids.push(*id);
-        model.coords.push(xb);
-        let _ = ps;
+        let before = pending.len();
+        let mut later = Vec::new();
+        for (id, cp, x, cd, ps) in pending.drain(..) {
+            if !seen_n.insert(id) {
+                return err(format!("GRID {id} doppelt."));
+            }
+            if cp != 0 && !cords.contains_key(&cp) {
+                seen_n.remove(&id);
+                later.push((id, cp, x, cd, ps));
+                continue;
+            }
+            let xb = if cp == 0 {
+                x
+            } else {
+                point_in_cord(&cords[&cp], x)
+            };
+            model.id_to_index.insert(id, model.coords.len());
+            model.node_ids.push(id);
+            model.coords.push(xb);
+            let _ = ps;
+        }
+        let mut cord_later = Vec::new();
+        for raw in cords_raw.iter() {
+            let RawCord::Grids { cid, kind, g1, g2, g3 } = raw else {
+                continue;
+            };
+            if cords.contains_key(cid) {
+                continue;
+            }
+            let (Some(a), Some(b), Some(c)) = (
+                grid_xyz_opt(&model, *g1),
+                grid_xyz_opt(&model, *g2),
+                grid_xyz_opt(&model, *g3),
+            ) else {
+                cord_later.push(*cid);
+                continue;
+            };
+            cords.insert(*cid, triad(a, b, c, *kind));
+        }
+        pending = later;
+        if pending.len() == before && !cord_later.is_empty() && pending.iter().all(|g| cord_later.contains(&g.1))
+        {
+            return err(format!("CORD1 {} hängt an einem fehlenden Gitter.", cord_later[0]));
+        }
+        if pending.len() == before {
+            return err(format!("GRID {}: Koordinatensystem {} fehlt.", pending[0].0, pending[0].1));
+        }
     }
 
     let mut elem_kind: HashMap<i32, ElemKind> = HashMap::new();
@@ -1050,18 +1207,42 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     let mut slave_nodes = HashSet::new();
     let mut ref_nodes = HashSet::new();
     for (eid, gn, cm, dep) in &rbes {
-        if !cm.contains(&1) || !cm.contains(&2) || !cm.contains(&3) {
-            model.warn(format!("RBE2 {eid}: nur CM mit 123 (und optional 456) wird als Starrkörper übernommen."));
-        }
         let name = format!("RBE{eid}");
         model.nsets.insert(name.clone(), dep.clone());
         model.rigid_bodies.push(RigidBody {
             nset: name,
             ref_node: *gn,
             rot_node: None,
+            dofs: cm.clone(),
         });
         ref_nodes.insert(*gn);
         slave_nodes.extend(dep.iter().copied());
+    }
+    for (eid, gref, refc, groups) in &rbe3s {
+        if refc.is_empty() {
+            return err(format!("RBE3 {eid} ohne REFC."));
+        }
+        for &comp in refc {
+            let mut wsum = 0.0;
+            for (w, cm, gs) in groups {
+                if cm.contains(&comp) {
+                    wsum += *w * gs.len() as f64;
+                }
+            }
+            if wsum.abs() < 1e-30 {
+                return err(format!("RBE3 {eid}: Komponente {comp} ohne unabhängige Gitter."));
+            }
+            let mut terms = vec![(*gref, comp - 1, 1.0)];
+            for (w, cm, gs) in groups {
+                if !cm.contains(&comp) {
+                    continue;
+                }
+                for g in gs {
+                    terms.push((*g, comp - 1, -w / wsum));
+                }
+            }
+            model.equations.push(Equation { terms, rhs: 0.0 });
+        }
     }
 
     let pin_rot: Vec<i32> = if rbes.is_empty() {
@@ -1136,6 +1317,11 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 push_spc(&mut model, &mut have, t.g, &t.comps, t.val);
             }
         }
+        if let Some(sid) = case.mpc {
+            for terms in resolve_mpc(sid, &mpcs, &mpcadd)? {
+                model.equations.push(Equation { terms, rhs: 0.0 });
+            }
+        }
         if let Some(sid) = case.load {
             apply_load(
                 &mut model,
@@ -1180,6 +1366,22 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
         return err("Keine Elemente im MYSTRAN-Deck.");
     }
     model.compact();
+    let mut any_cd = false;
+    for (id, _cp, _x, cd, _ps) in &grids {
+        if *cd == 0 {
+            continue;
+        }
+        let c = cords.get(cd).ok_or_else(|| {
+            crate::error::FemError(format!("GRID {id}: Verschiebungssystem {cd} fehlt."))
+        })?;
+        let p = model.coords[model.node_index(*id)?];
+        model.node_transform.insert(*id, disp_matrix(c, p));
+        any_cd = true;
+    }
+    if any_cd {
+        model.output_basic = false;
+        model.cloads_basic = true;
+    }
     let _ = nmodes;
     Ok(model)
 }
@@ -1323,52 +1525,160 @@ fn section_library(typ: &str, dims: &[f64]) -> Option<(f64, f64, f64, f64)> {
     }
 }
 
-fn resolve_cords(raw: &[(i32, i32, [f64; 3], [f64; 3], [f64; 3])]) -> Result<HashMap<i32, Cord>> {
+fn resolve_cord_points(raw: &[RawCord]) -> Result<HashMap<i32, Cord>> {
+    let mut left: Vec<RawCord> = raw
+        .iter()
+        .filter(|c| matches!(c, RawCord::Points { .. }))
+        .cloned()
+        .collect();
     let mut out = HashMap::new();
-    let mut left: Vec<_> = raw.to_vec();
     while !left.is_empty() {
         let n0 = left.len();
-        left.retain(|(cid, rid, a, b, c)| {
-            if *rid != 0 && !out.contains_key(rid) {
-                return true;
-            }
-            let (a, b, c) = if *rid == 0 {
-                (*a, *b, *c)
-            } else {
-                let p = &out[rid];
-                (to_basic(p, *a), to_basic(p, *b), to_basic(p, *c))
+        let mut next = Vec::new();
+        for cord in left {
+            let RawCord::Points { cid, rid, kind, a, b, c } = cord else {
+                continue;
             };
-            let ez = unit(sub3(b, a));
-            let ac = sub3(c, a);
-            let ex = unit(sub3(ac, scale3(ez, dot3(ac, ez))));
-            let ey = cross3(ez, ex);
-            out.insert(
-                *cid,
-                Cord {
-                    o: a,
-                    ex,
-                    ey,
-                    ez,
-                },
-            );
-            false
-        });
-        if left.len() == n0 {
-            return err(format!(
-                "CORD2R {} hängt an einem fehlenden System.",
-                left[0].0
-            ));
+            if rid != 0 && !out.contains_key(&rid) {
+                next.push(RawCord::Points { cid, rid, kind, a, b, c });
+                continue;
+            }
+            let (a, b, c) = if rid == 0 {
+                (a, b, c)
+            } else {
+                let p = &out[&rid];
+                (point_in_cord(p, a), point_in_cord(p, b), point_in_cord(p, c))
+            };
+            out.insert(cid, triad(a, b, c, kind));
         }
+        if next.len() == n0 {
+            let cid = match &next[0] {
+                RawCord::Points { cid, .. } => *cid,
+                RawCord::Grids { cid, .. } => *cid,
+            };
+            return err(format!("CORD2 {cid} hängt an einem fehlenden System."));
+        }
+        left = next;
     }
     Ok(out)
 }
 
-fn to_basic(c: &Cord, x: [f64; 3]) -> [f64; 3] {
+fn triad(a: [f64; 3], b: [f64; 3], c: [f64; 3], kind: CKind) -> Cord {
+    let ez = unit(sub3(b, a));
+    let ac = sub3(c, a);
+    let ex = unit(sub3(ac, scale3(ez, dot3(ac, ez))));
+    let ey = cross3(ez, ex);
+    Cord { o: a, ex, ey, ez, kind }
+}
+
+fn rect_of(kind: CKind, x: [f64; 3]) -> [f64; 3] {
+    match kind {
+        CKind::R => x,
+        CKind::C => {
+            let th = x[1].to_radians();
+            [x[0] * th.cos(), x[0] * th.sin(), x[2]]
+        }
+        CKind::S => {
+            let th = x[1].to_radians();
+            let ph = x[2].to_radians();
+            [
+                x[0] * ph.sin() * th.cos(),
+                x[0] * ph.sin() * th.sin(),
+                x[0] * ph.cos(),
+            ]
+        }
+    }
+}
+
+fn point_in_cord(c: &Cord, x: [f64; 3]) -> [f64; 3] {
+    let x = rect_of(c.kind, x);
     [
         c.o[0] + x[0] * c.ex[0] + x[1] * c.ey[0] + x[2] * c.ez[0],
         c.o[1] + x[0] * c.ex[1] + x[1] * c.ey[1] + x[2] * c.ez[1],
         c.o[2] + x[0] * c.ex[2] + x[1] * c.ey[2] + x[2] * c.ez[2],
     ]
+}
+
+/// Columns are the displacement axes. `r[p][q]` so u_basic = R u_local.
+fn disp_matrix(c: &Cord, at: [f64; 3]) -> [[f64; 3]; 3] {
+    let (ex, ey, ez) = match c.kind {
+        CKind::R => (c.ex, c.ey, c.ez),
+        CKind::C => {
+            let d = sub3(at, c.o);
+            let xl = dot3(d, c.ex);
+            let yl = dot3(d, c.ey);
+            let r = (xl * xl + yl * yl).sqrt();
+            if r < 1e-12 {
+                (c.ex, c.ey, c.ez)
+            } else {
+                let er = add3(scale3(c.ex, xl / r), scale3(c.ey, yl / r));
+                let et = add3(scale3(c.ex, -yl / r), scale3(c.ey, xl / r));
+                (er, et, c.ez)
+            }
+        }
+        CKind::S => {
+            let d = sub3(at, c.o);
+            let xl = dot3(d, c.ex);
+            let yl = dot3(d, c.ey);
+            let zl = dot3(d, c.ez);
+            let rho = (xl * xl + yl * yl + zl * zl).sqrt();
+            let r = (xl * xl + yl * yl).sqrt();
+            if rho < 1e-12 {
+                (c.ex, c.ey, c.ez)
+            } else {
+                let er = add3(add3(scale3(c.ex, xl / rho), scale3(c.ey, yl / rho)), scale3(c.ez, zl / rho));
+                let et = if r < 1e-12 {
+                    c.ey
+                } else {
+                    add3(scale3(c.ex, -yl / r), scale3(c.ey, xl / r))
+                };
+                let ep = cross3(er, et);
+                (er, et, ep)
+            }
+        }
+    };
+    [
+        [ex[0], ey[0], ez[0]],
+        [ex[1], ey[1], ez[1]],
+        [ex[2], ey[2], ez[2]],
+    ]
+}
+
+fn grid_xyz_opt(model: &Model, id: i32) -> Option<[f64; 3]> {
+    model.id_to_index.get(&id).map(|&i| model.coords[i])
+}
+
+fn resolve_mpc(
+    sid: i32,
+    mpc: &HashMap<i32, Vec<Vec<(i32, usize, f64)>>>,
+    add: &HashMap<i32, Vec<i32>>,
+) -> Result<Vec<Vec<(i32, usize, f64)>>> {
+    fn walk(
+        sid: i32,
+        mpc: &HashMap<i32, Vec<Vec<(i32, usize, f64)>>>,
+        add: &HashMap<i32, Vec<i32>>,
+        seen: &mut HashSet<i32>,
+        out: &mut Vec<Vec<(i32, usize, f64)>>,
+    ) -> Result<()> {
+        if !seen.insert(sid) {
+            return err(format!("MPCADD {sid} ist zyklisch."));
+        }
+        if let Some(ids) = add.get(&sid) {
+            for s in ids {
+                walk(*s, mpc, add, seen, out)?;
+            }
+        }
+        if let Some(eqs) = mpc.get(&sid) {
+            out.extend(eqs.iter().cloned());
+        }
+        if !add.contains_key(&sid) && !mpc.contains_key(&sid) {
+            return err(format!("MPC-Set {sid} fehlt."));
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(sid, mpc, add, &mut HashSet::new(), &mut out)?;
+    Ok(out)
 }
 
 fn resolve_spc<'a>(
@@ -1428,7 +1738,8 @@ fn apply_load(
                 }
             }
             LoadItem::Force { g, cid, f, moment } => {
-                let v = scale3(vec_in_basic(*cid, *f, cords)?, scale);
+                let at = grid_xyz_opt(model, *g).unwrap_or([0.0; 3]);
+                let v = scale3(vec_in_basic(*cid, *f, cords, at)?, scale);
                 let base = if *moment { 3 } else { 0 };
                 for k in 0..3 {
                     if v[k].abs() > 0.0 {
@@ -1442,7 +1753,8 @@ fn apply_load(
                 }
             }
             LoadItem::Grav { cid, a } => {
-                let v = scale3(vec_in_basic(*cid, *a, cords)?, scale);
+                let at = cords.get(cid).map(|c| c.o).unwrap_or([0.0; 3]);
+                let v = scale3(vec_in_basic(*cid, *a, cords, at)?, scale);
                 let mag = norm3(v);
                 if mag > 0.0 {
                     model.dloads.push(Dload::Grav { mag, dir: v });
@@ -1555,17 +1867,18 @@ fn solid_face(kind: ElemKind, nodes: &[i32], g1: i32, g34: i32) -> Option<i32> {
     }
 }
 
-fn vec_in_basic(cid: i32, v: [f64; 3], cords: &HashMap<i32, Cord>) -> Result<[f64; 3]> {
+fn vec_in_basic(cid: i32, v: [f64; 3], cords: &HashMap<i32, Cord>, at: [f64; 3]) -> Result<[f64; 3]> {
     if cid == 0 {
         return Ok(v);
     }
     let c = cords.get(&cid).ok_or_else(|| {
         crate::error::FemError(format!("Koordinatensystem {cid} fehlt."))
     })?;
+    let r = disp_matrix(c, at);
     Ok([
-        v[0] * c.ex[0] + v[1] * c.ey[0] + v[2] * c.ez[0],
-        v[0] * c.ex[1] + v[1] * c.ey[1] + v[2] * c.ez[1],
-        v[0] * c.ex[2] + v[1] * c.ey[2] + v[2] * c.ez[2],
+        r[0][0] * v[0] + r[0][1] * v[1] + r[0][2] * v[2],
+        r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2],
+        r[2][0] * v[0] + r[2][1] * v[1] + r[2][2] * v[2],
     ])
 }
 
@@ -1714,6 +2027,9 @@ fn parse_i32(s: &str) -> Result<i32> {
 
 fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -2004,5 +2320,163 @@ ENDDATA
         let expect = 1000.0 * 10.0 / (210000.0 * 2.0);
         assert!((ux - expect).abs() < 1e-8);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cylindrical_and_spherical_points() {
+        let deck = r#"
+SOL 1
+CEND
+SPC = 1
+BEGIN BULK
+CORD2C,1,0, 0.,0.,0., 0.,0.,1., 1.,0.,0.
+CORD2S,2,0, 0.,0.,0., 0.,0.,1., 1.,0.,0.
+GRID,1,1, 2.,90.,3.
+GRID,2,2, 2.,0.,90.
+GRID,3,2, 2.,90.,90.
+GRID,4,2, 2.,0.,0.
+CROD,1,1,1,2
+PROD,1,1,1.
+MAT1,1,1.,,0.
+SPC1,1,123456,1
+ENDDATA
+"#;
+        let m = parse_with_base(deck, None).unwrap();
+        let p = |id| m.coords[m.node_index(id).unwrap()];
+        let a = p(1);
+        assert!((a[0] - 0.0).abs() < 1e-8 && (a[1] - 2.0).abs() < 1e-8 && (a[2] - 3.0).abs() < 1e-8, "{a:?}");
+        let b = p(2);
+        assert!((b[0] - 2.0).abs() < 1e-8 && b[1].abs() < 1e-8 && b[2].abs() < 1e-8, "{b:?}");
+        let c = p(3);
+        assert!(c[0].abs() < 1e-8 && (c[1] - 2.0).abs() < 1e-8 && c[2].abs() < 1e-8, "{c:?}");
+        let d = p(4);
+        assert!(d[0].abs() < 1e-8 && d[1].abs() < 1e-8 && (d[2] - 2.0).abs() < 1e-8, "{d:?}");
+    }
+
+    #[test]
+    fn grid_cd_reports_displacement_in_that_system() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+CORD2R,10,0, 0.,0.,0., 0.,0.,1., 0.,1.,0.
+GRID,1,,0.,0.,0.
+GRID,2,,10.,0.,0.,10
+CROD,1,1,1,2
+PROD,1,1,2.0
+MAT1,1,210000.,,0.3
+SPC1,1,123456,1
+FORCE,1,2,,1000.,1.,0.,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let u = out.u[out.model.node_index(2).unwrap()];
+        let expect = 1000.0 * 10.0 / (210000.0 * 2.0);
+        assert!(u[0].abs() < 1e-8, "T1 {}", u[0]);
+        assert!((u[1] + expect).abs() < 1e-8, "T2 {} expect -{expect}", u[1]);
+        assert!(!out.model.output_basic);
+    }
+
+    #[test]
+    fn mpc_ties_the_loaded_node_to_the_rod() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+MPC = 2
+LOAD = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,10.,0.,0.
+GRID,3,,20.,0.,0.
+CROD,1,1,1,2
+PROD,1,1,2.
+MAT1,1,210000.,,0.
+SPC1,1,123456,1
+SPC1,1,23456,2
+SPC1,1,23456,3
+MPC,2,3,1,1.,2,1,-1.
+FORCE,1,3,,1000.,1.,0.,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        let u3 = out.u[out.model.node_index(3).unwrap()][0];
+        let expect = 1000.0 * 10.0 / (210000.0 * 2.0);
+        assert!((u2 - expect).abs() < 1e-6, "u2={u2}");
+        assert!((u3 - u2).abs() < 1e-8, "u3={u3} u2={u2}");
+    }
+
+    #[test]
+    fn rbe2_lever_and_partial_cm() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,1.,0.,0.
+RBE2,1,1,123456,2
+CONM2,9,1,,1.
+SPC1,1,123,1
+SPC,1,1,4,0.
+SPC,1,1,5,0.
+SPC,1,1,6,0.1
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()];
+        assert!(u2[0].abs() < 1e-6, "ux {}", u2[0]);
+        assert!((u2[1] - 0.1).abs() < 1e-5, "uy {} lever", u2[1]);
+
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,1.,0.,0.
+RBE2,1,1,1,2
+CONM2,9,1,,1.
+SPC,1,1,1,0.2
+SPC1,1,23456,1
+SPC1,1,23456,2
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()];
+        assert!((u2[0] - 0.2).abs() < 1e-8, "ux {}", u2[0]);
+        assert!(u2[1].abs() < 1e-8, "uy {}", u2[1]);
+    }
+
+    #[test]
+    fn rbe3_averages_two_grids() {
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+BEGIN BULK
+GRID,1,,0.,0.,0.
+GRID,2,,1.,0.,0.
+GRID,3,,2.,0.,0.
+RBE3,1,2,1,1.,1,1,3
+CONM2,9,1,,1.
+SPC,1,1,1,0.2
+SPC,1,3,1,0.6
+SPC1,1,23456,1,THRU,3
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let u2 = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((u2 - 0.4).abs() < 1e-6, "u2={u2}");
+    }
+
+    #[test]
+    fn aset_is_rejected() {
+        let deck = "SOL 1\nCEND\nBEGIN BULK\nASET,1,123\nGRID,1,,0,0,0\nENDDATA\n";
+        let err = parse_with_base(deck, None).unwrap_err();
+        assert!(err.to_string().contains("ASET"), "{err}");
     }
 }

@@ -699,6 +699,8 @@ pub struct RigidBody {
     pub nset: String,
     pub ref_node: i32,
     pub rot_node: Option<i32>,
+    /// Nastran CM, 1-based. Empty means all six components.
+    pub dofs: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -966,6 +968,10 @@ pub struct Model {
     pub independent_steps: bool,
     /// Parallel to `steps` when `independent_steps` is set (SUBCASE label or title).
     pub case_labels: Vec<String>,
+    /// When false, displacements stay in `node_transform` axes (GRID CD). CalculiX stays true.
+    pub output_basic: bool,
+    /// MYSTRAN stores FORCE in the basic system. CalculiX CLOAD is already in the nodal system.
+    pub cloads_basic: bool,
 }
 
 impl Model {
@@ -1030,6 +1036,8 @@ impl Model {
             amplitude_step: false,
             independent_steps: false,
             case_labels: Vec::new(),
+            output_basic: true,
+            cloads_basic: false,
         }
     }
 

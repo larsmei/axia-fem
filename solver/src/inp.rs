@@ -1626,6 +1626,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                     nset: nset.to_ascii_uppercase(),
                     ref_node,
                     rot_node,
+                    dofs: Vec::new(),
                 });
             }
             "*COUPLING" => {

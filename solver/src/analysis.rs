@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 use crate::beam;
@@ -840,8 +840,10 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     for d in 0..ndof {
         rf_full[d] = ku[d] - f_full[d];
     }
-    constraint::dofs_to_global(&mut u_full, ndn, &model.node_ids, &model.node_transform);
-    constraint::dofs_to_global(&mut rf_full, ndn, &model.node_ids, &model.node_transform);
+    if model.output_basic {
+        constraint::dofs_to_global(&mut u_full, ndn, &model.node_ids, &model.node_transform);
+        constraint::dofs_to_global(&mut rf_full, ndn, &model.node_ids, &model.node_transform);
+    }
 
     let mut u = vec![[0.0; 3]; nnode];
     let mut ur = vec![[0.0; 3]; nnode];
@@ -1360,6 +1362,13 @@ fn pin_unused_dofs(
             if let Ok(i) = model.node_index(rb.ref_node) {
                 struct_node[i] = true;
             }
+            if let Ok(ids) = model.expand_nset(&rb.nset) {
+                for id in ids {
+                    if let Ok(i) = model.node_index(id) {
+                        struct_node[i] = true;
+                    }
+                }
+            }
         }
         for c in &model.couplings {
             if c.kinematic {
@@ -1391,6 +1400,20 @@ fn pin_unused_dofs(
         for rb in &model.rigid_bodies {
             if let Ok(i) = model.node_index(rb.ref_node) {
                 keep[i] = true;
+            }
+            if let Ok(ids) = model.expand_nset(&rb.nset) {
+                for id in ids {
+                    if let Ok(i) = model.node_index(id) {
+                        keep[i] = true;
+                    }
+                }
+            }
+        }
+        for eq in &model.equations {
+            for &(id, _, _) in &eq.terms {
+                if let Ok(i) = model.node_index(id) {
+                    keep[i] = true;
+                }
             }
         }
         for c in &model.couplings {
@@ -1661,15 +1684,12 @@ fn add_cloads(model: &Model, ndn: usize, t: f64, f: &mut [f64]) -> Result<()> {
     let period = model.static_period.max(1e-30);
     let pretension_dummy: std::collections::HashSet<i32> =
         model.pretensions.iter().map(|p| p.dummy).collect();
+    let mut acc: HashMap<(i32, usize), f64> = HashMap::new();
     for c in &model.cloads {
         if c.dof >= ndn {
             continue;
         }
-        let ni = model.node_index(c.node)?;
         let s = if c.amplitude.is_empty() && pretension_dummy.contains(&c.node) {
-            // CalculiX *STEP,AMPLITUDE=STEP: unnamed loads (the dummy CLOAD)
-            // jump to full value at t=0+ of the first increment. Without STEP
-            // they ramp with t/period so DIRECT cutbacks reduce the bolt load.
             if model.amplitude_step {
                 1.0
             } else {
@@ -1678,7 +1698,41 @@ fn add_cloads(model: &Model, ndn: usize, t: f64, f: &mut [f64]) -> Result<()> {
         } else {
             model.amp_value(&c.amplitude, t)
         };
-        f[dof_of(ndn, ni, c.dof)] += c.mag * s;
+        *acc.entry((c.node, c.dof)).or_insert(0.0) += c.mag * s;
+    }
+    if model.cloads_basic && !model.node_transform.is_empty() {
+        let nodes: HashSet<i32> = acc.keys().map(|k| k.0).collect();
+        for n in nodes {
+            let Some(r) = model.node_transform.get(&n).copied() else {
+                continue;
+            };
+            // u_basic = R u_cd, so f_cd = R^T f_basic. r[p][q] is R.
+            for base in [0usize, 3] {
+                if base + 2 >= ndn {
+                    continue;
+                }
+                let fg = [
+                    acc.get(&(n, base)).copied().unwrap_or(0.0),
+                    acc.get(&(n, base + 1)).copied().unwrap_or(0.0),
+                    acc.get(&(n, base + 2)).copied().unwrap_or(0.0),
+                ];
+                if fg == [0.0, 0.0, 0.0] {
+                    continue;
+                }
+                for q in 0..3 {
+                    let fl = r[0][q] * fg[0] + r[1][q] * fg[1] + r[2][q] * fg[2];
+                    if fl.abs() > 0.0 {
+                        acc.insert((n, base + q), fl);
+                    } else {
+                        acc.remove(&(n, base + q));
+                    }
+                }
+            }
+        }
+    }
+    for ((node, dof), mag) in acc {
+        let ni = model.node_index(node)?;
+        f[dof_of(ndn, ni, dof)] += mag;
     }
     Ok(())
 }

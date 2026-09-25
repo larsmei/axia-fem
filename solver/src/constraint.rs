@@ -402,28 +402,37 @@ pub fn rigid_to_mpcs_at(model: &Model, ndn: usize, u: Option<&[f64]>) -> Result<
                 ufin[1] - (theta[2] * rr[0] - theta[0] * rr[2]),
                 ufin[2] - (theta[0] * rr[1] - theta[1] * rr[0]),
             ];
-            mpcs.push(Mpc {
-                slave: ndn * si,
-                masters: vec![(urx, 1.0), (thy, rr[2]), (thz, -rr[1])],
-                u0: particular[0],
-            });
-            mpcs.push(Mpc {
-                slave: ndn * si + 1,
-                masters: vec![(ury, 1.0), (thz, rr[0]), (thx, -rr[2])],
-                u0: particular[1],
-            });
-            mpcs.push(Mpc {
-                slave: ndn * si + 2,
-                masters: vec![(urz, 1.0), (thx, rr[1]), (thy, -rr[0])],
-                u0: particular[2],
-            });
+            let tied = |c: usize| rb.dofs.is_empty() || rb.dofs.contains(&c);
+            if tied(1) {
+                mpcs.push(Mpc {
+                    slave: ndn * si,
+                    masters: vec![(urx, 1.0), (thy, rr[2]), (thz, -rr[1])],
+                    u0: particular[0],
+                });
+            }
+            if tied(2) {
+                mpcs.push(Mpc {
+                    slave: ndn * si + 1,
+                    masters: vec![(ury, 1.0), (thz, rr[0]), (thx, -rr[2])],
+                    u0: particular[1],
+                });
+            }
+            if tied(3) {
+                mpcs.push(Mpc {
+                    slave: ndn * si + 2,
+                    masters: vec![(urz, 1.0), (thx, rr[1]), (thy, -rr[0])],
+                    u0: particular[2],
+                });
+            }
             if ndn >= 6 {
                 for rot in 0..3 {
-                    mpcs.push(Mpc {
-                        slave: ndn * si + 3 + rot,
-                        masters: vec![(ndn * ri + 3 + rot, 1.0)],
-                        u0: 0.0,
-                    });
+                    if tied(4 + rot) {
+                        mpcs.push(Mpc {
+                            slave: ndn * si + 3 + rot,
+                            masters: vec![(ndn * ri + 3 + rot, 1.0)],
+                            u0: 0.0,
+                        });
+                    }
                 }
             }
         }
@@ -491,15 +500,25 @@ pub fn apply_rigid_finite(model: &Model, ndn: usize, u: &mut [f64]) -> Result<()
             let xs = model.coords[si];
             let r0 = [xs[0] - xr[0], xs[1] - xr[1], xs[2] - xr[2]];
             let rr = matvec(rmat, r0);
+            let tied = |c: usize| rb.dofs.is_empty() || rb.dofs.contains(&c);
             if ndn * si + 2 < u.len() {
-                u[ndn * si] = ur[0] + rr[0] - r0[0];
-                u[ndn * si + 1] = ur[1] + rr[1] - r0[1];
-                u[ndn * si + 2] = ur[2] + rr[2] - r0[2];
+                let ug = [ur[0] + rr[0] - r0[0], ur[1] + rr[1] - r0[1], ur[2] + rr[2] - r0[2]];
+                if tied(1) {
+                    u[ndn * si] = ug[0];
+                }
+                if tied(2) {
+                    u[ndn * si + 1] = ug[1];
+                }
+                if tied(3) {
+                    u[ndn * si + 2] = ug[2];
+                }
             }
             if ndn >= 6 && ndn * si + 5 < u.len() {
-                u[ndn * si + 3] = theta[0];
-                u[ndn * si + 4] = theta[1];
-                u[ndn * si + 5] = theta[2];
+                for rot in 0..3 {
+                    if tied(4 + rot) {
+                        u[ndn * si + 3 + rot] = theta[rot];
+                    }
+                }
             }
         }
     }
