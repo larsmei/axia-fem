@@ -22,9 +22,9 @@ pub struct Card {
 }
 
 pub static CARDS: &[Card] = &[
-    card("PARAM", CardStatus::Implemented, "WTMASS"),
+    card("PARAM", CardStatus::Implemented, "WTMASS, AUTOSPC, K6ROT, GRDPNT"),
     card("DEBUG", CardStatus::Implemented, "akzeptiert, ohne Wirkung"),
-    card("EIGRL", CardStatus::Implemented, "ND Eigenwerte"),
+    card("EIGRL", CardStatus::Implemented, "alle Eigenvektoren in der F06"),
     card("GRDSET", CardStatus::Implemented, ""),
     card("GRID", CardStatus::Implemented, ""),
     card("CORD2R", CardStatus::Implemented, ""),
@@ -92,7 +92,7 @@ pub static CARDS: &[Card] = &[
     card("ASET1", CardStatus::Declined, "ASET1-Reduktion wird abgewiesen."),
     card("OMIT", CardStatus::Declined, "OMIT-Reduktion wird abgewiesen."),
     card("OMIT1", CardStatus::Declined, "OMIT1-Reduktion wird abgewiesen."),
-    card("EIGR", CardStatus::Planned, ""),
+    card("EIGR", CardStatus::Implemented, "Subspace statt Givens; NORM MAX, MASS, POINT"),
     card("MAT2", CardStatus::Implemented, "anisotrope Scheibe"),
     card("MAT8", CardStatus::Implemented, "orthotrop, Winkel wird angesetzt"),
     card("MAT9", CardStatus::Implemented, "nur lineares CHEXA"),

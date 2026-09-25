@@ -941,7 +941,22 @@ impl Procedure {
     }
 }
 
-/// Scalar spring or mass between one component and another, or ground (`n2` empty).
+/// Eigenvector scaling requested by EIGR/EIGRL NORM.
+#[derive(Clone, Copy, Debug)]
+pub enum EigNorm {
+    /// Unit generalized mass (the solver's native scaling).
+    Mass,
+    /// Largest component is 1.
+    Max,
+    /// Component `comp` (0-based) at `grid` is 1.
+    Point { grid: i32, comp: usize },
+}
+
+impl Default for EigNorm {
+    fn default() -> Self {
+        Self::Mass
+    }
+}
 #[derive(Clone, Debug)]
 pub struct DofLink {
     pub n1: i32,
@@ -1059,6 +1074,14 @@ pub struct Model {
     pub shell_law: HashMap<i32, crate::ortho::ShellLaw>,
     /// MAT9 elasticity keyed by element id. Only linear CHEXA.
     pub solid_d: HashMap<i32, [f64; 36]>,
+    /// PARAM AUTOSPC. Default on: singular DOF without stiffness are fixed.
+    pub autospc: bool,
+    /// PARAM K6ROT. Multiplies the MITC4 drilling stiffness (default 1, 0 removes it).
+    pub k6rot: f64,
+    /// PARAM GRDPNT. None means the rigid-body mass print was not requested.
+    pub grdpnt: Option<i32>,
+    /// EIGR/EIGRL NORM for the selected METHOD.
+    pub eig_norm: EigNorm,
 }
 
 impl Model {
@@ -1137,6 +1160,10 @@ impl Model {
             use_six: false,
             shell_law: HashMap::new(),
             solid_d: HashMap::new(),
+            autospc: true,
+            k6rot: 1.0,
+            grdpnt: None,
+            eig_norm: EigNorm::Mass,
         }
     }
 

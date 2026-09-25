@@ -88,7 +88,7 @@ pub const RECOGNIZED_BULK: &[&str] = &[
     "CELAS2", "CELAS3", "CELAS4", "PELAS", "CMASS1", "CMASS2", "CMASS3", "CMASS4", "PMASS", "CONM2",
     "CSHEAR", "PSHEAR", "CBUSH", "PBUSH", "RBE2", "RBE3", "FORCE", "MOMENT", "PLOAD2", "PLOAD4",
     "GRAV", "LOAD", "RFORCE", "SPC", "SPC1", "SPCADD", "MPC", "MPCADD", "TEMP", "TEMPD",
-    "TEMPP1", "TEMPRB", "MAT2", "MAT8", "MAT9", "PCOMP", "PCOMP1",
+    "TEMPP1", "TEMPRB", "MAT2", "MAT8", "MAT9", "PCOMP", "PCOMP1", "EIGR",
 ];
 
 pub fn parse_with_base(text: &str, base: Option<&Path>) -> Result<Model> {
@@ -595,7 +595,7 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     let mut model = Model::new();
     let mut wtmass = 1.0;
     let mut nmodes = 5usize;
-    let mut eig: HashMap<i32, usize> = HashMap::new();
+    let mut eig: HashMap<i32, (usize, crate::model::EigNorm)> = HashMap::new();
     let mut grids: Vec<(i32, i32, [f64; 3], i32, String)> = Vec::new();
     let mut grd_cp: Option<i32> = None;
     let mut grd_cd: Option<i32> = None;
@@ -639,17 +639,49 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
         match name {
             "PARAM" => {
                 let key = field(d, 0).to_ascii_uppercase();
-                if key == "WTMASS" {
-                    if let Some(v) = field_f64(d, 1) {
-                        wtmass = v;
+                match key.as_str() {
+                    "WTMASS" => {
+                        if let Some(v) = field_f64(d, 1) {
+                            wtmass = v;
+                        }
                     }
+                    "AUTOSPC" => {
+                        let v = field(d, 1).to_ascii_uppercase();
+                        model.autospc = !matches!(v.as_str(), "NO" | "N" | "OFF" | "0" | "0.");
+                    }
+                    "K6ROT" => {
+                        if let Some(v) = field_f64(d, 1) {
+                            model.k6rot = v;
+                        }
+                    }
+                    "GRDPNT" => {
+                        model.grdpnt = Some(field_i32(d, 1).unwrap_or(0));
+                    }
+                    _ => {}
                 }
             }
-            "DEBUG" | "EIGRL" => {
-                if name == "EIGRL" {
-                    let sid = req_i32(d, 0, "EIGRL SID")?;
-                    let nd = field_i32(d, 3).unwrap_or(5).max(1) as usize;
-                    eig.insert(sid, nd);
+            "DEBUG" | "EIGRL" | "EIGR" => {
+                if name == "EIGRL" || name == "EIGR" {
+                    let sid = req_i32(d, 0, name)?;
+                    let (nd, norm) = if name == "EIGR" {
+                        let meth = field(d, 1).to_ascii_uppercase();
+                        let ne = field_i32(d, 4).unwrap_or(0);
+                        let ndf = field_i32(d, 5).unwrap_or(0);
+                        let n = if meth == "INV" {
+                            1
+                        } else if ndf > 0 {
+                            ndf
+                        } else if ne > 0 {
+                            ne
+                        } else {
+                            5
+                        };
+                        (n as usize, eig_norm_at(d, 8))
+                    } else {
+                        let n = field_i32(d, 3).unwrap_or(5).max(1) as usize;
+                        (n, eig_norm_at(d, 7))
+                    };
+                    eig.insert(sid, (nd, norm));
                 }
             }
             "GRDSET" => {
@@ -1931,13 +1963,24 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
 
     let procedure = match sol {
         3 | 103 => {
-            let nd = cases
+            let (nd, norm) = cases
                 .first()
                 .and_then(|c| c.method)
                 .and_then(|m| eig.get(&m).copied())
-                .unwrap_or(nmodes);
+                .unwrap_or((nmodes, crate::model::EigNorm::Mass));
             nmodes = nd;
+            model.eig_norm = norm;
             Procedure::Frequency { nmodes }
+        }
+        5 | 105 => {
+            let (nd, norm) = cases
+                .first()
+                .and_then(|c| c.method)
+                .and_then(|m| eig.get(&m).copied())
+                .unwrap_or((nmodes, crate::model::EigNorm::Mass));
+            nmodes = nd;
+            model.eig_norm = norm;
+            Procedure::Buckle { nmodes }
         }
         1 | 101 | _ => {
             if !matches!(sol, 1 | 101) {
@@ -3088,6 +3131,19 @@ fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
+}
+
+fn eig_norm_at(d: &[String], at: usize) -> crate::model::EigNorm {
+    let kind = field(d, at).to_ascii_uppercase();
+    match kind.as_str() {
+        "MAX" => crate::model::EigNorm::Max,
+        "POINT" => {
+            let grid = field_i32(d, at + 1).unwrap_or(0);
+            let comp = field_i32(d, at + 2).unwrap_or(1).clamp(1, 6) as usize - 1;
+            crate::model::EigNorm::Point { grid, comp }
+        }
+        _ => crate::model::EigNorm::Mass,
+    }
 }
 
 fn mat9_fields(d: &[String]) -> ([f64; 36], f64, [f64; 6], f64) {
@@ -4320,5 +4376,97 @@ GRID,1,,0.,0.,0.\nGRID,2,,1.,0.,0.\nGRID,3,,0.,1.,0.\nGRID,4,,0.,0.,1.\n\
 CTETRA,1,1,1,2,3,4\nPSOLID,1,1\nMAT9,1,2.\nENDDATA\n";
         let err = parse_with_base(bad, None).unwrap_err();
         assert!(err.to_string().contains("MAT9"), "{err}");
+    }
+
+    #[test]
+    fn eigrl_writes_every_mode() {
+        let deck = "\
+SOL 103\nCEND\nMETHOD = 1\nSPC = 1\nBEGIN BULK\n\
+GRID,1,,0.,0.,0.\nGRID,2,,1.,0.,0.\n\
+CELAS2,1,1.,1,1\nCELAS2,2,1.,1,1,2,1\n\
+CMASS2,1,1.,1,1\nCMASS2,2,1.,2,1\n\
+SPC1,1,23456,1,2\nEIGRL,1,,,2\nENDDATA\n";
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        assert_eq!(out.frequencies.len(), 2, "{:?}", out.frequencies);
+        let l1 = (3.0 - 5.0_f64.sqrt()) / 2.0;
+        let l2 = (3.0 + 5.0_f64.sqrt()) / 2.0;
+        let f = |l: f64| l.sqrt() / (2.0 * std::f64::consts::PI);
+        assert!((out.frequencies[0] - f(l1)).abs() / f(l1) < 1e-3, "{:?}", out.frequencies);
+        assert!((out.frequencies[1] - f(l2)).abs() / f(l2) < 1e-3, "{:?}", out.frequencies);
+        let text = crate::f06::write_f06(&out.model, &out);
+        assert!(text.contains("MODE 1"), "{text}");
+        assert!(text.contains("MODE 2"), "{text}");
+        assert!(!text.contains("further modes"), "{text}");
+    }
+
+    #[test]
+    fn autospc_no_leaves_a_loose_grid_singular() {
+        let loose = "\
+SOL 101\nCEND\nSPC = 1\nLOAD = 1\nBEGIN BULK\n\
+PARAM,AUTOSPC,NO\n\
+GRID,1,,0.,0.,0.\nGRID,2,,1.,0.,0.\nGRID,3,,2.,0.,0.\n\
+CROD,1,1,1,2\nPROD,1,1,1.\nMAT1,1,1.,,,0.\n\
+SPC1,1,123456,1\nFORCE,1,2,0,1.,1.,0.,0.\nFORCE,1,3,0,1.,0.,1.,0.\nENDDATA\n";
+        let err = match solve(parse_with_base(loose, None).unwrap()) {
+            Err(e) => e,
+            Ok(_) => panic!("loses Gitter hätte singulär sein müssen"),
+        };
+        assert!(err.to_string().contains("singul"), "{err}");
+        let held = loose.replace("PARAM,AUTOSPC,NO\n", "");
+        solve(parse_with_base(&held, None).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn k6rot_scales_mitc4_drilling() {
+        let deck = |k: &str| {
+            format!(
+                "SOL 101\nCEND\nSPC = 1\nLOAD = 1\nBEGIN BULK\n\
+PARAM,K6ROT,{k}\n\
+GRID,1,,0.,0.,0.\nGRID,2,,1.,0.,0.\nGRID,3,,1.,1.,0.\nGRID,4,,0.,1.,0.\n\
+CQUAD4,1,1,1,2,3,4\nPSHELL,1,1,1.\nMAT1,1,1.,,,0.\n\
+SPC1,1,123456,2,THRU,4\nSPC1,1,12345,1\n\
+MOMENT,1,1,0,2.5-9,0.,0.,1.\nENDDATA\n"
+            )
+        };
+        let rot = |k: &str| {
+            let out = solve(parse_with_base(&deck(k), None).unwrap()).unwrap();
+            out.ur[out.model.node_index(1).unwrap()][2]
+        };
+        let r1 = rot("1.");
+        let r2 = rot("2.");
+        assert!((r1 - 1.0).abs() < 1e-3, "θ={r1}");
+        assert!((r2 - 0.5).abs() < 1e-3, "θ2={r2}");
+    }
+
+    #[test]
+    fn grdpnt_reports_conm2() {
+        let deck = "\
+SOL 101\nCEND\nSPC = 1\nBEGIN BULK\n\
+PARAM,GRDPNT,0\n\
+GRID,1,,1.,2.,0.\nCONM2,1,1,0,4.\nSPC,1,1,123456,0.\nENDDATA\n";
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let text = crate::f06::write_f06(&out.model, &out);
+        assert!(text.contains("GRDPNT"), "{text}");
+        assert!(text.contains("C.G."), "{text}");
+        assert!(text.contains("4.000000E+00"), "{text}");
+        assert!(text.contains("1.000000E+00"), "{text}");
+        assert!(text.contains("2.000000E+00"), "{text}");
+    }
+
+    #[test]
+    fn sol105_cbar_euler() {
+        let deck = "\
+SOL 105\nCEND\nSPC = 1\nLOAD = 1\nMETHOD = 1\nBEGIN BULK\n\
+GRID,1,,0.,0.,0.\nGRID,2,,0.25,0.,0.\nGRID,3,,0.5,0.,0.\nGRID,4,,0.75,0.,0.\nGRID,5,,1.,0.,0.\n\
+CBAR,1,1,1,2,0.,1.,0.\nCBAR,2,1,2,3,0.,1.,0.\nCBAR,3,1,3,4,0.,1.,0.\nCBAR,4,1,4,5,0.,1.,0.\n\
+PBAR,1,1,1.,1.,1.,1.\nMAT1,1,1.,,,0.\n\
+SPC1,1,123456,1\nFORCE,1,5,0,1.,-1.,0.,0.\nEIGRL,1,,,1\nENDDATA\n";
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        assert!(!out.buckles.is_empty(), "keine Beulfaktoren");
+        let euler = std::f64::consts::PI.powi(2) / 4.0;
+        let lam = out.buckles[0].abs();
+        assert!((lam - euler).abs() / euler < 0.2, "λ={lam} Euler={euler}");
+        let text = crate::f06::write_f06(&out.model, &out);
+        assert!(text.contains("FACTOR"), "{text}");
     }
 }

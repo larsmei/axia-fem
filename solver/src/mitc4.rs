@@ -310,14 +310,16 @@ pub fn s4_ke_bi(
     bi: f64,
 ) -> Result<(Vec<f64>, f64)> {
     let law = crate::ortho::isotropic_shell(e, nu, h, bi)?;
-    s4_ke_law(xyz, &law, directors)
+    s4_ke_law(xyz, &law, directors, 1.0)
 }
 
 /// MITC4 with a pre-integrated plate law (MAT1, MAT2, MAT8 or PCOMP).
+/// `k6rot` multiplies the drilling stabilizer (PARAM K6ROT, default 1).
 pub fn s4_ke_law(
     xyz: &[[f64; 3]],
     law: &ShellLaw,
     directors: Option<&[[f64; 3]]>,
+    k6rot: f64,
 ) -> Result<(Vec<f64>, f64)> {
     if xyz.len() < 4 {
         return err("S4: zu wenige Knoten.");
@@ -347,7 +349,7 @@ pub fn s4_ke_law(
     } else {
         an[0]
     };
-    let kd = DRILL * law.drill_eh * area / 4.0;
+    let kd = DRILL * k6rot * law.drill_eh * area / 4.0;
     for a in 0..4 {
         for i in 0..3 {
             for j in 0..3 {

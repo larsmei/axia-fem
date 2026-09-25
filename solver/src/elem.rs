@@ -352,6 +352,7 @@ pub fn element_ke(
     bend: f64,
     plate: Option<&crate::ortho::ShellLaw>,
     solid: Option<&[f64; 36]>,
+    k6rot: f64,
 ) -> Result<KeFe> {
     match kind {
         ElemKind::Hex8 => {
@@ -537,9 +538,10 @@ pub fn element_ke(
         }
         ElemKind::Shell4 | ElemKind::Shell4R => {
             let (ke, area) = if let Some(law) = plate {
-                crate::mitc4::s4_ke_law(xyz, law, directors)?
+                crate::mitc4::s4_ke_law(xyz, law, directors, k6rot)?
             } else {
-                crate::mitc4::s4_ke_bi(xyz, e, nu, thickness, directors, bend)?
+                let law = crate::ortho::isotropic_shell(e, nu, thickness, bend)?;
+                crate::mitc4::s4_ke_law(xyz, &law, directors, k6rot)?
             };
             let ndof = 24;
             Ok(KeFe {

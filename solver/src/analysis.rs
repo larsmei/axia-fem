@@ -42,6 +42,9 @@ pub struct SolveOutput {
     pub procedure: String,
     pub frequencies: Vec<f64>,
     pub buckles: Vec<f64>,
+    /// Eigenvectors in node order. Parallel to `frequencies` or `buckles`.
+    pub modes: Vec<Vec<[f64; 3]>>,
+    pub mode_ur: Vec<Vec<[f64; 3]>>,
     pub nsteps: usize,
     pub peeq: Vec<f64>,
     pub lambda: f64,
@@ -60,6 +63,9 @@ pub struct Subcase {
     pub stress: Vec<[f64; 6]>,
     pub von_mises: Vec<f64>,
     pub frequencies: Vec<f64>,
+    pub buckles: Vec<f64>,
+    pub modes: Vec<Vec<[f64; 3]>>,
+    pub mode_ur: Vec<Vec<[f64; 3]>>,
 }
 
 fn elem_xyz(model: &Model, nodes: &[i32]) -> Result<Vec<[f64; 3]>> {
@@ -236,6 +242,9 @@ fn solve_independent(model: Model, t0: f64) -> Result<SolveOutput> {
             stress: out.stress.clone(),
             von_mises: out.von_mises.clone(),
             frequencies: out.frequencies.clone(),
+            buckles: out.buckles.clone(),
+            modes: out.modes.clone(),
+            mode_ur: out.mode_ur.clone(),
         });
         if first.is_none() {
             first = Some(out);
@@ -427,7 +436,7 @@ fn assemble_nl_element(
         } else {
             model.thickness_for(el)
         };
-        let kef = element_ke(el.kind, xyz0, mat.e, mat.nu, th, None, None, 1.0, None, None)?;
+        let kef = element_ke(el.kind, xyz0, mat.e, mat.nu, th, None, None, 1.0, None, None, 1.0)?;
         let n = kef.ndof;
         let mut fe = vec![0.0; n];
         for i in 0..n {
@@ -599,6 +608,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
             model.bend_scale(el),
             model.shell_law.get(&el.id),
             model.solid_d.get(&el.id),
+            model.k6rot,
         )?;
         if !model.node_transform.is_empty() {
             constraint::transform_ke(
@@ -859,6 +869,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut residual = 0.0;
     let mut frequencies = Vec::new();
     let mut buckles = Vec::new();
+    let mut eig_full: Vec<Vec<f64>> = Vec::new();
 
     let mut u_full = if nfree == 0 {
         map.u0.clone()
@@ -888,12 +899,15 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         solver = format!("eigen ({} modes, {})", frequencies.len(), "subspace");
         iters = 1;
         residual = 0.0;
-        let mode0 = ev
-            .vectors
+        for v in &ev.vectors {
+            let mut full = map.reconstruct(v);
+            scale_eigenvector(&mut full, &model.eig_norm, &model, ndn);
+            eig_full.push(full);
+        }
+        eig_full
             .first()
             .cloned()
-            .unwrap_or_else(|| vec![0.0; nfree]);
-        map.reconstruct(&mode0)
+            .unwrap_or_else(|| vec![0.0; ndof])
     } else if let Procedure::Dynamic { dt, period } = model.procedure {
         let (u_dyn, name, it, res) = newmark(
             &model, ndn, ndof, nfree, &map, &trips, &c_trips, &m_full, &f_dload, dt, period,
@@ -922,6 +936,9 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     }
     if model.output_basic {
         constraint::dofs_to_global(&mut u_full, ndn, &model.node_ids, &model.node_transform);
+        for v in &mut eig_full {
+            constraint::dofs_to_global(v, ndn, &model.node_ids, &model.node_transform);
+        }
         constraint::dofs_to_global(&mut rf_full, ndn, &model.node_ids, &model.node_transform);
     }
 
@@ -1119,8 +1136,21 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                 Ok(ev) => {
                     buckles = ev.values;
                     solver = format!("buckle ({} factors)", buckles.len());
-                    if let Some(v0) = ev.vectors.first() {
-                        u_full = map.reconstruct(v0);
+                    for v in &ev.vectors {
+                        let mut full = map.reconstruct(v);
+                        scale_eigenvector(&mut full, &model.eig_norm, &model, ndn);
+                        if model.output_basic {
+                            constraint::dofs_to_global(
+                                &mut full,
+                                ndn,
+                                &model.node_ids,
+                                &model.node_transform,
+                            );
+                        }
+                        eig_full.push(full);
+                    }
+                    if let Some(v0) = eig_full.first() {
+                        u_full = v0.clone();
                     }
                 }
                 Err(e) => return Err(e),
@@ -1135,6 +1165,20 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                     }
                 }
             }
+        }
+    }
+
+    let mut modes = Vec::new();
+    let mut mode_ur = Vec::new();
+    for v in &eig_full {
+        let (mu, mur) = split_disp(v, ndn, nnode);
+        modes.push(mu);
+        mode_ur.push(mur);
+    }
+    if let Some(m0) = modes.first() {
+        u = m0.clone();
+        if let Some(r0) = mode_ur.first() {
+            ur = r0.clone();
         }
     }
 
@@ -1165,6 +1209,8 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         procedure,
         frequencies,
         buckles,
+        modes,
+        mode_ur,
         nsteps,
         lambda: 1.0,
         ninc: 1,
@@ -1656,12 +1702,57 @@ fn assemble_bush(
 }
 
 /// Pin unused rotational DOFs on continuum nodes, and uz on planar 2D/truss models.
+fn split_disp(u_full: &[f64], ndn: usize, nnode: usize) -> (Vec<[f64; 3]>, Vec<[f64; 3]>) {
+    let mut u = vec![[0.0; 3]; nnode];
+    let mut ur = vec![[0.0; 3]; nnode];
+    for ni in 0..nnode {
+        for d in 0..3.min(ndn) {
+            u[ni][d] = u_full.get(dof_of(ndn, ni, d)).copied().unwrap_or(0.0);
+        }
+        if ndn >= 6 {
+            for d in 0..3 {
+                ur[ni][d] = u_full.get(dof_of(ndn, ni, 3 + d)).copied().unwrap_or(0.0);
+            }
+        }
+    }
+    (u, ur)
+}
+
+fn scale_eigenvector(u: &mut [f64], norm: &crate::model::EigNorm, model: &Model, ndn: usize) {
+    match norm {
+        crate::model::EigNorm::Mass => {}
+        crate::model::EigNorm::Max => {
+            let m = u.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+            if m > 0.0 {
+                for v in u.iter_mut() {
+                    *v /= m;
+                }
+            }
+        }
+        crate::model::EigNorm::Point { grid, comp } => {
+            let Ok(i) = model.node_index(*grid) else {
+                return;
+            };
+            let d = dof_of(ndn, i, *comp);
+            let s = u.get(d).copied().unwrap_or(0.0);
+            if s.abs() > 1e-30 {
+                for v in u.iter_mut() {
+                    *v /= s;
+                }
+            }
+        }
+    }
+}
+
 fn pin_unused_dofs(
     model: &Model,
     ndn: usize,
     nnode: usize,
     prescribed: &mut HashMap<usize, f64>,
 ) -> Result<()> {
+    if !model.autospc {
+        return Ok(());
+    }
     if ndn == 6 {
         let mut struct_node = vec![false; nnode];
         for el in &model.elements {
@@ -2550,6 +2641,8 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
         procedure,
         frequencies: Vec::new(),
         buckles: Vec::new(),
+        modes: Vec::new(),
+        mode_ur: Vec::new(),
         nsteps,
         lambda: 1.0,
         ninc: 1,
@@ -3011,6 +3104,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
             model.bend_scale(el),
             model.shell_law.get(&el.id),
             model.solid_d.get(&el.id),
+            model.k6rot,
         )?;
         if !model.node_transform.is_empty() {
             constraint::transform_ke(
@@ -3457,6 +3551,8 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         procedure,
         frequencies: vec![],
         buckles: vec![],
+        modes: Vec::new(),
+        mode_ur: Vec::new(),
         nsteps,
         lambda: 1.0,
         ninc: ninc_run,
@@ -3642,6 +3738,8 @@ fn solve_continuum_plastic(model: Model, t0: f64) -> Result<SolveOutput> {
         procedure,
         frequencies: vec![],
         buckles: vec![],
+        modes: Vec::new(),
+        mode_ur: Vec::new(),
         nsteps,
         lambda: 1.0,
         ninc: 1,
@@ -4141,6 +4239,8 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
         procedure,
         frequencies: vec![],
         buckles: vec![],
+        modes: Vec::new(),
+        mode_ur: Vec::new(),
         nsteps,
         lambda: 1.0,
         ninc: ninc_done.max(1),
@@ -4451,6 +4551,8 @@ fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput
         procedure,
         frequencies: vec![],
         buckles: vec![],
+        modes: Vec::new(),
+        mode_ur: Vec::new(),
         nsteps,
         lambda: 1.0,
         ninc: 1,
@@ -4919,6 +5021,8 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
         procedure,
         frequencies: vec![],
         buckles: vec![],
+        modes: Vec::new(),
+        mode_ur: Vec::new(),
         nsteps,
         lambda: lam,
         ninc,
