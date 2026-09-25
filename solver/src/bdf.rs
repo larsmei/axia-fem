@@ -263,6 +263,9 @@ fn parse_cases(lines: &[String]) -> Vec<CaseCtrl> {
             "SPC" => dest.spc = v.split_whitespace().next().and_then(|s| parse_i32(s).ok()),
             "LOAD" => dest.load = v.split_whitespace().next().and_then(|s| parse_i32(s).ok()),
             "METHOD" => dest.method = v.split_whitespace().next().and_then(|s| parse_i32(s).ok()),
+            // ECHO=SORT/UNSORT/NONE/BOTH changes the punch, not the solution.
+            "ECHO" | "DISPLACEMENT" | "SPCFORCES" | "STRESS" | "FORCE" | "ELFORCE" | "OLOAD"
+            | "STRAIN" | "MAXLINES" => {}
             _ => {}
         }
     }
@@ -1915,5 +1918,91 @@ ENDDATA
                 assert!((u[k] - exp[k]).abs() <= tol, "grid {id} u{k}={} exp={}", u[k], exp[k]);
             }
         }
+    }
+
+    fn rod_ux(deck: &str) -> f64 {
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        out.u[out.model.node_index(2).unwrap()][0]
+    }
+
+    #[test]
+    fn syntax_paths_keep_the_rod_exact() {
+        let expect = 1000.0 * 10.0 / (210000.0 * 2.0);
+        let free = r#"
+SOL 101
+CEND
+ECHO = UNSORT
+DISPLACEMENT = ALL
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,1,,0.,0.,
+,0.
+GRID,2,,10.,0.,0.
+CROD,1,1,1,2
+PROD,1,1,2.0
+MAT1,1,2.1+5,,0.3
+SPC1,1,123456,1,THRU,1
+FORCE,1,2,,1.0+3,1.,0.,0.
+ENDDATA
+"#;
+        assert!((rod_ux(free) - expect).abs() < 1e-8);
+
+        let mut wide = String::from("SOL 101\nCEND\nECHO = NONE\nSPC = 1\nLOAD = 1\nBEGIN BULK\n");
+        wide.push_str(&format!(
+            "{:<8}{:<16}{:<16}{:<16}{:<16}*\n",
+            "GRID*", "1", "0", "0.0", "0.0"
+        ));
+        wide.push_str(&format!("{:<8}{:<16}\n", "*", "0.0"));
+        wide.push_str(&format!(
+            "{:<8}{:<16}{:<16}{:<16}{:<16}*\n",
+            "GRID*", "2", "0", "10.0", "0.0"
+        ));
+        wide.push_str(&format!("{:<8}{:<16}\n", "*", "0.0"));
+        wide.push_str("CROD,1,1,1,2\nPROD,1,1,2.0\nMAT1,1,210000.,,0.3\n");
+        wide.push_str("SPC1,1,123456,1\nFORCE,1,2,,1000.,1.,0.,0.\nENDDATA\n");
+        assert!((rod_ux(&wide) - expect).abs() < 1e-8, "wide ux");
+
+        let mut cont = String::from("SOL 1\nCEND\nSPC=1\nLOAD=1\nBEGIN BULK\n");
+        let head = format!("{:<8}{:<8}{:<8}{:<8}{:<8}", "GRID", "2", "", "10.0", "0.0");
+        cont.push_str(&format!("{head:<72}+G2\n"));
+        cont.push_str(&format!("{:<8}{:<8}\n", "+G2", "0.0"));
+        cont.push_str("GRID,1,,0.,0.,0.\nCROD,1,1,1,2\nPROD,1,1,2.\nMAT1,1,210000.,,0.3\n");
+        cont.push_str("SPC1,1,123456,1\nFORCE,1,2,,1000.,1.,0.,0.\nENDDATA\n");
+        assert!((rod_ux(&cont) - expect).abs() < 1e-8, "cont ux {}", rod_ux(&cont));
+    }
+
+    #[test]
+    fn missing_grid_id_is_an_error() {
+        let deck = "SOL 1\nCEND\nBEGIN BULK\nGRID,,,,0,0,0\nENDDATA\n";
+        assert!(parse_with_base(deck, None).is_err());
+    }
+
+    #[test]
+    fn include_is_expanded() {
+        let dir = std::env::temp_dir().join(format!("axia-inc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mat.bdf"), "MAT1,1,210000.,,0.3\n").unwrap();
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+INCLUDE 'mat.bdf'
+GRID,1,,0.,0.,0.
+GRID,2,,10.,0.,0.
+CROD,1,1,1,2
+PROD,1,1,2.0
+SPC1,1,123456,1
+FORCE,1,2,,1000.,1.,0.,0.
+ENDDATA
+"#;
+        let out = solve(parse_with_base(deck, Some(&dir)).unwrap()).unwrap();
+        let ux = out.u[out.model.node_index(2).unwrap()][0];
+        let expect = 1000.0 * 10.0 / (210000.0 * 2.0);
+        assert!((ux - expect).abs() < 1e-8);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
