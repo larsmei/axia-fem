@@ -4048,7 +4048,17 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
                 &last_du,
                 &prescribed,
             );
-            if have_du && residual > 1.5 * last_residual && last_residual.is_finite() {
+            // Pure NLGEOM (no contact, no pretension): take the Newton step
+            // even when ||r|| grows. The first correction cancels f_ext and
+            // leaves the quadratic Green–Lagrange force, so the residual often
+            // jumps by an order of magnitude; the next consistent tangent
+            // removes it. Halving until ||r|| falls never accepts that step
+            // and crawls (CalculiX line-searches only face-to-face contact).
+            // Contact and pretension keep the residual halving — a full step
+            // there can chatter or invert the gap.
+            let damp_residual = model.has_contact() || !model.pretensions.is_empty();
+            if damp_residual && have_du && residual > 1.5 * last_residual && last_residual.is_finite()
+            {
                 let mut nrm = 0.0;
                 for i in 0..ndof {
                     u_work[i] -= 0.5 * last_du[i];
@@ -4093,10 +4103,14 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
                     du_full[i] += c * solved.x[j];
                 }
             }
-            // Limit each node independently so a sliding mechanism cannot
-            // starve the pretension dummy in the same increment.
-            let cap = (0.05 * min_span).min(0.05 * char_len).max(1e-6);
-            cap_nodal_du(&mut du_full, ndn, nnode, cap);
+            // Cap only contact/pretension steps. On a pure NLGEOM Newton
+            // correction the cap (5% of the smallest span) clips the step
+            // that removes the geometric residual and destroys quadratic
+            // convergence. The pretension dummy is not in this increment.
+            if model.has_contact() || !model.pretensions.is_empty() {
+                let cap = (0.05 * min_span).min(0.05 * char_len).max(1e-6);
+                cap_nodal_du(&mut du_full, ndn, nnode, cap);
+            }
             for i in 0..ndof {
                 u_work[i] += du_full[i];
             }

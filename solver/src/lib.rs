@@ -2467,6 +2467,83 @@ C3D8 SVK stretch λ=1.2
     }
 
     #[test]
+    fn nlgeom_c3d20_bending_one_increment() {
+        // One quadratic hex, cantilever, full load in one increment.
+        // The first Newton step leaves a Green–Lagrange residual several
+        // times the tip load. A residual-halving line search then refuses
+        // the step and needs a cutback; a consistent Newton finishes in
+        // one increment (same policy as CalculiX NLGEOM without contact).
+        let inp = r#"
+*HEADING
+C3D20 NLGEOM cantilever, one increment
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 1, 0
+4, 0, 1, 0
+5, 0, 0, 1
+6, 10, 0, 1
+7, 10, 1, 1
+8, 0, 1, 1
+9, 5, 0, 0
+10, 10, 0.5, 0
+11, 5, 1, 0
+12, 0, 0.5, 0
+13, 5, 0, 1
+14, 10, 0.5, 1
+15, 5, 1, 1
+16, 0, 0.5, 1
+17, 0, 0, 0.5
+18, 10, 0, 0.5
+19, 10, 1, 0.5
+20, 0, 1, 0.5
+*ELEMENT, TYPE=C3D20, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 3
+4, 1, 3
+5, 1, 3
+8, 1, 3
+12, 1, 3
+16, 1, 3
+17, 1, 3
+20, 1, 3
+*STEP, NLGEOM
+*STATIC
+1, 1, 1e-6, 0
+*CLOAD
+3, 2, -12.5
+7, 2, -12.5
+10, 2, -12.5
+14, 2, -12.5
+18, 2, -12.5
+19, 2, -12.5
+*END STEP
+"#;
+        let out = solve_native(inp).expect("C3D20 NLGEOM bending");
+        assert_eq!(
+            out.ninc, 1,
+            "expected one increment, got {} ({})",
+            out.ninc, out.solver
+        );
+        assert!(
+            out.iters <= 8,
+            "expected a short Newton, got {} iters ({})",
+            out.iters, out.solver
+        );
+        let uy7 = out.u[out.model.node_index(7).unwrap()][1];
+        assert!(
+            uy7 < -0.05 && uy7 > -2.0,
+            "tip uy={uy7}, expected a moderate finite deflection"
+        );
+        assert!(out.residual < 1e-4, "residual={}", out.residual);
+    }
+
+    #[test]
     fn plastic_c3d8_hardening() {
         let inp = r#"
 *HEADING
