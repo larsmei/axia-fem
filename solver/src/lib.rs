@@ -2544,6 +2544,87 @@ C3D20 NLGEOM cantilever, one increment
     }
 
     #[test]
+    fn nlgeom_c3d20_bending_stress_matches_linear() {
+        // Same mesh, small load. Nodal Cauchy must follow the linear
+        // Gauss-point extrapolation. The element-mean smear cancels bending.
+        let mesh = r#"
+*HEADING
+C3D20 bending stress
+*NODE
+1, 0, 0, 0
+2, 10, 0, 0
+3, 10, 1, 0
+4, 0, 1, 0
+5, 0, 0, 1
+6, 10, 0, 1
+7, 10, 1, 1
+8, 0, 1, 1
+9, 5, 0, 0
+10, 10, 0.5, 0
+11, 5, 1, 0
+12, 0, 0.5, 0
+13, 5, 0, 1
+14, 10, 0.5, 1
+15, 5, 1, 1
+16, 0, 0.5, 1
+17, 0, 0, 0.5
+18, 10, 0, 0.5
+19, 10, 1, 0.5
+20, 0, 1, 0.5
+*ELEMENT, TYPE=C3D20, ELSET=S
+1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*SOLID SECTION, ELSET=S, MATERIAL=STEEL
+*BOUNDARY
+1, 1, 3
+4, 1, 3
+5, 1, 3
+8, 1, 3
+12, 1, 3
+16, 1, 3
+17, 1, 3
+20, 1, 3
+"#;
+        let loads = "\
+*CLOAD
+3, 2, -0.125
+7, 2, -0.125
+10, 2, -0.125
+14, 2, -0.125
+18, 2, -0.125
+19, 2, -0.125
+*END STEP
+";
+        let lin = solve_native(&format!("{mesh}*STEP\n*STATIC\n{loads}")).expect("linear");
+        let nl = solve_native(&format!("{mesh}*STEP, NLGEOM\n*STATIC\n1, 1, 1e-6, 0\n{loads}"))
+            .expect("nlgeom");
+        let vmax = |v: &[f64]| v.iter().copied().fold(0.0_f64, f64::max);
+        let vm_l = vmax(&lin.von_mises);
+        let vm_n = vmax(&nl.von_mises);
+        let ratio = vm_n / vm_l;
+        assert!(
+            (ratio - 1.0).abs() < 0.05,
+            "nodal vm NL {vm_n:.6e} vs linear {vm_l:.6e} (ratio {ratio:.3})"
+        );
+        let i = lin
+            .von_mises
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        let s_l = lin.stress[i][0];
+        let s_n = nl.stress[i][0];
+        let sr = if s_l.abs() > 1.0 { s_n / s_l } else { 1.0 };
+        assert!(
+            (sr - 1.0).abs() < 0.05,
+            "sxx at peak node NL {s_n:.6e} vs linear {s_l:.6e}"
+        );
+    }
+
+    #[test]
     fn plastic_c3d8_hardening() {
         let inp = r#"
 *HEADING

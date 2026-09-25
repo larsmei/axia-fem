@@ -4199,20 +4199,52 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut gacc = vec![[0.0; 6]; nnode];
     let mut pacc = vec![0.0; nnode];
     let mut stress_gp = Vec::new();
+    // Element-mean Cauchy smeared onto every node cancels bending: tension
+    // and compression in one C3D20 average toward the membrane stress, so
+    // nodal von Mises was ~10× below the linear Gauss extrapolation.
+    // Same recovery as the linear path and as recover_nl_fields: 27-point
+    // Cauchy, Lagrange to the 20 nodes. Plastic history stays on the
+    // element mean (no stored Gauss-point Cauchy to extrapolate).
+    let elastic = !model.has_plastic();
     for (ei, el) in model.elements.iter().enumerate() {
-        let s = last_cauchy[ei];
-        let g = last_gl[ei];
         let p = last_peeq[ei];
-        for &id in &el.nodes {
+        let (sn, en, mean) = if elastic && matches!(el.kind, ElemKind::Hex20 | ElemKind::Hex20R)
+        {
+            let xyz0 = elem_xyz(&model, &el.nodes)?;
+            let mat = model.material_for(el)?;
+            let nn = el.kind.nnodes();
+            let mut ue = vec![0.0; 3 * nn];
+            for a in 0..nn {
+                let ni = model.node_index(el.nodes[a])?;
+                for d in 0..3 {
+                    ue[3 * a + d] = u_full.get(dof_of(ndn, ni, d)).copied().unwrap_or(0.0);
+                }
+            }
+            let (cs, gs) = nlgeom::hex20_nodal_nl(&xyz0, &ue, &mat, el.kind.reduced_int())?;
+            let mut mean = [0.0; 6];
+            for a in 0..nn.min(cs.len()) {
+                for c in 0..6 {
+                    mean[c] += cs[a][c] / nn as f64;
+                }
+            }
+            (cs, gs, mean)
+        } else {
+            let s = last_cauchy[ei];
+            let g = last_gl[ei];
+            (vec![s; el.nodes.len()], vec![g; el.nodes.len()], s)
+        };
+        for (a, &id) in el.nodes.iter().enumerate() {
             let ni = model.node_index(id)?;
-            for c in 0..6 {
-                accs[ni][c] += s[c];
-                gacc[ni][c] += g[c];
+            if a < sn.len() {
+                for c in 0..6 {
+                    accs[ni][c] += sn[a][c];
+                    gacc[ni][c] += en[a][c];
+                }
             }
             pacc[ni] += p;
             cnt[ni] += 1.0;
         }
-        stress_gp.push((el.id, 1usize, s));
+        stress_gp.push((el.id, 1usize, mean));
     }
     let mut stress = vec![[0.0; 6]; nnode];
     let mut strain = vec![[0.0; 6]; nnode];
