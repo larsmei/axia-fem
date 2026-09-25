@@ -1045,6 +1045,10 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                         if v > 0 {
                             ctrl.max_inc = v as usize;
                         }
+                    } else {
+                        // *STEP, INC= is the increment cap. The optional 5th
+                        // *STATIC field overrides it when it is present.
+                        ctrl.max_inc = model.max_inc.max(1);
                     }
                     if ctrl.dlam_max < ctrl.dlam_min {
                         ctrl.dlam_max = ctrl.dlam_min;
@@ -2046,6 +2050,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
     }
 
     model.compact();
+    normalize_quadratic_beams(&mut model);
     expand_deferred(&mut model)?;
     bind_contact_interactions(&mut model);
     crate::constraint::apply_pretension(&mut model)?;
@@ -2055,6 +2060,38 @@ fn parse_expanded(inp: &str) -> Result<Model> {
         last.n_bc = last.n_bc.max(model.bcs.len());
     }
     Ok(model)
+}
+
+/// B32 in CalculiX/Mecway is end, mid, end. Beam shape functions are Abaqus
+/// (end, end, mid). Detect the midside and reorder; Abaqus decks stay put.
+fn normalize_quadratic_beams(model: &mut Model) {
+    let mut n = 0usize;
+    for el in &mut model.elements {
+        if el.kind != ElemKind::Beam32 || el.nodes.len() < 3 {
+            continue;
+        }
+        let mut xyz = [[0.0; 3]; 3];
+        let mut ok = true;
+        for a in 0..3 {
+            match model.id_to_index.get(&el.nodes[a]).copied() {
+                Some(i) => xyz[a] = model.coords[i],
+                None => ok = false,
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let before = el.nodes.clone();
+        crate::beam::to_abaqus_order(&mut el.nodes, &xyz);
+        if el.nodes != before {
+            n += 1;
+        }
+    }
+    if n > 0 {
+        model.warn(format!(
+            "B32: {n} Elemente von CalculiX-Folge (Ende, Mitte, Ende) auf interne Folge (Ende, Ende, Mitte) gestellt."
+        ));
+    }
 }
 
 fn bind_contact_interactions(model: &mut Model) {

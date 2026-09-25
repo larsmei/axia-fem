@@ -63,6 +63,51 @@ pub fn orthonormal(t: [f64; 3], n1_hint: [f64; 3]) -> Result<([f64; 3], [f64; 3]
     Ok((n1, n2))
 }
 
+/// CalculiX/Mecway lists B32 as end, mid, end. This solver (and Abaqus) uses
+/// end, end, mid. Swap only when another node is clearly the midside, so an
+/// already-Abaqus connectivity is left untouched (tie → keep node 3 as mid).
+pub fn to_abaqus_order(nodes: &mut [i32], xyz: &[[f64; 3]]) {
+    if nodes.len() < 3 || xyz.len() < 3 {
+        return;
+    }
+    let dist_seg = |i: usize| {
+        let a = (i + 1) % 3;
+        let b = (i + 2) % 3;
+        dist_point_segment(xyz[i], xyz[a], xyz[b])
+    };
+    let d = [dist_seg(0), dist_seg(1), dist_seg(2)];
+    let scale = dist3(xyz[0], xyz[1])
+        .max(dist3(xyz[0], xyz[2]))
+        .max(dist3(xyz[1], xyz[2]))
+        .max(1e-16);
+    let tol = 1e-8 * scale;
+    if d[2] <= d[0] + tol && d[2] <= d[1] + tol {
+        return;
+    }
+    if d[1] + tol < d[2] && d[1] <= d[0] + tol {
+        nodes.swap(1, 2);
+        return;
+    }
+    if d[0] + tol < d[1] && d[0] + tol < d[2] {
+        let mid = nodes[0];
+        nodes[0] = nodes[1];
+        nodes[1] = nodes[2];
+        nodes[2] = mid;
+    }
+}
+
+fn dist_point_segment(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let ab2 = dot(ab, ab);
+    if ab2 < 1e-30 {
+        return norm(ap);
+    }
+    let t = (dot(ap, ab) / ab2).clamp(0.0, 1.0);
+    let q = [a[0] + t * ab[0], a[1] + t * ab[1], a[2] + t * ab[2]];
+    dist3(p, q)
+}
+
 /// Shape N and dN/dξ. ξ ∈ [-1, 1]. Node order: end1, end2 [, mid].
 fn shape(kind: ElemKind, xi: f64) -> ([f64; 3], [f64; 3], usize) {
     match kind {
@@ -725,6 +770,7 @@ pub fn stiffness_nl(
     ])?;
     let l0 = dist3(xyz0[0], xyz0[i1]).max(1e-18);
     let l = dist3(xyz[0], xyz[i1]).max(1e-18);
+    let (n1_0, n2_0) = orthonormal(t0, sec.n1)?;
     let (n1, n2) = orthonormal(t, sec.n1)?;
     let r = rotation_from_t(t0, t);
     let th_chord = rotvec_from_r(r);
@@ -743,12 +789,38 @@ pub fn stiffness_nl(
         udef[6 * a + 3] = t[0] * thg[0] + t[1] * thg[1] + t[2] * thg[2];
         udef[6 * a + 4] = n1[0] * thg[0] + n1[1] * thg[1] + n1[2] * thg[2];
         udef[6 * a + 5] = n2[0] * thg[0] + n2[1] * thg[1] + n2[2] * thg[2];
+        // Translational deformation in the chord frame. The midside offset
+        // from the current chord is bending; dropping it leaves that DOF
+        // with a tangent but no residual (the node drifts under Riks).
+        let r0 = [
+            xyz0[a][0] - xyz0[0][0],
+            xyz0[a][1] - xyz0[0][1],
+            xyz0[a][2] - xyz0[0][2],
+        ];
+        let rc = [
+            xyz[a][0] - xyz[0][0],
+            xyz[a][1] - xyz[0][1],
+            xyz[a][2] - xyz[0][2],
+        ];
+        udef[6 * a] = dot(rc, t) - dot(r0, t0);
+        udef[6 * a + 1] = dot(rc, n1) - dot(r0, n1_0);
+        udef[6 * a + 2] = dot(rc, n2) - dot(r0, n2_0);
     }
-    udef[6 * i1] = l - l0;
-    if nn == 3 {
-        udef[12] = 0.5 * (l - l0);
+    // `stiffness` is already in global axes. Build it in the reference chord
+    // frame (local x = t0) and rotate once into the current frame. Rotating
+    // the global matrix again zeroes shear on any member that is not along X.
+    let mut xyz_l = vec![[0.0; 3]; nn];
+    for a in 0..nn {
+        let r0 = [
+            xyz0[a][0] - xyz0[0][0],
+            xyz0[a][1] - xyz0[0][1],
+            xyz0[a][2] - xyz0[0][2],
+        ];
+        xyz_l[a] = [dot(r0, t0), dot(r0, n1_0), dot(r0, n2_0)];
     }
-    let (ke_l, _) = stiffness(kind, xyz0, e, nu, sec)?;
+    let mut sec_l = *sec;
+    sec_l.n1 = [0.0, 1.0, 0.0];
+    let (ke_l, _) = stiffness(kind, &xyz_l, e, nu, &sec_l)?;
     let mut fe_l = vec![0.0; nd];
     for i in 0..nd {
         let mut s = 0.0;
@@ -913,6 +985,53 @@ mod tests {
         assert!((g.v1 - 1.0).abs() < 1e-4, "v1 {}", g.v1);
         assert!(g.v2.abs() < 1e-4 && g.axial.abs() < 1e-4 && g.torque.abs() < 1e-4);
         assert!(g.m2a.abs() < 1e-4 && g.m2b.abs() < 1e-4);
+    }
+
+    #[test]
+    fn ccx_b32_order_becomes_end_end_mid() {
+        let xyz = [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        let mut ccx = [1, 2, 3];
+        to_abaqus_order(&mut ccx, &xyz);
+        assert_eq!(ccx, [1, 3, 2]);
+        let xyz_ab = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.0, 0.0]];
+        let mut ab = [1, 3, 2];
+        to_abaqus_order(&mut ab, &xyz_ab);
+        assert_eq!(ab, [1, 3, 2]);
+    }
+
+    #[test]
+    fn vertical_pipe_constant_rotx_has_energy() {
+        let xyz = [[0.0, 0.0, 0.0], [0.0, 0.0, -0.01], [0.0, 0.0, -0.005]];
+        let sec = BeamSection::pipe(0.001, 0.001, [0.0, 1.0, 0.0]);
+        let (ke, _) = stiffness(ElemKind::Beam32, &xyz, 2.1e11, 0.3, &sec).unwrap();
+        let nd = 18;
+        let mut ue = vec![0.0; nd];
+        for a in 0..3 {
+            ue[6 * a + 3] = 1.0;
+        }
+        let mut energy = 0.0;
+        for i in 0..nd {
+            for j in 0..nd {
+                energy += ue[i] * ke[i * nd + j] * ue[j];
+            }
+        }
+        assert!(
+            energy > 1.0,
+            "constant θx energy {energy} — shear should resist it"
+        );
+        let ue0 = vec![0.0; nd];
+        let (ke_nl, _, _) =
+            stiffness_nl(ElemKind::Beam32, &xyz, &ue0, 2.1e11, 0.3, &sec).unwrap();
+        let mut energy_nl = 0.0;
+        for i in 0..nd {
+            for j in 0..nd {
+                energy_nl += ue[i] * ke_nl[i * nd + j] * ue[j];
+            }
+        }
+        assert!(
+            energy_nl > 1.0,
+            "nl constant θx energy {energy_nl} linear {energy}"
+        );
     }
 }
 

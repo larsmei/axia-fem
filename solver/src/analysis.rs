@@ -313,10 +313,9 @@ fn solve_one(mut model: Model, t0: f64) -> Result<SolveOutput> {
             .iter()
             .all(|e| nlgeom::is_nl_continuum(e.kind));
     let riks_ok = !model.elements.is_empty()
-        && model
-            .elements
-            .iter()
-            .all(|e| e.kind.is_truss() || nlgeom::is_nl_continuum(e.kind));
+        && model.elements.iter().all(|e| {
+            e.kind.is_truss() || e.kind.is_beam() || nlgeom::is_nl_continuum(e.kind)
+        });
     if model.has_contact() {
         if !matches!(model.procedure, Procedure::Static { .. }) {
             model.warn("*CONTACT PAIR mit nicht-statischer Prozedur: lineare Kontaktlösung.");
@@ -348,7 +347,7 @@ fn solve_one(mut model: Model, t0: f64) -> Result<SolveOutput> {
     if riks {
         if !riks_ok {
             return err(
-                "RIKS ist für T3D2 und Kontinuum (C3D*) implementiert; gemischte Netze nicht.",
+                "RIKS ist für T3D2/T3D3, B31/B32 und Kontinuum (C3D*) implementiert.",
             );
         }
         return solve_riks(model, t0);
@@ -4672,7 +4671,7 @@ fn crisfield_dlam(du_i: &[f64], du_ii: &[f64], du_acc: &[f64], dl: f64) -> f64 {
 }
 
 fn assemble_nl(model: &Model, u_full: &[f64], hist: &[Vec<plastic::GpHist>]) -> Result<NlAsm> {
-    let ndn = 3;
+    let ndn = model.ndof_node().max(3);
     let ndof = u_full.len();
     let mut trips = Vec::new();
     let mut f_int = vec![0.0; ndof];
@@ -4682,78 +4681,50 @@ fn assemble_nl(model: &Model, u_full: &[f64], hist: &[Vec<plastic::GpHist>]) -> 
     for (ei, el) in model.elements.iter().enumerate() {
         let xyz0 = elem_xyz(model, &el.nodes)?;
         let nn = el.kind.nnodes();
-        if el.kind.is_truss() {
-            let i1 = if nn == 2 { 1 } else { nn - 1 };
-            let mut xyz = xyz0.clone();
-            let mut gdofs = Vec::with_capacity(3 * nn);
+        if el.kind.is_truss() || el.kind.is_beam() {
+            let local = if el.kind.is_beam() { 6 } else { 3 };
+            let mut ue = vec![0.0; local * nn];
+            let mut gdofs = Vec::with_capacity(local * nn);
             for a in 0..nn {
                 let ni = model.node_index(el.nodes[a])?;
-                for d in 0..3 {
+                for d in 0..local {
                     let g = dof_of(ndn, ni, d);
                     gdofs.push(g);
-                    xyz[a][d] = xyz0[a][d] + u_full[g];
+                    ue[local * a + d] = u_full.get(g).copied().unwrap_or(0.0);
                 }
             }
-            let mat = model.material_for(el)?;
-            let area = model.thickness_for(el);
-            let mut d = [
-                xyz[i1][0] - xyz[0][0],
-                xyz[i1][1] - xyz[0][1],
-                xyz[i1][2] - xyz[0][2],
-            ];
-            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-18);
-            d[0] /= len;
-            d[1] /= len;
-            d[2] /= len;
-            let l0 = {
-                let dx = xyz0[i1][0] - xyz0[0][0];
-                let dy = xyz0[i1][1] - xyz0[0][1];
-                let dz = xyz0[i1][2] - xyz0[0][2];
-                (dx * dx + dy * dy + dz * dz).sqrt().max(1e-18)
+            let nl = if el.kind.is_beam() {
+                let mat = model.material_for(el)?;
+                let sec = model.beam_section_for(el)?;
+                let (ke, fe, cauchy_e) =
+                    beam::stiffness_nl(el.kind, &xyz0, &ue, mat.e, mat.nu, &sec)?;
+                nlgeom::NlElem {
+                    ke,
+                    fe,
+                    vol: 1.0,
+                    cauchy: cauchy_e,
+                    gl: [0.0; 6],
+                    peeq: 0.0,
+                }
+            } else {
+                truss_nl_elem(model, el, &xyz0, &ue)?
             };
-            let eps = (len - l0) / l0;
-            let (sig, et) = truss_1d_stress(mat.e, eps, model.plastic_for(el));
-            let nforce = sig * area;
-            let kax = et * area / l0;
-            let nd = 3 * nn;
-            let mut ke = vec![0.0; nd * nd];
-            let geom = nforce / len;
-            for a in [0usize, i1] {
-                for b in [0usize, i1] {
-                    let s_ax = if a == b { kax } else { -kax };
-                    let s_g = if a == b { geom } else { -geom };
-                    for i in 0..3 {
-                        for j in 0..3 {
-                            let ax = d[i] * d[j];
-                            let pr = if i == j { 1.0 } else { 0.0 } - d[i] * d[j];
-                            ke[(3 * a + i) * nd + (3 * b + j)] += s_ax * ax + s_g * pr;
-                        }
-                    }
-                }
-            }
-            let mut fe = vec![0.0; nd];
-            for k in 0..3 {
-                fe[k] -= nforce * d[k];
-                fe[3 * i1 + k] += nforce * d[k];
-            }
+            cauchy[ei] = nl.cauchy;
+            gl[ei] = nl.gl;
+            peeq_e[ei] = nl.peeq;
+            let nd = gdofs.len();
             for i in 0..nd {
-                f_int[gdofs[i]] += fe[i];
+                if i < nl.fe.len() {
+                    f_int[gdofs[i]] += nl.fe[i];
+                }
+                let row = i * nd;
                 for j in 0..nd {
-                    let v = ke[i * nd + j];
+                    let v = nl.ke.get(row + j).copied().unwrap_or(0.0);
                     if v.abs() > 0.0 {
                         trips.push((gdofs[i], gdofs[j], v));
                     }
                 }
             }
-            cauchy[ei] = [
-                sig * d[0] * d[0],
-                sig * d[1] * d[1],
-                sig * d[2] * d[2],
-                sig * d[0] * d[1],
-                sig * d[1] * d[2],
-                sig * d[2] * d[0],
-            ];
-            gl[ei][0] = eps;
         } else if nlgeom::is_nl_continuum(el.kind) {
             let mut ue = vec![0.0; 3 * nn];
             let mut gdofs = Vec::with_capacity(3 * nn);
@@ -4803,10 +4774,38 @@ fn assemble_nl(model: &Model, u_full: &[f64], hist: &[Vec<plastic::GpHist>]) -> 
     })
 }
 
+/// T3D3 (CalculiX): nodes 1 and 3 are the ends, node 2 the midside.
+/// The bar force lives on the ends only. An MPC keeps the midside on the
+/// chord; a penalty spring makes the tangent so badly scaled that the
+/// in-crate LU (WASM, `--solver cholesky`) calls the first step singular.
+fn truss3_midside_mpcs(model: &Model, ndn: usize) -> Result<Vec<constraint::Mpc>> {
+    let mut out = Vec::new();
+    for el in &model.elements {
+        if el.kind != ElemKind::Truss3 || el.nodes.len() < 3 {
+            continue;
+        }
+        let n0 = model.node_index(el.nodes[0])?;
+        let nm = model.node_index(el.nodes[1])?;
+        let n1 = model.node_index(el.nodes[2])?;
+        let x0 = model.coords[n0];
+        let xm = model.coords[nm];
+        let x1 = model.coords[n1];
+        for k in 0..3.min(ndn) {
+            let g0 = 0.5 * (x0[k] + x1[k]) - xm[k];
+            out.push(constraint::Mpc {
+                slave: dof_of(ndn, nm, k),
+                masters: vec![(dof_of(ndn, n0, k), 0.5), (dof_of(ndn, n1, k), 0.5)],
+                u0: g0,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Modified Riks / Crisfield arc-length (CalculiX `*STATIC, RIKS`).
 fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
     let ctrl = model.riks.unwrap_or(RiksCtrl::default());
-    let ndn = 3;
+    let ndn = model.ndof_node().max(3);
     let nnode = model.node_ids.len();
     let ndof = ndn * nnode;
     let mut prescribed: HashMap<usize, f64> = HashMap::new();
@@ -4823,7 +4822,8 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
     if fext_n < 1e-30 {
         return err("RIKS: keine Last (*CLOAD/*DLOAD).");
     }
-    let mpcs = constraint::build_all_mpcs(&model, ndn)?;
+    let mut mpcs = constraint::build_all_mpcs(&model, ndn)?;
+    mpcs.extend(truss3_midside_mpcs(&model, ndn)?);
     let map = DofMap::build(ndof, &prescribed, &mpcs)?;
     let nfree = map.n_ind;
     if nfree == 0 {
@@ -4853,13 +4853,13 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
     while inc < ctrl.max_inc.max(1) {
         last = assemble_nl(&model, &u_full, &hist)?;
         let (ff, _) = map.reduce_inc(&last.trips, &last.f_int);
-        let vsol = match solve_kff(nfree, ff, &f_red) {
+        let vsol = match solve_kff(nfree, ff.clone(), &f_red) {
             Ok(s) => s,
-            Err(_) => {
+            Err(e) => {
                 retries += 1;
                 if retries > 8 {
                     return err(format!(
-                        "Riks: Tangente singulär bei λ={lam:.4} (Inkrement {inc})."
+                        "Riks: Tangente singulär bei λ={lam:.4} (Inkrement {inc}): {e}"
                     ));
                 }
                 dl *= 0.5;
@@ -4972,14 +4972,28 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
             lam = lam_conv;
             continue;
         }
+        let had_cutback = retries;
         retries = 0;
         inc += 1;
         ninc = inc;
         du_prev = du_acc;
         u_conv.clone_from(&u_full);
+        // Easy increments take the full user Δλ next time. A cutback keeps the
+        // shorter arc that just converged and only grows it slowly, so the
+        // limit point is not immediately retried at full size. Without this,
+        // one rejected step permanently shrinks dl (the old factor is ~1 when
+        // the iteration count is near 4) and snap-through never reaches
+        // λ = period inside *STEP, INC.
+        let dlam_done = (lam - lam_conv).abs().max(1e-16);
+        let v_est = (vnorm(&du_prev) / dlam_done).max(1e-30);
+        let target_dl = ctrl.dlam_max.max(ctrl.dlam_min) * v_est;
+        if had_cutback == 0 && it_count <= 8 {
+            dl = target_dl;
+        } else {
+            let grow = (4.0 / (it_count as f64).max(1.0)).sqrt().clamp(0.5, 1.5);
+            dl = (dl * grow).min(target_dl);
+        }
         lam_conv = lam;
-        let n_des = 4.0;
-        dl *= (n_des / (it_count as f64).max(1.0)).sqrt();
         if lam >= ctrl.period - 1e-8 {
             break;
         }
@@ -4998,14 +5012,17 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
 
     let solver = format!("Riks (λ={lam:.4}, {ninc} inc, {solver_name}, {total_iters} iters)");
 
-    let mut u = vec![[0.0; 3]; nnode];
-    let ur = vec![[0.0; 3]; nnode];
+    let (u, ur) = split_disp(&u_full, ndn, nnode);
     let mut rf = vec![[0.0; 3]; nnode];
-    let rm = vec![[0.0; 3]; nnode];
+    let mut rm = vec![[0.0; 3]; nnode];
     for ni in 0..nnode {
         for d in 0..3 {
-            u[ni][d] = u_full[dof_of(ndn, ni, d)];
-            rf[ni][d] = last.f_int[dof_of(ndn, ni, d)] - lam * f_ext[dof_of(ndn, ni, d)];
+            let g = dof_of(ndn, ni, d);
+            rf[ni][d] = last.f_int[g] - lam * f_ext[g];
+            if ndn >= 6 {
+                let gr = dof_of(ndn, ni, 3 + d);
+                rm[ni][d] = last.f_int[gr] - lam * f_ext[gr];
+            }
         }
     }
     let mut accs = vec![[0.0; 6]; nnode];

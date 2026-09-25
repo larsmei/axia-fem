@@ -123,6 +123,8 @@ fn frd_nodes(kind: ElemKind, nodes: &[i32]) -> Vec<i32> {
                 n[10], n[11],
             ]
         }
+        // Internal B32 order is Abaqus (end, end, mid). cgx type 12 is end, mid, end.
+        ElemKind::Beam32 if nodes.len() >= 3 => vec![nodes[0], nodes[2], nodes[1]],
         _ => nodes.to_vec(),
     }
 }
@@ -203,7 +205,7 @@ pub fn write_frd_frames(model: &Model, frames: &[FrdFrame]) -> String {
     o.push_str("    1UTIME              21:00:00\n");
     o.push_str("    1UHOST              axia\n");
     o.push_str("    1UPGM               Axia FEM\n");
-    o.push_str("    1UVERSION           1.31.4\n");
+    o.push_str("    1UVERSION           1.31.5\n");
     o.push_str("    1UCODE              CalculiX-compatible Axia FEM\n");
 
     let out_nodes = frd_output_nodes(model);

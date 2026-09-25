@@ -3193,6 +3193,150 @@ von Mises truss — Riks snap-through
         );
     }
 
+    #[test]
+    fn ccx_b32_order_matches_abaqus_cantilever() {
+        let ccx = r#"
+*HEADING
+ccx order
+*NODE
+1, 0, 0, 0
+2, 500, 0, 0
+3, 1000, 0, 0
+*ELEMENT, TYPE=B32, ELSET=BEAM
+1, 1, 2, 3
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000, 0.3
+*BEAM SECTION, ELSET=BEAM, MATERIAL=STEEL, SECTION=RECT
+10, 20
+0, 1, 0
+*BOUNDARY
+1, 1, 6
+*STEP
+*STATIC
+*CLOAD
+3, 3, -100
+*END STEP
+"#;
+        let m = crate::inp::parse(ccx).unwrap();
+        assert_eq!(m.elements[0].nodes, vec![1, 3, 2]);
+        let out = solve_native(ccx).unwrap();
+        let tip = out.u[out.model.node_index(3).unwrap()];
+        let e = 210000.0;
+        let nu = 0.3;
+        let g = e / (2.0 * (1.0 + nu));
+        let a = 200.0;
+        let i11 = 10.0 * 20.0_f64.powi(3) / 12.0;
+        let k = 5.0 / 6.0;
+        let p = 100.0;
+        let l = 1000.0_f64;
+        let expect = p * l.powi(3) / (3.0 * e * i11) + p * l / (k * g * a);
+        let uz = -tip[2];
+        assert!(
+            (uz - expect).abs() / expect < 0.04,
+            "uz={uz}, Timoshenko={expect}"
+        );
+    }
+
+    #[test]
+    fn riks_mecway_b32r_t3d3_reaches_the_load() {
+        // Mecway 33: B32R written end, mid, end; T3D3 end, mid, end;
+        // *STATIC,RIKS and a stepped amplitude to -400 N.
+        let inp = r#"
+*NODE
+1,0,0,0
+2,0.02,0,0
+3,0.01,0.001,0
+4,0.005,0.0005,0
+5,0.015,0.0005,0
+6,0,0,-0.01
+7,0,0,-0.005
+*ELEMENT,TYPE=B32R
+1,1,4,3
+3,1,7,6
+*ELEMENT,TYPE=T3D3
+2,3,5,2
+*ELSET,ELSET=1
+1
+*ELSET,ELSET=2
+2
+*ELSET,ELSET=3
+3
+*MATERIAL,NAME=MATERIAL
+*ELASTIC,TYPE=ISOTROPIC
+210000000000,0.3
+*BEAM SECTION,ELSET=1,MATERIAL=MATERIAL,SECTION=PIPE
+0.001,0.001
+-0.099503719021,0.995037190209,0
+*SOLID SECTION,ELSET=2,MATERIAL=MATERIAL
+3.14159265359E-06
+*BEAM SECTION,ELSET=3,MATERIAL=MATERIAL,SECTION=PIPE
+0.001,0.001
+0,1,0
+*BOUNDARY
+3,3,,0
+6,2,,0
+*BOUNDARY
+1,1,,0
+1,2,,0
+1,3,,0
+*BOUNDARY
+2,1,,0
+2,2,,0
+2,3,,0
+*AMPLITUDE,NAME=Ay_3_4
+0,0
+1,-400
+*STEP,NLGEOM=YES,INC=100,AMPLITUDE=STEP
+*STATIC,RIKS
+0.05,1,0,0.05
+*CLOAD,AMPLITUDE=Ay_3_4
+3,2,1
+*NODE FILE,GLOBAL=YES
+U,RF
+*EL FILE
+S,NOE
+*END STEP
+"#;
+        let m = crate::inp::parse(inp).unwrap();
+        let e1 = m.elements.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e1.nodes, vec![1, 3, 4], "B32R CalculiX order not reordered");
+        let e3 = m.elements.iter().find(|e| e.id == 3).unwrap();
+        assert_eq!(e3.nodes, vec![1, 6, 7]);
+        let t3 = m.elements.iter().find(|e| e.id == 2).unwrap();
+        assert_eq!(t3.nodes, vec![3, 5, 2], "T3D3 stays end, mid, end");
+        let out = solve_native(inp).expect("Mecway Riks arch");
+        let ni3 = out.model.node_index(3).unwrap();
+        let uy = out.u[ni3][1];
+        assert!(
+            uy < -1e-5,
+            "crown uy={uy} should follow the downward load ({})",
+            out.solver
+        );
+        assert!(
+            (out.lambda - 1.0).abs() < 0.05,
+            "λ={} inc={} solver={}",
+            out.lambda,
+            out.ninc,
+            out.solver
+        );
+        let out_c = with_sparse_backend(SparseBackend::Cholesky, || solve_native(inp))
+            .expect("Mecway Riks on in-crate LU");
+        let uy_c = out_c.u[out_c.model.node_index(3).unwrap()][1];
+        assert!(
+            (out_c.lambda - 1.0).abs() < 0.05,
+            "cholesky λ={} inc={} solver={}",
+            out_c.lambda,
+            out_c.ninc,
+            out_c.solver
+        );
+        assert!(
+            (uy_c - uy).abs() < 1e-5,
+            "cholesky uy={uy_c} faer uy={uy}"
+        );
+        assert!(out.ninc >= 1, "ninc {}", out.ninc);
+    }
+
     fn cax3_lame_deck() -> String {
         let mut inp = String::from("*HEADING\nCAX3 Lame\n*NODE\n");
         let a = 10.0;
