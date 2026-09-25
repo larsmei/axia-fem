@@ -315,7 +315,13 @@ fn tri3_shape() -> ([f64; 3], [[f64; 2]; 3]) {
 }
 
 /// DKT bending 9×9 (w, θx, θy) plus CST membrane, 1-pt shear.
-fn s3_local(xy: &[[f64; 2]; 3], e: f64, nu: f64, h: f64, bend: f64) -> Result<(Vec<f64>, f64)> {
+fn s3_local(
+    xy: &[[f64; 2]; 3],
+    dm: &[f64; 9],
+    db: &[f64; 9],
+    ds: &[f64; 4],
+    drill_eh: f64,
+) -> Result<(Vec<f64>, f64)> {
     let x1 = xy[0][0];
     let y1 = xy[0][1];
     let x2 = xy[1][0];
@@ -335,14 +341,7 @@ fn s3_local(xy: &[[f64; 2]; 3], e: f64, nu: f64, h: f64, bend: f64) -> Result<(V
     dndx[0] = [(y2 - y3) / two_a, (x3 - x2) / two_a];
     dndx[1] = [(y3 - y1) / two_a, (x1 - x3) / two_a];
     dndx[2] = [(y1 - y2) / two_a, (x2 - x1) / two_a];
-    let dm0 = d_plane_stress(e, nu)?;
-    let mut dm = [0.0; 9];
-    let mut db = [0.0; 9];
-    for i in 0..9 {
-        dm[i] = dm0[i] * h;
-        db[i] = dm0[i] * h * h * h / 12.0 * bend;
-    }
-    add_membrane(&mut ke, nd, 3, &dndx, &dm, area);
+    add_membrane(&mut ke, nd, 3, &dndx, dm, area);
 
     // DKT bending, 3 Hammer points
     let x23 = x2 - x3;
@@ -451,15 +450,14 @@ fn s3_local(xy: &[[f64; 2]; 3], e: f64, nu: f64, h: f64, bend: f64) -> Result<(V
             b[2 * nd + g + 3] = dhx_dy[c0 + 1] + dhy_dx[c0 + 1];
             b[2 * nd + g + 4] = dhx_dy[c0 + 2] + dhy_dx[c0 + 2];
         }
-        gemm_bt_d_b(&mut ke, nd, &b, 3, &db, wt);
+        gemm_bt_d_b(&mut ke, nd, &b, 3, db, wt);
     }
 
     // 1-pt Mindlin shear (thin-plate: small energy)
-    let ds = ds_mat(e, nu, h);
     let nshp = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0];
     let bg = cartesian_shear_b(&nshp, &dndx, 3);
-    add_shear(&mut ke, nd, &bg, &ds, area, 3);
-    add_drill(&mut ke, nd, 3, e, h, area);
+    add_shear(&mut ke, nd, &bg, ds, area, 3);
+    add_drill(&mut ke, nd, 3, drill_eh, 1.0, area);
     Ok((ke, area))
 }
 
@@ -496,6 +494,21 @@ fn s6_local(xy: &[[f64; 2]], e: f64, nu: f64, h: f64) -> Result<(Vec<f64>, f64)>
     Ok((ke, area))
 }
 
+/// CTRIA3 with a plate law already rotated into the G1–G2 frame.
+pub fn tri_shell_law(xyz: &[[f64; 3]], law: &crate::ortho::ShellLaw) -> Result<(Vec<f64>, f64)> {
+    if xyz.len() < 3 {
+        return err("Schale: zu wenige Knoten.");
+    }
+    let (e1, e2, e3) = local_frame(xyz, 3)?;
+    let xy = project_xy(xyz, e1, e2, 3);
+    let mut p = [[0.0; 2]; 3];
+    p.copy_from_slice(&xy[..3]);
+    let (mut ke, area) = s3_local(&p, &law.a, &law.d, &law.ds, law.drill_eh)?;
+    rotate_ke(&mut ke, 3, e1, e2, e3);
+    let _ = e3;
+    Ok((ke, area))
+}
+
 pub fn stiffness(kind: ElemKind, xyz: &[[f64; 3]], e: f64, nu: f64, h: f64) -> Result<(Vec<f64>, f64)> {
     stiffness_bend(kind, xyz, e, nu, h, 1.0)
 }
@@ -525,7 +538,15 @@ pub fn stiffness_bend(
         ElemKind::Shell3 => {
             let mut p = [[0.0; 2]; 3];
             p.copy_from_slice(&xy[..3]);
-            s3_local(&p, e, nu, h, bend)?
+            let dm0 = d_plane_stress(e, nu)?;
+            let mut dm = [0.0; 9];
+            let mut db = [0.0; 9];
+            for i in 0..9 {
+                dm[i] = dm0[i] * h;
+                db[i] = dm0[i] * h * h * h / 12.0 * bend;
+            }
+            let ds = ds_mat(e, nu, h);
+            s3_local(&p, &dm, &db, &ds, e * h)?
         }
         ElemKind::Shell6 => s6_local(&xy, e, nu, h)?,
         _ => return err("Kein Schalenelement."),
@@ -906,6 +927,7 @@ pub fn membrane_stiffness(
     e: f64,
     nu: f64,
     h: f64,
+    integrated: Option<&[f64; 9]>,
 ) -> Result<(Vec<f64>, f64)> {
     let nn = kind.nnodes();
     if xyz.len() < nn {
@@ -920,7 +942,7 @@ pub fn membrane_stiffness(
         ElemKind::Mem4 | ElemKind::Mem4R => {
             let mut p = [[0.0; 2]; 4];
             p.copy_from_slice(&xy[..4]);
-            mem_quad4(&p, e, nu, h, kind.reduced_int())?
+            mem_quad4(&p, e, nu, h, kind.reduced_int(), integrated)?
         }
         ElemKind::Mem8 => {
             let mut p = [[0.0; 2]; 8];
@@ -930,7 +952,7 @@ pub fn membrane_stiffness(
         ElemKind::Mem3 => {
             let mut p = [[0.0; 2]; 3];
             p.copy_from_slice(&xy[..3]);
-            mem_tri3(&p, e, nu, h)?
+            mem_tri3(&p, e, nu, h, integrated)?
         }
         ElemKind::Mem6 => {
             let mut p = [[0.0; 2]; 6];
@@ -962,8 +984,21 @@ pub fn membrane_stiffness(
     Ok((ke, area))
 }
 
-fn mem_quad4(xy: &[[f64; 2]; 4], e: f64, nu: f64, h: f64, reduced: bool) -> Result<(Vec<f64>, f64)> {
-    let d = d_plane_stress(e, nu)?;
+fn mem_quad4(
+    xy: &[[f64; 2]; 4],
+    e: f64,
+    nu: f64,
+    h: f64,
+    reduced: bool,
+    integrated: Option<&[f64; 9]>,
+) -> Result<(Vec<f64>, f64)> {
+    let owned;
+    let (d, scale_h): (&[f64], f64) = if let Some(a) = integrated {
+        (a, 1.0)
+    } else {
+        owned = d_plane_stress(e, nu)?;
+        (&owned, h)
+    };
     let n = 8usize;
     let mut ke = vec![0.0; n * n];
     let mut area = 0.0;
@@ -991,13 +1026,19 @@ fn mem_quad4(xy: &[[f64; 2]; 4], e: f64, nu: f64, h: f64, reduced: bool) -> Resu
             d2[i] = dndx[i];
         }
         fill_b2(&mut b, 4, &d2);
-        gemm_bt_d_b(&mut ke, n, &b, 3, &d, h * w0 * det);
+        gemm_bt_d_b(&mut ke, n, &b, 3, d, scale_h * w0 * det);
         area += w0 * det;
     }
     Ok((ke, area))
 }
 
-fn mem_tri3(xy: &[[f64; 2]; 3], e: f64, nu: f64, h: f64) -> Result<(Vec<f64>, f64)> {
+fn mem_tri3(
+    xy: &[[f64; 2]; 3],
+    e: f64,
+    nu: f64,
+    h: f64,
+    integrated: Option<&[f64; 9]>,
+) -> Result<(Vec<f64>, f64)> {
     let x1 = xy[0][0];
     let y1 = xy[0][1];
     let x2 = xy[1][0];
@@ -1013,12 +1054,18 @@ fn mem_tri3(xy: &[[f64; 2]; 3], e: f64, nu: f64, h: f64) -> Result<(Vec<f64>, f6
     dndx[0] = [(y2 - y3) / two_a, (x3 - x2) / two_a];
     dndx[1] = [(y3 - y1) / two_a, (x1 - x3) / two_a];
     dndx[2] = [(y1 - y2) / two_a, (x2 - x1) / two_a];
-    let d = d_plane_stress(e, nu)?;
+    let owned;
+    let (d, scale_h): (&[f64], f64) = if let Some(a) = integrated {
+        (a, 1.0)
+    } else {
+        owned = d_plane_stress(e, nu)?;
+        (&owned, h)
+    };
     let n = 6usize;
     let mut ke = vec![0.0; n * n];
     let mut b = vec![0.0; 3 * n];
     fill_b2(&mut b, 3, &dndx);
-    gemm_bt_d_b(&mut ke, n, &b, 3, &d, h * a);
+    gemm_bt_d_b(&mut ke, n, &b, 3, d, scale_h * a);
     Ok((ke, a))
 }
 

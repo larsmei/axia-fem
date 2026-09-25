@@ -7,6 +7,7 @@
 
 use crate::elem::{d_plane_stress, gemm_bt_d_b, invert2, G2};
 use crate::error::{err, Result};
+use crate::ortho::ShellLaw;
 
 const K_SHEAR: f64 = 5.0 / 6.0;
 const DRILL: f64 = 1.0e-8;
@@ -308,26 +309,24 @@ pub fn s4_ke_bi(
     directors: Option<&[[f64; 3]]>,
     bi: f64,
 ) -> Result<(Vec<f64>, f64)> {
+    let law = crate::ortho::isotropic_shell(e, nu, h, bi)?;
+    s4_ke_law(xyz, &law, directors)
+}
+
+/// MITC4 with a pre-integrated plate law (MAT1, MAT2, MAT8 or PCOMP).
+pub fn s4_ke_law(
+    xyz: &[[f64; 3]],
+    law: &ShellLaw,
+    directors: Option<&[[f64; 3]]>,
+) -> Result<(Vec<f64>, f64)> {
     if xyz.len() < 4 {
         return err("S4: zu wenige Knoten.");
-    }
-    if h <= 0.0 {
-        return err("SHELL SECTION: Dicke muss positiv sein.");
     }
     let mut p = [[0.0; 3]; 4];
     p.copy_from_slice(&xyz[..4]);
     let an = resolve_directors(&p, directors)?;
     let nd = 24usize;
     let mut ke = vec![0.0; nd * nd];
-    let dm0 = d_plane_stress(e, nu)?;
-    let mut dm = [0.0; 9];
-    let mut db = [0.0; 9];
-    for i in 0..9 {
-        dm[i] = dm0[i] * h;
-        db[i] = dm0[i] * h * h * h / 12.0 * bi;
-    }
-    let gsh = e / (2.0 * (1.0 + nu)) * K_SHEAR * h;
-    let ds = [gsh, 0.0, 0.0, gsh];
     let tied = tied_rows(&p, &an)?;
     let mut area = 0.0;
     let mut e3_avg = [0.0; 3];
@@ -336,9 +335,9 @@ pub fn s4_ke_bi(
             let k = kin(&p, &an, xi, eta)?;
             let (bm, bb) = mb(&k, &an);
             let bs = shear_b(&k, xi, eta, &tied);
-            gemm_bt_d_b(&mut ke, nd, &bm, 3, &dm, k.da);
-            gemm_bt_d_b(&mut ke, nd, &bb, 3, &db, k.da);
-            gemm_bt_d_b(&mut ke, nd, &bs, 2, &ds, k.da);
+            gemm_bt_d_b(&mut ke, nd, &bm, 3, &law.a, k.da);
+            gemm_bt_d_b(&mut ke, nd, &bb, 3, &law.d, k.da);
+            gemm_bt_d_b(&mut ke, nd, &bs, 2, &law.ds, k.da);
             area += k.da;
             e3_avg = add(e3_avg, k.e3);
         }
@@ -348,7 +347,7 @@ pub fn s4_ke_bi(
     } else {
         an[0]
     };
-    let kd = DRILL * e * h * area / 4.0;
+    let kd = DRILL * law.drill_eh * area / 4.0;
     for a in 0..4 {
         for i in 0..3 {
             for j in 0..3 {

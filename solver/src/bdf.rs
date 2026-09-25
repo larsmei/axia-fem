@@ -88,7 +88,7 @@ pub const RECOGNIZED_BULK: &[&str] = &[
     "CELAS2", "CELAS3", "CELAS4", "PELAS", "CMASS1", "CMASS2", "CMASS3", "CMASS4", "PMASS", "CONM2",
     "CSHEAR", "PSHEAR", "CBUSH", "PBUSH", "RBE2", "RBE3", "FORCE", "MOMENT", "PLOAD2", "PLOAD4",
     "GRAV", "LOAD", "RFORCE", "SPC", "SPC1", "SPCADD", "MPC", "MPCADD", "TEMP", "TEMPD",
-    "TEMPP1", "TEMPRB",
+    "TEMPP1", "TEMPRB", "MAT2", "MAT8", "MAT9", "PCOMP", "PCOMP1",
 ];
 
 pub fn parse_with_base(text: &str, base: Option<&Path>) -> Result<Model> {
@@ -395,12 +395,25 @@ fn continuation_fields(line: &str, large: bool) -> Result<Vec<String>> {
 }
 
 #[derive(Clone)]
+enum PlateLaw {
+    Iso,
+    /// Plane-stress Q in material axes. `g1z`/`g2z` ≤ 0 means rigid transverse shear.
+    Aniso {
+        q: [f64; 9],
+        g1z: f64,
+        g2z: f64,
+    },
+    Solid([f64; 36]),
+}
+
+#[derive(Clone)]
 struct MatRec {
     e: f64,
     nu: f64,
     rho: f64,
     alpha: f64,
     tref: f64,
+    plate: PlateLaw,
 }
 
 #[derive(Clone)]
@@ -434,6 +447,12 @@ enum Prop {
     Shear {
         mid: i32,
         t: f64,
+    },
+    Comp {
+        z0: Option<f64>,
+        nsm: f64,
+        sym: bool,
+        plies: Vec<(i32, f64, f64)>,
     },
 }
 
@@ -593,7 +612,6 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     let mut spcadd: HashMap<i32, Vec<i32>> = HashMap::new();
     let mut rbes: Vec<(i32, i32, Vec<usize>, Vec<i32>)> = Vec::new();
     let mut unknown: HashMap<String, usize> = HashMap::new();
-    let mut warn_theta = false;
     let mut mpcs: HashMap<i32, Vec<Vec<(i32, usize, f64)>>> = HashMap::new();
     let mut mpcadd: HashMap<i32, Vec<i32>> = HashMap::new();
     let mut rbe3s: Vec<(i32, i32, Vec<usize>, Vec<(f64, Vec<usize>, Vec<i32>)>)> = Vec::new();
@@ -613,6 +631,7 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     let mut spring_pid: Vec<(usize, i32)> = Vec::new();
     let mut mass_pid: Vec<(usize, i32)> = Vec::new();
     let mut shear_raw: Vec<(i32, [i32; 4])> = Vec::new();
+    let mut elem_axis: HashMap<i32, String> = HashMap::new();
 
     for c in cards {
         let name = c.first().map(|s| s.as_str()).unwrap_or("");
@@ -715,6 +734,141 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                         rho,
                         alpha,
                         tref: field_f64(d, 6).unwrap_or(0.0),
+                        plate: PlateLaw::Iso,
+                    },
+                );
+            }
+            "MAT2" => {
+                let mid = req_i32(d, 0, "MAT2")?;
+                let g11 = field_f64(d, 1).unwrap_or(0.0);
+                let g12 = field_f64(d, 2).unwrap_or(0.0);
+                let g13 = field_f64(d, 3).unwrap_or(0.0);
+                let g22 = field_f64(d, 4).unwrap_or(0.0);
+                let g23 = field_f64(d, 5).unwrap_or(0.0);
+                let g33 = field_f64(d, 6).unwrap_or(0.0);
+                let mut q = [0.0; 9];
+                q[0] = g11;
+                q[1] = g12;
+                q[2] = g13;
+                q[3] = g12;
+                q[4] = g22;
+                q[5] = g23;
+                q[6] = g13;
+                q[7] = g23;
+                q[8] = g33;
+                let a1 = field_f64(d, 8).unwrap_or(0.0);
+                let a2 = field_f64(d, 9).unwrap_or(0.0);
+                let a3 = field_f64(d, 10).unwrap_or(0.0);
+                if a1.abs() + a2.abs() + a3.abs() > 0.0 {
+                    model.warn(format!(
+                        "MAT2 {mid}: Wärmedehnung wird nur über A1 angesetzt, nicht richtungsabhängig."
+                    ));
+                }
+                mats.insert(
+                    mid,
+                    MatRec {
+                        e: g11.abs().max(g22.abs()).max(1.0),
+                        nu: 0.0,
+                        rho: field_f64(d, 7).unwrap_or(0.0),
+                        alpha: a1,
+                        tref: field_f64(d, 11).unwrap_or(0.0),
+                        plate: PlateLaw::Aniso { q, g1z: 0.0, g2z: 0.0 },
+                    },
+                );
+            }
+            "MAT8" => {
+                let mid = req_i32(d, 0, "MAT8")?;
+                let e1 = field_f64(d, 1).unwrap_or(0.0);
+                let e2 = field_f64(d, 2).unwrap_or(0.0);
+                let nu12 = field_f64(d, 3).unwrap_or(0.0);
+                let g12 = field_f64(d, 4).unwrap_or(0.0);
+                let g1z = field_f64(d, 5).unwrap_or(0.0);
+                let g2z = field_f64(d, 6).unwrap_or(0.0);
+                let a1 = field_f64(d, 8).unwrap_or(0.0);
+                let a2 = field_f64(d, 9).unwrap_or(0.0);
+                if a1.abs() + a2.abs() > 0.0 {
+                    model.warn(format!(
+                        "MAT8 {mid}: Wärmedehnung wird nur über A1 angesetzt, nicht richtungsabhängig."
+                    ));
+                }
+                let q = crate::ortho::q_ortho(e1, e2, nu12, g12)?;
+                mats.insert(
+                    mid,
+                    MatRec {
+                        e: e1,
+                        nu: nu12,
+                        rho: field_f64(d, 7).unwrap_or(0.0),
+                        alpha: a1,
+                        tref: field_f64(d, 10).unwrap_or(0.0),
+                        plate: PlateLaw::Aniso { q, g1z, g2z },
+                    },
+                );
+            }
+            "MAT9" => {
+                let mid = req_i32(d, 0, "MAT9")?;
+                let (g, rho, alpha, tref) = mat9_fields(d);
+                if alpha.iter().any(|v| v.abs() > 0.0) {
+                    model.warn(format!(
+                        "MAT9 {mid}: anisotrope Wärmedehnung wird nicht angesetzt."
+                    ));
+                }
+                mats.insert(
+                    mid,
+                    MatRec {
+                        e: g[0].abs().max(1.0),
+                        nu: 0.0,
+                        rho,
+                        alpha: alpha[0],
+                        tref,
+                        plate: PlateLaw::Solid(g),
+                    },
+                );
+            }
+            "PCOMP" => {
+                let pid = req_i32(d, 0, "PCOMP")?;
+                let lam = field(d, 7).to_ascii_uppercase();
+                if !lam.is_empty() && lam != "SYM" && lam != "NONSYM" {
+                    model.warn(format!("PCOMP {pid}: LAM '{lam}' wird wie NONSYM gelesen."));
+                }
+                let plies = parse_plies(d)?;
+                if plies.is_empty() {
+                    return err(format!("PCOMP {pid} ohne Lagen."));
+                }
+                props.insert(
+                    pid,
+                    Prop::Comp {
+                        z0: field_f64(d, 1),
+                        nsm: field_f64(d, 2).unwrap_or(0.0),
+                        sym: lam == "SYM",
+                        plies,
+                    },
+                );
+            }
+            "PCOMP1" => {
+                let pid = req_i32(d, 0, "PCOMP1")?;
+                let mid = req_i32(d, 5, "PCOMP1 MID")?;
+                let t = field_f64(d, 6).unwrap_or(0.0);
+                if t <= 0.0 {
+                    return err(format!("PCOMP1 {pid}: Lagendicke muss positiv sein."));
+                }
+                let lam = field(d, 7).to_ascii_uppercase();
+                let mut plies = Vec::new();
+                for i in 8..d.len() {
+                    if field(d, i).is_empty() {
+                        continue;
+                    }
+                    plies.push((mid, t, field_f64(d, i).unwrap_or(0.0)));
+                }
+                if plies.is_empty() {
+                    return err(format!("PCOMP1 {pid} ohne Winkel."));
+                }
+                props.insert(
+                    pid,
+                    Prop::Comp {
+                        z0: field_f64(d, 1),
+                        nsm: field_f64(d, 2).unwrap_or(0.0),
+                        sym: lam == "SYM",
+                        plies,
                     },
                 );
             }
@@ -878,11 +1032,12 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 }
             }
             "CQUAD4" | "CQUAD4K" => {
-                if field_f64(d, 6).unwrap_or(0.0).abs() > 1e-8 {
-                    warn_theta = true;
+                let eid = req_i32(d, 0, name)?;
+                if !field(d, 6).is_empty() {
+                    elem_axis.insert(eid, field(d, 6).to_string());
                 }
                 elements.push(BuiltEl::Std {
-                    eid: req_i32(d, 0, name)?,
+                    eid,
                     kind: ElemKind::Shell4,
                     nodes: vec![
                         req_i32(d, 2, name)?,
@@ -894,6 +1049,10 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 });
             }
             "CTRIA3" | "CTRIA3K" => {
+                let eid = req_i32(d, 0, name)?;
+                if !field(d, 5).is_empty() {
+                    elem_axis.insert(eid, field(d, 5).to_string());
+                }
                 elements.push(BuiltEl::Std {
                     eid: req_i32(d, 0, name)?,
                     kind: ElemKind::Shell3,
@@ -1408,9 +1567,6 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
         }
     }
 
-    if warn_theta {
-        model.warn("CQUAD4-Materialwinkel wird ignoriert (isotropes MITC4).");
-    }
     if !unknown.is_empty() {
         let mut names: Vec<_> = unknown.keys().cloned().collect();
         names.sort();
@@ -1515,10 +1671,27 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                     nodes: nodes.clone(),
                     elset,
                 });
+                let axis = elem_axis.get(eid).map(|s| s.as_str()).unwrap_or("");
+                install_law(
+                    &mut model,
+                    *eid,
+                    kind,
+                    nodes,
+                    *pid,
+                    axis,
+                    &mats,
+                    &props,
+                    &cords,
+                )?;
                 elem_kind.insert(*eid, kind);
                 elem_nodes.insert(*eid, nodes.clone());
             }
             BuiltEl::Conrod { eid, g1, g2, mid, area } => {
+            if let Some(m) = mats.get(mid) {
+                if !matches!(m.plate, PlateLaw::Iso) {
+                    return err(format!("CONROD {eid}: Material {mid} muss MAT1 sein."));
+                }
+            }
                 let elset = format!("CONROD{eid}");
                 bind_mat(&mut model, &mats, &elset, *mid, wtmass)?;
                 model.elset_thickness.insert(elset.clone(), *area);
@@ -1923,6 +2096,10 @@ fn bind_prop(
             model.elset_thickness.insert(elset.clone(), *area);
             false
         }
+        Prop::Comp { nsm, sym, plies, .. } => {
+            bind_comp(model, mats, &elset, pid, *nsm, *sym, plies, wtmass)?;
+            false
+        }
         Prop::Bar { .. } | Prop::Bush { .. } | Prop::Shear { .. } => false,
     };
     Ok((elset, membrane))
@@ -1930,7 +2107,7 @@ fn bind_prop(
 
 fn bind_mat(model: &mut Model, mats: &HashMap<i32, MatRec>, elset: &str, mid: i32, wtmass: f64) -> Result<()> {
     let m = mats.get(&mid).ok_or_else(|| {
-        crate::error::FemError(format!("MAT1 {mid} fehlt."))
+        crate::error::FemError(format!("Material {mid} fehlt."))
     })?;
     let name = format!("M{mid}");
     model.materials.entry(name.clone()).or_insert(Material {
@@ -2913,6 +3090,309 @@ fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+fn mat9_fields(d: &[String]) -> ([f64; 36], f64, [f64; 6], f64) {
+    let pairs = [
+        (0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5),
+        (1, 1), (1, 2), (1, 3), (1, 4), (1, 5),
+        (2, 2), (2, 3), (2, 4), (2, 5),
+        (3, 3), (3, 4), (3, 5),
+        (4, 4), (4, 5),
+        (5, 5),
+    ];
+    let mut g = [0.0; 36];
+    for (k, (i, j)) in pairs.iter().enumerate() {
+        let v = field_f64(d, k + 1).unwrap_or(0.0);
+        g[i * 6 + j] = v;
+        g[j * 6 + i] = v;
+    }
+    let rho = field_f64(d, 22).unwrap_or(0.0);
+    let mut alpha = [0.0; 6];
+    for i in 0..6 {
+        alpha[i] = field_f64(d, 23 + i).unwrap_or(0.0);
+    }
+    (g, rho, alpha, field_f64(d, 29).unwrap_or(0.0))
+}
+
+fn parse_plies(d: &[String]) -> Result<Vec<(i32, f64, f64)>> {
+    let mut out = Vec::new();
+    let mut last_mid: Option<i32> = None;
+    let mut last_t: Option<f64> = None;
+    let mut i = 8;
+    while i < d.len() {
+        let a = field(d, i);
+        let b = field(d, i + 1);
+        let c = field(d, i + 2);
+        let s = field(d, i + 3);
+        if a.is_empty() && b.is_empty() && c.is_empty() && s.is_empty() {
+            i += 4;
+            continue;
+        }
+        let mid = if a.is_empty() {
+            last_mid.ok_or_else(|| crate::error::FemError("PCOMP: MID fehlt.".into()))?
+        } else {
+            parse_i32(a)?
+        };
+        let t = if b.is_empty() {
+            last_t.ok_or_else(|| crate::error::FemError("PCOMP: Lagendicke fehlt.".into()))?
+        } else {
+            parse_f64(b)?
+        };
+        let th = if c.is_empty() { 0.0 } else { parse_f64(c)? };
+        let _ = s;
+        last_mid = Some(mid);
+        last_t = Some(t);
+        out.push((mid, t, th));
+        i += 4;
+    }
+    Ok(out)
+}
+
+fn expand_plies(plies: &[(i32, f64, f64)], sym: bool) -> Vec<(i32, f64, f64)> {
+    if !sym {
+        return plies.to_vec();
+    }
+    let mut v = plies.to_vec();
+    for p in plies.iter().rev() {
+        v.push(*p);
+    }
+    v
+}
+
+fn bind_comp(
+    model: &mut Model,
+    mats: &HashMap<i32, MatRec>,
+    elset: &str,
+    pid: i32,
+    nsm: f64,
+    sym: bool,
+    plies: &[(i32, f64, f64)],
+    wtmass: f64,
+) -> Result<()> {
+    let expanded = expand_plies(plies, sym);
+    let mut tsum = 0.0;
+    let mut mass = 0.0;
+    let mut e_rep = 1.0;
+    let mut nu_rep = 0.0;
+    let mut alpha = 0.0;
+    let mut tref = 0.0;
+    for (mid, t, _) in &expanded {
+        let m = mats.get(mid).ok_or_else(|| {
+            crate::error::FemError(format!("PCOMP {pid}: Material {mid} fehlt."))
+        })?;
+        if matches!(m.plate, PlateLaw::Solid(_)) {
+            return err(format!("PCOMP {pid}: MAT9 {mid} ist kein Plattenmaterial."));
+        }
+        if *t <= 0.0 {
+            return err(format!("PCOMP {pid}: Lagendicke muss positiv sein."));
+        }
+        tsum += *t;
+        mass += m.rho * *t;
+        e_rep = m.e;
+        nu_rep = m.nu;
+        alpha = m.alpha;
+        tref = m.tref;
+    }
+    if tsum <= 0.0 {
+        return err(format!("PCOMP {pid}: Gesamtdicke muss positiv sein."));
+    }
+    let name = format!("PCOMP{pid}");
+    model.materials.entry(name.clone()).or_insert(Material {
+        e: e_rep,
+        nu: nu_rep,
+        density: (mass / tsum + nsm / tsum) * wtmass,
+        alpha,
+        tref,
+        ..Material::default()
+    });
+    model.elset_material.insert(elset.to_string(), name);
+    model.elset_thickness.insert(elset.to_string(), tsum);
+    Ok(())
+}
+
+fn shellish(kind: ElemKind) -> bool {
+    matches!(
+        kind,
+        ElemKind::Shell4
+            | ElemKind::Shell4R
+            | ElemKind::Shell3
+            | ElemKind::Mem4
+            | ElemKind::Mem4R
+            | ElemKind::Mem3
+    )
+}
+
+fn install_law(
+    model: &mut Model,
+    eid: i32,
+    kind: ElemKind,
+    nodes: &[i32],
+    pid: i32,
+    axis: &str,
+    mats: &HashMap<i32, MatRec>,
+    props: &HashMap<i32, Prop>,
+    cords: &HashMap<i32, Cord>,
+) -> Result<()> {
+    let Some(prop) = props.get(&pid) else {
+        return Ok(());
+    };
+    match prop {
+        Prop::Comp { z0, sym, plies, .. } => {
+            if !shellish(kind) {
+                return err(format!("PCOMP {pid} nur auf CQUAD4 und CTRIA3."));
+            }
+            let xyz = nodes_xyz(model, nodes)?;
+            let th = material_angle(axis, cords, &xyz)?;
+            let (law, coupled) = pcomp_law(mats, pid, plies, *sym, *z0, th)?;
+            if coupled {
+                let msg = format!("PCOMP {pid}: Kopplung B wird nicht angesetzt.");
+                if !model.warnings.iter().any(|w| w == &msg) {
+                    model.warn(msg);
+                }
+            }
+            model.shell_law.insert(eid, law);
+        }
+        Prop::Shell { mid, t, bend, .. } => match plate_of(mats, *mid)? {
+            PlateOf::Iso => {}
+            PlateOf::Aniso { q, g1z, g2z, e } => {
+                if !shellish(kind) {
+                    return err(format!("MAT2/MAT8 {mid} nur auf CQUAD4 und CTRIA3."));
+                }
+                let xyz = nodes_xyz(model, nodes)?;
+                let th = material_angle(axis, cords, &xyz)?;
+                let law = crate::ortho::homogeneous_plate(&q, *t, *bend, th, g1z, g2z, e)?;
+                model.shell_law.insert(eid, law);
+            }
+            PlateOf::SolidD(_) => return err(format!("MAT9 {mid} nur auf linearem CHEXA.")),
+        },
+        Prop::Solid { mid } => match plate_of(mats, *mid)? {
+            PlateOf::SolidD(d) => {
+                if kind != ElemKind::Hex8 {
+                    return err(format!("MAT9 {mid} nur auf linearem CHEXA."));
+                }
+                model.solid_d.insert(eid, d);
+            }
+            PlateOf::Aniso { .. } => {
+                return err(format!("MAT2/MAT8 {mid} nur auf CQUAD4 und CTRIA3."));
+            }
+            PlateOf::Iso => {}
+        },
+        Prop::Rod { mid, .. } | Prop::Bar { mid, .. } | Prop::Shear { mid, .. } => {
+            if !matches!(plate_of(mats, *mid)?, PlateOf::Iso) {
+                return err(format!("Material {mid} muss MAT1 sein."));
+            }
+        }
+        Prop::Bush { .. } => {}
+    }
+    Ok(())
+}
+
+enum PlateOf {
+    Iso,
+    SolidD([f64; 36]),
+    Aniso {
+        q: [f64; 9],
+        g1z: f64,
+        g2z: f64,
+        e: f64,
+    },
+}
+
+fn plate_of(mats: &HashMap<i32, MatRec>, mid: i32) -> Result<PlateOf> {
+    let m = mats.get(&mid).ok_or_else(|| {
+        crate::error::FemError(format!("Material {mid} fehlt."))
+    })?;
+    Ok(match &m.plate {
+        PlateLaw::Iso => PlateOf::Iso,
+        PlateLaw::Aniso { q, g1z, g2z } => PlateOf::Aniso {
+            q: *q,
+            g1z: *g1z,
+            g2z: *g2z,
+            e: m.e,
+        },
+        PlateLaw::Solid(d) => PlateOf::SolidD(*d),
+    })
+}
+
+fn pcomp_law(
+    mats: &HashMap<i32, MatRec>,
+    pid: i32,
+    plies: &[(i32, f64, f64)],
+    sym: bool,
+    z0: Option<f64>,
+    elem_theta: f64,
+) -> Result<(crate::ortho::ShellLaw, bool)> {
+    let expanded = expand_plies(plies, sym);
+    let mut tsum = 0.0;
+    let mut stack = Vec::new();
+    for (mid, t, th) in &expanded {
+        let m = mats.get(mid).ok_or_else(|| {
+            crate::error::FemError(format!("PCOMP {pid}: Material {mid} fehlt."))
+        })?;
+        let (q, g1z, g2z) = match &m.plate {
+            PlateLaw::Iso => {
+                let g = if (1.0 + m.nu).abs() < 1e-12 {
+                    0.0
+                } else {
+                    m.e / (2.0 * (1.0 + m.nu))
+                };
+                (crate::ortho::q_ortho(m.e, m.e, m.nu, g.max(0.0))?, g.max(0.0), g.max(0.0))
+            }
+            PlateLaw::Aniso { q, g1z, g2z } => (*q, *g1z, *g2z),
+            PlateLaw::Solid(_) => {
+                return err(format!("PCOMP {pid}: MAT9 {mid} ist kein Plattenmaterial."));
+            }
+        };
+        stack.push(crate::ortho::PlyQ {
+            q,
+            t: *t,
+            theta_deg: elem_theta + *th,
+            g1z,
+            g2z,
+            drill_e: m.e,
+        });
+        tsum += *t;
+    }
+    let z = z0.unwrap_or(-0.5 * tsum);
+    crate::ortho::laminate(&stack, z)
+}
+
+fn nodes_xyz(model: &Model, nodes: &[i32]) -> Result<Vec<[f64; 3]>> {
+    let mut xyz = Vec::with_capacity(nodes.len());
+    for id in nodes {
+        xyz.push(model.coords[model.node_index(*id)?]);
+    }
+    Ok(xyz)
+}
+
+fn material_angle(tok: &str, cords: &HashMap<i32, Cord>, xyz: &[[f64; 3]]) -> Result<f64> {
+    let t = tok.trim();
+    if t.is_empty() {
+        return Ok(0.0);
+    }
+    if is_int_token(t) {
+        if let Ok(cid) = parse_i32(t) {
+            if let Some(c) = cords.get(&cid) {
+                return mcid_angle(c, xyz);
+            }
+        }
+    }
+    parse_f64(t)
+}
+
+fn is_int_token(t: &str) -> bool {
+    let s = t.strip_prefix('+').or_else(|| t.strip_prefix('-')).unwrap_or(t);
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn mcid_angle(c: &Cord, xyz: &[[f64; 3]]) -> Result<f64> {
+    let (e1, e2, e3) = crate::shell::local_frame(xyz, xyz.len())?;
+    let proj = sub3(c.ex, scale3(e3, dot3(c.ex, e3)));
+    if norm3(proj) < 1e-12 {
+        return err("MCID: die x-Achse steht senkrecht auf der Elementebene.");
+    }
+    Ok(dot3(proj, e2).atan2(dot3(proj, e1)).to_degrees())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3762,5 +4242,83 @@ ENDDATA
         let fx = 2.0 * w2 * 3.0;
         assert!((out.rf[i][0] + fx).abs() / fx < 1e-6, "rx {} fx {fx}", out.rf[i][0]);
         assert!(out.rf[i][1].abs() < 1e-8, "ry {}", out.rf[i][1]);
+    }
+
+    fn square_ux(elem_tail: &str, props: &str) -> f64 {
+        let deck = format!(
+            "SOL 101\nCEND\nSPC = 1\nLOAD = 1\nBEGIN BULK\n\
+GRID,1,,0.,0.,0.\nGRID,2,,1.,0.,0.\nGRID,3,,1.,1.,0.\nGRID,4,,0.,1.,0.\n\
+CQUAD4,1,1,1,2,3,4{elem_tail}\n{props}\n\
+SPC1,1,3456,1,THRU,4\nSPC1,1,1,1,4\nSPC,1,1,2,0.\n\
+FORCE,1,2,0,0.5,1.,0.,0.\nFORCE,1,3,0,0.5,1.,0.,0.\nENDDATA\n"
+        );
+        let out = solve(parse_with_base(&deck, None).unwrap()).unwrap();
+        let i = out.model.node_index(2).unwrap();
+        let j = out.model.node_index(3).unwrap();
+        let ux = out.u[i][0];
+        assert!((out.u[j][0] - ux).abs() < 1e-8, "ux2 {ux} ux3 {}", out.u[j][0]);
+        ux
+    }
+
+    #[test]
+    fn mat8_theta_90_uses_e2_not_mystran_issue_102() {
+        let props = "PSHELL,1,1,1.\nMAT8,1,2.,3.,0.,1.";
+        let ux = square_ux(",90.", props);
+        assert!((ux - 1.0 / 3.0).abs() < 1e-4, "ux={ux}, MYSTRAN ohne THETA wäre 0.5");
+        let ux0 = square_ux("", props);
+        assert!((ux0 - 0.5).abs() < 1e-4, "ux0={ux0}");
+    }
+
+    #[test]
+    fn mat2_membrane_is_one_over_g11() {
+        let ux = square_ux("", "PSHELL,1,1,1.\nMAT2,1,2.,0.,0.,3.,0.,1.");
+        assert!((ux - 0.5).abs() < 1e-4, "ux={ux}");
+    }
+
+    #[test]
+    fn pcomp_ply_theta_90_matches_mat8() {
+        let props = "PCOMP,1\n,1,1.,90.\nMAT8,1,2.,3.,0.,1.";
+        let ux = square_ux("", props);
+        assert!((ux - 1.0 / 3.0).abs() < 1e-4, "ux={ux}");
+        let props1 = "PCOMP1,1,,0.,,,1,1.\n,90.\nMAT8,1,2.,3.,0.,1.";
+        let ux1 = square_ux("", props1);
+        assert!((ux1 - 1.0 / 3.0).abs() < 1e-4, "pcomp1 ux={ux1}");
+    }
+
+    #[test]
+    fn pcomp_nsm_is_mass_per_area() {
+        let deck = "\
+SOL 101\nCEND\nBEGIN BULK\n\
+GRID,1,,0.,0.,0.\nGRID,2,,1.,0.,0.\nGRID,3,,1.,1.,0.\nGRID,4,,0.,1.,0.\n\
+CQUAD4,1,1,1,2,3,4\nPCOMP,1,,2.\n,1,1.,0.\nMAT8,1,2.,3.,0.,1.\nENDDATA\n";
+        let m = parse_with_base(deck, None).unwrap();
+        let mat = m.materials.values().next().unwrap();
+        assert!((mat.density - 2.0).abs() < 1e-12, "rho {}", mat.density);
+    }
+
+    #[test]
+    fn mat9_hex_uniaxial_and_tet_rejected() {
+        let deck = "\
+SOL 101\nCEND\nSPC = 1\nLOAD = 1\nBEGIN BULK\n\
+GRID,1,,0.,0.,0.\nGRID,2,,1.,0.,0.\nGRID,3,,1.,1.,0.\nGRID,4,,0.,1.,0.\n\
+GRID,5,,0.,0.,1.\nGRID,6,,1.,0.,1.\nGRID,7,,1.,1.,1.\nGRID,8,,0.,1.,1.\n\
+CHEXA,1,1,1,2,3,4,5,6,\n,7,8\n\
+PSOLID,1,1\n\
+MAT9,1,2.,0.,0.,0.,0.,0.,1.\n\
+,0.,0.,0.,0.,1.,0.,0.,0.\n\
+,1.,0.,0.,1.,0.,1.\n\
+SPC1,1,23,1,THRU,8\nSPC1,1,1,1,4,5,8\n\
+FORCE,1,2,0,0.25,1.,0.,0.\nFORCE,1,3,0,0.25,1.,0.,0.\n\
+FORCE,1,6,0,0.25,1.,0.,0.\nFORCE,1,7,0,0.25,1.,0.,0.\n\
+ENDDATA\n";
+        let out = solve(parse_with_base(deck, None).unwrap()).unwrap();
+        let ux = out.u[out.model.node_index(2).unwrap()][0];
+        assert!((ux - 0.5).abs() < 1e-4, "ux={ux}");
+        let bad = "\
+SOL 101\nCEND\nBEGIN BULK\n\
+GRID,1,,0.,0.,0.\nGRID,2,,1.,0.,0.\nGRID,3,,0.,1.,0.\nGRID,4,,0.,0.,1.\n\
+CTETRA,1,1,1,2,3,4\nPSOLID,1,1\nMAT9,1,2.\nENDDATA\n";
+        let err = parse_with_base(bad, None).unwrap_err();
+        assert!(err.to_string().contains("MAT9"), "{err}");
     }
 }

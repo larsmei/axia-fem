@@ -427,7 +427,7 @@ fn assemble_nl_element(
         } else {
             model.thickness_for(el)
         };
-        let kef = element_ke(el.kind, xyz0, mat.e, mat.nu, th, None, None, 1.0)?;
+        let kef = element_ke(el.kind, xyz0, mat.e, mat.nu, th, None, None, 1.0, None, None)?;
         let n = kef.ndof;
         let mut fe = vec![0.0; n];
         for i in 0..n {
@@ -597,6 +597,8 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
             sec.as_ref(),
             dirs.as_deref(),
             model.bend_scale(el),
+            model.shell_law.get(&el.id),
+            model.solid_d.get(&el.id),
         )?;
         if !model.node_transform.is_empty() {
             constraint::transform_ke(
@@ -3007,6 +3009,8 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
             sec.as_ref(),
             dirs.as_deref(),
             model.bend_scale(el),
+            model.shell_law.get(&el.id),
+            model.solid_d.get(&el.id),
         )?;
         if !model.node_transform.is_empty() {
             constraint::transform_ke(

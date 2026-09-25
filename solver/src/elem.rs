@@ -193,6 +193,10 @@ pub(crate) fn hex8_dndx(xyz: &[[f64; 3]; 8], xi: f64, eta: f64, zeta: f64) -> Re
 
 fn hex8_stiffness(xyz: &[[f64; 3]; 8], e: f64, nu: f64) -> Result<(Vec<f64>, f64)> {
     let d = d_iso_3d(e, nu)?;
+    hex8_stiffness_d(xyz, &d)
+}
+
+fn hex8_stiffness_d(xyz: &[[f64; 3]; 8], d: &[f64; 36]) -> Result<(Vec<f64>, f64)> {
     let n = 24usize;
     let mut ke = vec![0.0; n * n];
     let mut vol = 0.0;
@@ -206,7 +210,7 @@ fn hex8_stiffness(xyz: &[[f64; 3]; 8], e: f64, nu: f64) -> Result<(Vec<f64>, f64
                 }
                 let mut b = vec![0.0; 6 * n];
                 fill_b3(&mut b, 8, &dndx);
-                gemm_bt_d_b(&mut ke, n, &b, 6, &d, det);
+                gemm_bt_d_b(&mut ke, n, &b, 6, d, det);
                 vol += det;
             }
         }
@@ -346,6 +350,8 @@ pub fn element_ke(
     section: Option<&BeamSection>,
     directors: Option<&[[f64; 3]]>,
     bend: f64,
+    plate: Option<&crate::ortho::ShellLaw>,
+    solid: Option<&[f64; 36]>,
 ) -> Result<KeFe> {
     match kind {
         ElemKind::Hex8 => {
@@ -353,7 +359,11 @@ pub fn element_ke(
             for i in 0..8 {
                 p[i] = xyz[i];
             }
-            let (ke, vol) = hex8_stiffness(&p, e, nu)?;
+            let (ke, vol) = if let Some(d) = solid {
+                hex8_stiffness_d(&p, d)?
+            } else {
+                hex8_stiffness(&p, e, nu)?
+            };
             let ndof = 24;
             Ok(KeFe {
                 ke,
@@ -526,7 +536,11 @@ pub fn element_ke(
             })
         }
         ElemKind::Shell4 | ElemKind::Shell4R => {
-            let (ke, area) = crate::mitc4::s4_ke_bi(xyz, e, nu, thickness, directors, bend)?;
+            let (ke, area) = if let Some(law) = plate {
+                crate::mitc4::s4_ke_law(xyz, law, directors)?
+            } else {
+                crate::mitc4::s4_ke_bi(xyz, e, nu, thickness, directors, bend)?
+            };
             let ndof = 24;
             Ok(KeFe {
                 ke,
@@ -536,7 +550,14 @@ pub fn element_ke(
             })
         }
         ElemKind::Shell3 | ElemKind::Shell8 | ElemKind::Shell8R | ElemKind::Shell6 => {
-            let (ke, area) = shell::stiffness_bend(kind, xyz, e, nu, thickness, bend)?;
+            let (ke, area) = if let Some(law) = plate {
+                if kind != ElemKind::Shell3 {
+                    return err("MAT8/MAT2/PCOMP nur auf CQUAD4 und CTRIA3.");
+                }
+                shell::tri_shell_law(xyz, law)?
+            } else {
+                shell::stiffness_bend(kind, xyz, e, nu, thickness, bend)?
+            };
             let ndof = 6 * kind.nnodes();
             Ok(KeFe {
                 ke,
@@ -546,7 +567,14 @@ pub fn element_ke(
             })
         }
         ElemKind::Mem3 | ElemKind::Mem4 | ElemKind::Mem4R | ElemKind::Mem6 | ElemKind::Mem8 => {
-            let (ke, area) = shell::membrane_stiffness(kind, xyz, e, nu, thickness)?;
+            let (ke, area) = if let Some(law) = plate {
+                if !matches!(kind, ElemKind::Mem3 | ElemKind::Mem4 | ElemKind::Mem4R) {
+                    return err("MAT8/MAT2/PCOMP nur auf CQUAD4 und CTRIA3.");
+                }
+                shell::membrane_stiffness(kind, xyz, e, nu, thickness, Some(&law.a))?
+            } else {
+                shell::membrane_stiffness(kind, xyz, e, nu, thickness, None)?
+            };
             let ndof = 3 * kind.nnodes();
             Ok(KeFe {
                 ke,

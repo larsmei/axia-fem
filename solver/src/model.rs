@@ -1055,6 +1055,10 @@ pub struct Model {
     pub mass_arms: HashMap<i32, [f64; 3]>,
     /// Force 6 DOF per node even without beams or shells (rotational springs, inertia).
     pub use_six: bool,
+    /// Orthotropic/composite plate law keyed by element id. Absent means isotropic.
+    pub shell_law: HashMap<i32, crate::ortho::ShellLaw>,
+    /// MAT9 elasticity keyed by element id. Only linear CHEXA.
+    pub solid_d: HashMap<i32, [f64; 36]>,
 }
 
 impl Model {
@@ -1131,6 +1135,8 @@ impl Model {
             shears: Vec::new(),
             mass_arms: HashMap::new(),
             use_six: false,
+            shell_law: HashMap::new(),
+            solid_d: HashMap::new(),
         }
     }
 
