@@ -118,7 +118,7 @@ pub static CARDS: &[Card] = &[
         CardStatus::Declined,
         "PARVEC1 ist ein MYSTRAN-Debug-Vektor und wird nicht gerechnet.",
     ),
-    card("CQUAD8", CardStatus::Declined, "quadratische Schale wird nicht gerechnet."),
+    card("CQUAD8", CardStatus::Implemented, "S8, Ecken dann Mitten, THETA/MCID"),
     card("PLOTEL", CardStatus::Implemented, "nur Plot, ohne Steifigkeit"),
     card(
         "PUSERIN",

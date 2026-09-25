@@ -85,7 +85,7 @@ pub fn is_mystran_deck(text: &str) -> bool {
 pub const RECOGNIZED_BULK: &[&str] = &[
     "PARAM", "DEBUG", "EIGRL", "GRDSET", "GRID", "CORD1C", "CORD1R", "CORD1S", "CORD2C", "CORD2R",
     "CORD2S", "MAT1", "PSHELL", "PSOLID", "PROD", "PBAR", "PBARL", "CROD", "CONROD", "CBAR", "CBEAM",
-    "BAROR", "CQUAD4", "CQUAD4K", "CTRIA3", "CTRIA3K", "CTETRA", "CHEXA", "CPENTA", "CELAS1",
+    "BAROR", "CQUAD4", "CQUAD4K", "CQUAD8", "CTRIA3", "CTRIA3K", "CTETRA", "CHEXA", "CPENTA", "CELAS1",
     "CELAS2", "CELAS3", "CELAS4", "PELAS", "CMASS1", "CMASS2", "CMASS3", "CMASS4", "PMASS", "CONM2",
     "CSHEAR", "PSHEAR", "CBUSH", "PBUSH", "RBE2", "RBE3", "FORCE", "MOMENT", "PLOAD2", "PLOAD4",
     "GRAV", "LOAD", "RFORCE", "SPC", "SPC1", "SPCADD", "MPC", "MPCADD", "TEMP", "TEMPD",
@@ -1112,6 +1112,24 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                     pid: req_i32(d, 1, name)?,
                 });
             }
+            "CQUAD8" => {
+                // EID PID G1..G8, then T1..T4, THETA/MCID. Same corner-then-midside
+                // order as S8: G5 on 1-2, G6 on 2-3, G7 on 3-4, G8 on 4-1.
+                let eid = req_i32(d, 0, name)?;
+                if !field(d, 14).is_empty() {
+                    elem_axis.insert(eid, field(d, 14).to_string());
+                }
+                let mut nodes = Vec::with_capacity(8);
+                for i in 2..10 {
+                    nodes.push(req_i32(d, i, name)?);
+                }
+                elements.push(BuiltEl::Std {
+                    eid,
+                    kind: ElemKind::Shell8,
+                    nodes,
+                    pid: req_i32(d, 1, name)?,
+                });
+            }
             "CTRIA3" | "CTRIA3K" => {
                 let eid = req_i32(d, 0, name)?;
                 if !field(d, 5).is_empty() {
@@ -1727,6 +1745,11 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 } else {
                     *kind
                 };
+                let nodes = if kind == ElemKind::Hex20 {
+                    hex20_abaqus_nodes(&model, nodes)?
+                } else {
+                    nodes.clone()
+                };
                 model.elements.push(Element {
                     id: *eid,
                     kind,
@@ -1738,7 +1761,7 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                     &mut model,
                     *eid,
                     kind,
-                    nodes,
+                    &nodes,
                     *pid,
                     axis,
                     &mats,
@@ -3438,6 +3461,38 @@ fn pcomp_law(
     crate::ortho::laminate(&stack, z)
 }
 
+/// Mecway writes CHEXA20 in CalculiX-FRD order: after the bottom midsides,
+/// nodes 13–16 are the vertical edges and 17–20 the top face. Nastran and the
+/// Abaqus C3D20 used here put the top face in 13–16 and the vertical edges in
+/// 17–20. Keep whichever order has a positive Jacobian.
+fn hex20_abaqus_nodes(model: &Model, nodes: &[i32]) -> Result<Vec<i32>> {
+    if nodes.len() < 20 {
+        return Ok(nodes.to_vec());
+    }
+    let xyz = nodes_xyz(model, nodes)?;
+    if hex20_jac_positive(&xyz) {
+        return Ok(nodes.to_vec());
+    }
+    let mut swapped = nodes[..12].to_vec();
+    swapped.extend_from_slice(&nodes[16..20]);
+    swapped.extend_from_slice(&nodes[12..16]);
+    let xyz2 = nodes_xyz(model, &swapped)?;
+    if hex20_jac_positive(&xyz2) {
+        return Ok(swapped);
+    }
+    Ok(nodes.to_vec())
+}
+
+fn hex20_jac_positive(xyz: &[[f64; 3]]) -> bool {
+    for (xi, eta, zeta, _) in crate::quadratic::hex_gauss(false) {
+        match crate::quadratic::hex20_dndx(xyz, xi, eta, zeta) {
+            Ok((_, det, _)) if det > 0.0 => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn nodes_xyz(model: &Model, nodes: &[i32]) -> Result<Vec<[f64; 3]>> {
     let mut xyz = Vec::with_capacity(nodes.len());
     for id in nodes {
@@ -3617,6 +3672,109 @@ ENDDATA
         let deck = "SOL 1\nCEND\nBEGIN BULK\nCUSERIN,1\nGRID,1,,0,0,0\nENDDATA\n";
         let err = parse_with_base(deck, None).unwrap_err();
         assert!(err.to_string().contains("CUSERIN"), "{err}");
+    }
+
+    #[test]
+    fn cquad8_membrane_is_fl_over_ea() {
+        // Consistent edge loads on the quadratic side: corners F/6, midside 2F/3.
+        let deck = r#"
+SOL 101
+CEND
+SPC = 1
+LOAD = 1
+BEGIN BULK
+GRID,1,,0,0,0
+GRID,2,,1,0,0
+GRID,3,,1,1,0
+GRID,4,,0,1,0
+GRID,5,,0.5,0,0
+GRID,6,,1,0.5,0
+GRID,7,,0.5,1,0
+GRID,8,,0,0.5,0
+CQUAD8,1,1,1,2,3,4,5,6,7,8
+PSHELL,1,1,0.1,1
+MAT1,1,1000.,,0.
+SPC1,1,123456,1,4,8
+SPC1,1,23456,2,3,5,6,7
+FORCE,2,2,0,1.,1.,0.,0.
+FORCE,2,3,0,1.,1.,0.,0.
+FORCE,2,6,0,4.,1.,0.,0.
+LOAD,1,1.,1.,2
+ENDDATA
+"#;
+        let model = parse_with_base(deck, None).unwrap();
+        assert_eq!(model.elements[0].kind, ElemKind::Shell8);
+        let out = solve(model).unwrap();
+        let ux = |id: i32| {
+            let i = out.model.node_index(id).unwrap();
+            out.u[i][0]
+        };
+        // F = 6, A = t·h = 0.1, E = 1000, L = 1 → u = x·0.06
+        for id in [2, 3, 6] {
+            assert!((ux(id) - 0.06).abs() < 1e-4, "grid {id} ux={}", ux(id));
+        }
+        for id in [5, 7] {
+            assert!((ux(id) - 0.03).abs() < 1e-4, "grid {id} ux={}", ux(id));
+        }
+        for id in [1, 4, 8] {
+            assert!(ux(id).abs() < 1e-8, "grid {id} ux={}", ux(id));
+        }
+    }
+
+    #[test]
+    fn mecway_chexa20_matches_nastran_order() {
+        let grids = r#"
+GRID,1,,0,0,0
+GRID,2,,1,0,0
+GRID,3,,1,1,0
+GRID,4,,0,1,0
+GRID,5,,0,0,1
+GRID,6,,1,0,1
+GRID,7,,1,1,1
+GRID,8,,0,1,1
+GRID,9,,0.5,0,0
+GRID,10,,1,0.5,0
+GRID,11,,0.5,1,0
+GRID,12,,0,0.5,0
+GRID,13,,0.5,0,1
+GRID,14,,1,0.5,1
+GRID,15,,0.5,1,1
+GRID,16,,0,0.5,1
+GRID,17,,0,0,0.5
+GRID,18,,1,0,0.5
+GRID,19,,1,1,0.5
+GRID,20,,0,1,0.5
+"#;
+        let tail = r#"
+PSOLID,1,1
+MAT1,1,1000.,,0.
+SPC1,1,123,1,4,5,8,12,16,17,20
+FORCE,2,2,0,1.,1.,0.,0.
+FORCE,2,3,0,1.,1.,0.,0.
+FORCE,2,6,0,1.,1.,0.,0.
+FORCE,2,7,0,1.,1.,0.,0.
+LOAD,1,1.,1.,2
+"#;
+        let deck = |conn: &str| {
+            format!("SOL 101\nCEND\nSPC=1\nLOAD=1\nBEGIN BULK\n{grids}CHEXA,1,1,{conn}\n{tail}ENDDATA\n")
+        };
+        let nas = parse_with_base(
+            &deck("1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20"),
+            None,
+        )
+        .unwrap();
+        let mec = parse_with_base(
+            &deck("1,2,3,4,5,6,7,8,9,10,11,12,17,18,19,20,13,14,15,16"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(nas.elements[0].nodes, mec.elements[0].nodes);
+        assert_eq!(&nas.elements[0].nodes[12..16], &[13, 14, 15, 16]);
+        let a = solve(nas).unwrap();
+        let b = solve(mec).unwrap();
+        let i = a.model.node_index(2).unwrap();
+        assert!((a.u[i][0] - b.u[i][0]).abs() < 1e-8, "{} vs {}", a.u[i][0], b.u[i][0]);
+        assert!(a.u[i][0] > 1e-4, "ux={}", a.u[i][0]);
     }
 
     #[test]
