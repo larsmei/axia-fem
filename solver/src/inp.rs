@@ -216,6 +216,9 @@ pub fn parse(inp: &str) -> Result<Model> {
 }
 
 pub fn parse_with_base(inp: &str, base: Option<&Path>) -> Result<Model> {
+    if crate::bdf::is_mystran_deck(inp) {
+        return crate::bdf::parse_with_base(inp, base);
+    }
     let expanded = expand_includes(inp, base, 0)?;
     parse_expanded(&expanded)
 }

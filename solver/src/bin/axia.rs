@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use axia_fem::{
-    mkl_self_test, parse_model, parse_model_with_base, parse_sparse_backend, set_sparse_backend,
-    solve_native, solve_native_with_base, Model, SolveOutput,
+    is_mystran_deck, mkl_self_test, parse_model, parse_model_with_base, parse_sparse_backend,
+    set_sparse_backend, solve_native, solve_native_with_base, write_f06, Model, SolveOutput,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -31,13 +31,16 @@ struct Args {
     no_dat: bool,
     stdout_frd: bool,
     solver: Option<String>,
+    format: String,
+    f06: Option<PathBuf>,
+    no_f06: bool,
 }
 
 fn print_help() {
     let exe = env::args().next().unwrap_or_else(|| "axia".into());
     println!(
         "\
-Axia FEM {VERSION} — FEM solver (CalculiX INP / FRD / DAT)
+Axia FEM {VERSION} — FEM solver (CalculiX INP and MYSTRAN/Nastran BDF)
 
 Native sparse backends (see --solver):
     auto       PARDISO (MKL, then Panua) if present, else faer, else rivrs-sparse
@@ -50,22 +53,32 @@ Native sparse backends (see --solver):
     pcg        in-crate conjugate gradients
 The chosen solver is printed on stderr and in --json (`solver`).
 
+Input is detected automatically:
+    CalculiX / Abaqus INP  →  .frd and .dat
+    MYSTRAN / Nastran BDF  →  .f06
+    --format overrides the output (the input reader still follows the file).
+
 USAGE:
     {exe} [OPTIONS] <JOB>
     {exe} [OPTIONS] <JOB.inp>
-    {exe} [OPTIONS] -              # read INP from stdin
+    {exe} [OPTIONS] <JOB.bdf>
+    {exe} [OPTIONS] -              # read the deck from stdin
 
 ARGS:
-    <JOB>                 Job name or path. Reads JOB.inp, writes JOB.frd and JOB.dat
+    <JOB>                 Job name or path. Tries JOB, JOB.inp, JOB.bdf, JOB.nas, JOB.dat
 
 OPTIONS:
-    -i, --input <FILE>    Input INP (overrides JOB)
+    -i, --input <FILE>    Input deck (overrides JOB)
     -o, --output <STEM>   Output stem without extension (default: derived from input)
-        --frd <FILE>      Write FRD to this path
-        --dat <FILE>      Write DAT to this path
+    -f, --format <FMT>    Output format: auto (default), calculix, mystran
+                          calculix|ccx|frd writes FRD/DAT; mystran|f06|bdf writes F06
+        --frd <FILE>      Also write FRD to this path
+        --dat <FILE>      Also write DAT to this path
+        --f06 <FILE>      Also write F06 to this path
         --no-frd          Do not write a .frd file
         --no-dat          Do not write a .dat file
-        --stdout          Write FRD to stdout (implies --quiet --no-dat)
+        --no-f06          Do not write a .f06 file
+        --stdout          Write the selected output to stdout (implies --quiet)
         --json            Print solve statistics as JSON
         --check           Parse and report the mesh, do not solve
     -s, --solver <NAME>   Sparse backend: auto|mkl|panua|pardiso|faer|rivrs|cholesky|pcg
@@ -77,11 +90,12 @@ OPTIONS:
 
 EXAMPLES:
     {exe} cantilever              # cantilever.inp → cantilever.frd / .dat
-    {exe} model.inp
+    {exe} model.bdf               # MYSTRAN deck → model.f06
+    {exe} --format calculix model.bdf
     {exe} --solver faer job.inp
     {exe} -i deck.inp -o /tmp/run
     {exe} --check model.inp
-    cat model.inp | {exe} - --json
+    cat model.bdf | {exe} - --json
 "
     );
 }
@@ -101,6 +115,9 @@ fn parse_args() -> Result<Args, String> {
         no_dat: false,
         stdout_frd: false,
         solver: None,
+        format: "auto".into(),
+        f06: None,
+        no_f06: false,
     };
     let mut raw = env::args().skip(1);
     while let Some(a) = raw.next() {
@@ -121,6 +138,13 @@ fn parse_args() -> Result<Args, String> {
             }
             "--frd" => args.frd = Some(PathBuf::from(need(&mut raw, &a)?)),
             "--dat" => args.dat = Some(PathBuf::from(need(&mut raw, &a)?)),
+            "--f06" => args.f06 = Some(PathBuf::from(need(&mut raw, &a)?)),
+            "-f" | "--format" => {
+                args.format = need(&mut raw, &a)?;
+            }
+            s if s.starts_with("--format=") => {
+                args.format = s.trim_start_matches("--format=").to_string();
+            }
             "--json" => args.json = true,
             "--check" => args.check = true,
             "-s" | "--solver" => {
@@ -133,10 +157,13 @@ fn parse_args() -> Result<Args, String> {
             "-v" | "--verbose" => args.verbose = true,
             "--no-frd" => args.no_frd = true,
             "--no-dat" => args.no_dat = true,
+            "--no-f06" => args.no_f06 = true,
             "--stdout" => {
                 args.stdout_frd = true;
                 args.quiet = true;
                 args.no_dat = true;
+                args.no_frd = true;
+                args.no_f06 = true;
             }
             s if s.starts_with('-') => return Err(format!("unknown option '{s}'. Try --help.")),
             s => {
@@ -183,12 +210,17 @@ fn resolve_input(args: &Args) -> Result<(String, Option<PathBuf>), String> {
             let path = if p.exists() {
                 p
             } else {
-                let with = PathBuf::from(format!("{job}.inp"));
-                if with.exists() {
-                    with
-                } else {
-                    return Err(format!("cannot find '{job}' or '{job}.inp'"));
+                let mut found = None;
+                for ext in ["inp", "bdf", "nas", "dat"] {
+                    let with = PathBuf::from(format!("{job}.{ext}"));
+                    if with.exists() {
+                        found = Some(with);
+                        break;
+                    }
                 }
+                found.ok_or_else(|| {
+                    format!("cannot find '{job}', '{job}.inp' or '{job}.bdf'")
+                })?
             };
             let text = fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -197,19 +229,46 @@ fn resolve_input(args: &Args) -> Result<(String, Option<PathBuf>), String> {
     }
 }
 
-fn stem_from(args: &Args, input_path: Option<&Path>) -> PathBuf {
+fn stem_from(args: &Args, input_path: Option<&Path>, mystran_in: bool) -> PathBuf {
     if let Some(s) = &args.output_stem {
         return s.clone();
     }
     if let Some(p) = input_path {
         let mut s = p.to_path_buf();
-        if s.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("inp")) == Some(true)
-        {
+        let ext = s
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let strip = matches!(ext.as_str(), "inp" | "bdf" | "nas")
+            || (ext == "dat" && mystran_in);
+        if strip {
             s.set_extension("");
         }
         return s;
     }
     PathBuf::from("axia")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutFmt {
+    Calculix,
+    Mystran,
+}
+
+fn output_format(flag: &str, text: &str) -> Result<OutFmt, String> {
+    match flag.to_ascii_lowercase().as_str() {
+        "auto" | "" => Ok(if is_mystran_deck(text) {
+            OutFmt::Mystran
+        } else {
+            OutFmt::Calculix
+        }),
+        "calculix" | "ccx" | "frd" | "inp" => Ok(OutFmt::Calculix),
+        "mystran" | "f06" | "bdf" | "nastran" => Ok(OutFmt::Mystran),
+        other => Err(format!(
+            "unknown --format '{other}'. Use auto, calculix or mystran."
+        )),
+    }
 }
 
 fn type_counts(model: &Model) -> BTreeMap<String, usize> {
@@ -367,7 +426,9 @@ fn run() -> Result<(), String> {
         set_sparse_backend(b);
     }
     let (inp, input_path) = resolve_input(&args)?;
-    let stem = stem_from(&args, input_path.as_deref());
+    let fmt = output_format(&args.format, &inp)?;
+    let mystran_in = is_mystran_deck(&inp);
+    let stem = stem_from(&args, input_path.as_deref(), mystran_in);
 
     if args.check {
         let model = if let Some(p) = input_path.as_ref().and_then(|p| p.parent()) {
@@ -417,13 +478,26 @@ fn run() -> Result<(), String> {
     }
 
     if args.stdout_frd {
+        let text = match fmt {
+            OutFmt::Mystran => write_f06(&out.model, &out),
+            OutFmt::Calculix => out.frd.clone(),
+        };
         io::stdout()
-            .write_all(out.frd.as_bytes())
+            .write_all(text.as_bytes())
             .map_err(|e| format!("stdout: {e}"))?;
         return Ok(());
     }
 
-    if !args.no_frd {
+    let write_ccx = match fmt {
+        OutFmt::Calculix => true,
+        OutFmt::Mystran => args.frd.is_some() || args.dat.is_some(),
+    };
+    let write_my = match fmt {
+        OutFmt::Mystran => true,
+        OutFmt::Calculix => args.f06.is_some(),
+    };
+
+    if write_ccx && !args.no_frd {
         let path = args
             .frd
             .clone()
@@ -433,12 +507,22 @@ fn run() -> Result<(), String> {
             eprintln!("  wrote      {}", path.display());
         }
     }
-    if !args.no_dat {
+    if write_ccx && !args.no_dat {
         let path = args
             .dat
             .clone()
             .unwrap_or_else(|| stem.with_extension("dat"));
         write_file(&path, &out.dat)?;
+        if !args.quiet && !args.json {
+            eprintln!("  wrote      {}", path.display());
+        }
+    }
+    if write_my && !args.no_f06 {
+        let path = args
+            .f06
+            .clone()
+            .unwrap_or_else(|| stem.with_extension("f06"));
+        write_file(&path, &write_f06(&out.model, &out))?;
         if !args.quiet && !args.json {
             eprintln!("  wrote      {}", path.display());
         }

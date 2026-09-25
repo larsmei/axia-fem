@@ -962,6 +962,10 @@ pub struct Model {
     pub static_period: f64,
     /// `*STEP, AMPLITUDE=STEP`: unnamed loads jump to full value at t=0+ of the step.
     pub amplitude_step: bool,
+    /// MYSTRAN/Nastran SUBCASEs are independent load cases, not a path-dependent sequence.
+    pub independent_steps: bool,
+    /// Parallel to `steps` when `independent_steps` is set (SUBCASE label or title).
+    pub case_labels: Vec<String>,
 }
 
 impl Model {
@@ -1024,6 +1028,8 @@ impl Model {
             static_dt: 1.0,
             static_period: 1.0,
             amplitude_step: false,
+            independent_steps: false,
+            case_labels: Vec::new(),
         }
     }
 

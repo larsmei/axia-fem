@@ -20,6 +20,9 @@ mod nlgeom;
 mod plastic;
 mod quadratic;
 mod shell;
+mod bdf;
+mod f06;
+mod mystran_manifest;
 #[cfg(test)]
 mod nafems;
 
@@ -37,6 +40,8 @@ pub use analysis::SolveOutput;
 pub use backend::{
     parse_sparse_backend, set_sparse_backend, sparse_backend, with_sparse_backend, SparseBackend,
 };
+pub use bdf::is_mystran_deck;
+pub use f06::write_f06;
 pub use model::{ElemKind, Model};
 
 fn mesh_json(model: &Model) -> Value {

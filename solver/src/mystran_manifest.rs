@@ -1,0 +1,162 @@
+//! MYSTRAN bulk-card contract.
+//!
+//! The list is the User Manual (2025-09-22, chapter 7) crossed with the 2011
+//! manual contents and the decks under `Build_Test_Cases`. A card is either
+//! implemented, still planned, declined with a hard error, or a known MYSTRAN
+//! defect that Axia does not reproduce.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardStatus {
+    Implemented,
+    Planned,
+    Declined,
+    /// Present so the status exists. Axia solves the case correctly instead
+    /// of copying the MYSTRAN defect. See the card note.
+    MystranBug,
+}
+
+pub struct Card {
+    pub name: &'static str,
+    pub status: CardStatus,
+    pub note: &'static str,
+}
+
+pub static CARDS: &[Card] = &[
+    card("PARAM", CardStatus::Implemented, "WTMASS"),
+    card("DEBUG", CardStatus::Implemented, "akzeptiert, ohne Wirkung"),
+    card("EIGRL", CardStatus::Implemented, "ND Eigenwerte"),
+    card("GRDSET", CardStatus::Implemented, ""),
+    card("GRID", CardStatus::Implemented, ""),
+    card("CORD2R", CardStatus::Implemented, ""),
+    card("MAT1", CardStatus::Implemented, ""),
+    card("PSHELL", CardStatus::Implemented, "12I/T³ noch als 1"),
+    card("PSOLID", CardStatus::Implemented, ""),
+    card("PROD", CardStatus::Implemented, ""),
+    card("PBAR", CardStatus::Implemented, ""),
+    card("PBARL", CardStatus::Implemented, "ROD, TUBE, BAR"),
+    card("CROD", CardStatus::Implemented, ""),
+    card("CONROD", CardStatus::Implemented, ""),
+    card("CBAR", CardStatus::Implemented, "B31, Ein-Punkt-Timoshenko"),
+    card("CBEAM", CardStatus::Implemented, "wie CBAR"),
+    card("CQUAD4", CardStatus::Implemented, "MITC4, Winkel noch ignoriert"),
+    card("CTRIA3", CardStatus::Implemented, ""),
+    card("CTETRA", CardStatus::Implemented, ""),
+    card("CHEXA", CardStatus::Implemented, ""),
+    card("CPENTA", CardStatus::Implemented, ""),
+    card("CELAS2", CardStatus::Implemented, "axial, nicht komponentenweise"),
+    card("CONM2", CardStatus::Implemented, "ohne Versatz"),
+    card("RBE2", CardStatus::Implemented, "CM 123"),
+    card("FORCE", CardStatus::Implemented, ""),
+    card("MOMENT", CardStatus::Implemented, ""),
+    card("PLOAD2", CardStatus::Implemented, "positiv entgegen der Normalen"),
+    card(
+        "PLOAD4",
+        CardStatus::MystranBug,
+        "Axia wertet PLOAD4 auch in LOAD aus. MYSTRAN Issue 196 liefert dort Null.",
+    ),
+    card("GRAV", CardStatus::Implemented, ""),
+    card("LOAD", CardStatus::Implemented, ""),
+    card("SPC", CardStatus::Implemented, ""),
+    card("SPC1", CardStatus::Implemented, ""),
+    card("SPCADD", CardStatus::Implemented, ""),
+    card("ASET", CardStatus::Planned, ""),
+    card("ASET1", CardStatus::Planned, ""),
+    card("BAROR", CardStatus::Planned, ""),
+    card("CBUSH", CardStatus::Planned, ""),
+    card("CELAS1", CardStatus::Planned, ""),
+    card("CELAS3", CardStatus::Planned, ""),
+    card("CELAS4", CardStatus::Planned, ""),
+    card("CMASS1", CardStatus::Planned, ""),
+    card("CMASS2", CardStatus::Planned, ""),
+    card("CMASS3", CardStatus::Planned, ""),
+    card("CMASS4", CardStatus::Planned, ""),
+    card("CORD1C", CardStatus::Planned, ""),
+    card("CORD1R", CardStatus::Planned, ""),
+    card("CORD1S", CardStatus::Planned, ""),
+    card("CORD2C", CardStatus::Planned, ""),
+    card("CORD2S", CardStatus::Planned, ""),
+    card("CQUAD4K", CardStatus::Planned, ""),
+    card("CSHEAR", CardStatus::Planned, ""),
+    card("CTRIA3K", CardStatus::Planned, ""),
+    card("EIGR", CardStatus::Planned, ""),
+    card("MAT2", CardStatus::Planned, ""),
+    card("MAT8", CardStatus::Planned, ""),
+    card("MAT9", CardStatus::Planned, ""),
+    card("MPC", CardStatus::Planned, ""),
+    card("MPCADD", CardStatus::Planned, ""),
+    card("OMIT", CardStatus::Planned, ""),
+    card("OMIT1", CardStatus::Planned, ""),
+    card("PBUSH", CardStatus::Planned, ""),
+    card("PCOMP", CardStatus::Planned, ""),
+    card("PCOMP1", CardStatus::Planned, ""),
+    card("PELAS", CardStatus::Planned, ""),
+    card("PLOAD1", CardStatus::Planned, ""),
+    card("PSHEAR", CardStatus::Planned, ""),
+    card("RBE3", CardStatus::Planned, ""),
+    card("RFORCE", CardStatus::Planned, ""),
+    card("TEMP", CardStatus::Planned, ""),
+    card("TEMPD", CardStatus::Planned, ""),
+    card("TEMPP1", CardStatus::Planned, ""),
+    card(
+        "CUSERIN",
+        CardStatus::Declined,
+        "Superelement CUSERIN liegt außerhalb des linearen Elementkerns.",
+    ),
+    card(
+        "PARVEC",
+        CardStatus::Declined,
+        "PARVEC ist ein MYSTRAN-Debug-Vektor und wird nicht gerechnet.",
+    ),
+    card(
+        "PARVEC1",
+        CardStatus::Declined,
+        "PARVEC1 ist ein MYSTRAN-Debug-Vektor und wird nicht gerechnet.",
+    ),
+];
+
+const fn card(name: &'static str, status: CardStatus, note: &'static str) -> Card {
+    Card { name, status, note }
+}
+
+pub fn lookup(name: &str) -> Option<&'static Card> {
+    CARDS.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+}
+
+pub fn names_with(status: CardStatus) -> Vec<&'static str> {
+    let mut v: Vec<_> = CARDS
+        .iter()
+        .filter(|c| c.status == status)
+        .map(|c| c.name)
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+/// Cards that are neither implemented, declined, nor a documented MYSTRAN defect.
+pub fn open_gaps() -> Vec<&'static str> {
+    names_with(CardStatus::Planned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_is_unique_and_classified() {
+        let mut names: Vec<_> = CARDS.iter().map(|c| c.name).collect();
+        let n = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), n, "doppelte Kartennamen");
+        assert!(CARDS.iter().any(|c| c.status == CardStatus::MystranBug));
+        assert!(CARDS.iter().any(|c| c.status == CardStatus::Declined));
+        assert!(!names_with(CardStatus::Implemented).is_empty());
+    }
+
+    #[test]
+    #[ignore = "Phase 8: keine geplanten Karten mehr"]
+    fn mystran_manifest_closed() {
+        let gaps = open_gaps();
+        assert!(gaps.is_empty(), "noch offen: {}", gaps.join(", "));
+    }
+}

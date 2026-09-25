@@ -46,6 +46,20 @@ pub struct SolveOutput {
     pub peeq: Vec<f64>,
     pub lambda: f64,
     pub ninc: usize,
+    /// Independent SUBCASEs (MYSTRAN). Empty for a single CalculiX step.
+    pub cases: Vec<Subcase>,
+}
+
+/// One independent load case. Displacements are in the same node order as `SolveOutput.model`.
+pub struct Subcase {
+    pub label: String,
+    pub u: Vec<[f64; 3]>,
+    pub ur: Vec<[f64; 3]>,
+    pub rf: Vec<[f64; 3]>,
+    pub rm: Vec<[f64; 3]>,
+    pub stress: Vec<[f64; 6]>,
+    pub von_mises: Vec<f64>,
+    pub frequencies: Vec<f64>,
 }
 
 fn elem_xyz(model: &Model, nodes: &[i32]) -> Result<Vec<[f64; 3]>> {
@@ -172,10 +186,64 @@ fn cap_nodal_du(du: &mut [f64], ndn: usize, nnode: usize, cap: f64) {
 
 pub fn solve(model: Model) -> Result<SolveOutput> {
     let t0 = now_ms();
+    if model.independent_steps && model.steps.len() > 1 {
+        return solve_independent(model, t0);
+    }
     if model.steps.len() > 1 {
         return solve_sequence(model, t0);
     }
     solve_one(model, t0)
+}
+
+fn solve_independent(model: Model, t0: f64) -> Result<SolveOutput> {
+    let steps = model.steps.clone();
+    let labels = model.case_labels.clone();
+    let all_c = model.cloads.clone();
+    let all_d = model.dloads.clone();
+    let all_b = model.bcs.clone();
+    let mut cases = Vec::with_capacity(steps.len());
+    let mut first: Option<SolveOutput> = None;
+    for (i, st) in steps.iter().enumerate() {
+        let mut m = model.clone();
+        m.independent_steps = false;
+        m.steps.clear();
+        m.case_labels.clear();
+        m.procedure = st.procedure.clone();
+        m.u_start.clear();
+        m.f_start.clear();
+        let c0 = st.cload_from.min(all_c.len());
+        let c1 = st.n_cload.min(all_c.len()).max(c0);
+        let d0 = st.dload_from.min(all_d.len());
+        let d1 = st.n_dload.min(all_d.len()).max(d0);
+        let b0 = st.bc_from.min(all_b.len());
+        let b1 = st.n_bc.min(all_b.len()).max(b0);
+        m.cloads = all_c[c0..c1].to_vec();
+        m.dloads = all_d[d0..d1].to_vec();
+        m.bcs = all_b[b0..b1].to_vec();
+        let out = solve_one(m, t0)?;
+        let label = labels
+            .get(i)
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("SUBCASE {}", i + 1));
+        cases.push(Subcase {
+            label,
+            u: out.u.clone(),
+            ur: out.ur.clone(),
+            rf: out.rf.clone(),
+            rm: out.rm.clone(),
+            stress: out.stress.clone(),
+            von_mises: out.von_mises.clone(),
+            frequencies: out.frequencies.clone(),
+        });
+        if first.is_none() {
+            first = Some(out);
+        }
+    }
+    let mut out = first.ok_or_else(|| crate::error::FemError("Keine SUBCASE.".into()))?;
+    out.nsteps = steps.len();
+    out.cases = cases;
+    Ok(out)
 }
 
 fn solve_sequence(model: Model, t0: f64) -> Result<SolveOutput> {
@@ -1019,6 +1087,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
         lambda: 1.0,
         ninc: 1,
         peeq: Vec::new(),
+        cases: Vec::new(),
     })
 }
 
@@ -1979,6 +2048,7 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
         lambda: 1.0,
         ninc: 1,
         peeq: Vec::new(),
+        cases: Vec::new(),
     })
 }
 
@@ -2873,6 +2943,7 @@ fn solve_contact(model: Model, t0: f64) -> Result<SolveOutput> {
         lambda: 1.0,
         ninc: ninc_run,
         peeq: Vec::new(),
+        cases: Vec::new(),
     })
 }
 
@@ -3057,6 +3128,7 @@ fn solve_continuum_plastic(model: Model, t0: f64) -> Result<SolveOutput> {
         lambda: 1.0,
         ninc: 1,
         peeq,
+        cases: Vec::new(),
     })
 }
 
@@ -3555,6 +3627,7 @@ fn solve_continuum_newton(model: Model, t0: f64) -> Result<SolveOutput> {
         lambda: 1.0,
         ninc: ninc_done.max(1),
         peeq,
+        cases: Vec::new(),
     })
 }
 
@@ -3864,6 +3937,7 @@ fn solve_truss_newton(model: Model, t0: f64, nlgeom: bool) -> Result<SolveOutput
         lambda: 1.0,
         ninc: 1,
         peeq: Vec::new(),
+        cases: Vec::new(),
     })
 }
 
@@ -4331,5 +4405,6 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
         lambda: lam,
         ninc,
         peeq,
+        cases: Vec::new(),
     })
 }
