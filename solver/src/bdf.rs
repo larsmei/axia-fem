@@ -1,7 +1,8 @@
 //! MYSTRAN / Nastran bulk-data reader.
 //!
 //! Free-field and 8/16-character fixed fields, `$` comments, `INCLUDE`,
-//! continuations, `SOL 1/101` statics and `SOL 3/103` modes. The result is an
+//! continuations, `SOL 1/101` statics, `SOL 3/103` modes and `SOL 5/105`
+//! buckling. `SOL 4/104` and `SOL 31` are rejected. The result is an
 //! Axia [`Model`](crate::model::Model). Shell `PLOAD2`/`PLOAD4` follow the
 //! Nastran sign: positive pressure opposes the element normal.
 
@@ -88,7 +89,8 @@ pub const RECOGNIZED_BULK: &[&str] = &[
     "CELAS2", "CELAS3", "CELAS4", "PELAS", "CMASS1", "CMASS2", "CMASS3", "CMASS4", "PMASS", "CONM2",
     "CSHEAR", "PSHEAR", "CBUSH", "PBUSH", "RBE2", "RBE3", "FORCE", "MOMENT", "PLOAD2", "PLOAD4",
     "GRAV", "LOAD", "RFORCE", "SPC", "SPC1", "SPCADD", "MPC", "MPCADD", "TEMP", "TEMPD",
-    "TEMPP1", "TEMPRB", "MAT2", "MAT8", "MAT9", "PCOMP", "PCOMP1", "EIGR",
+    "TEMPP1", "TEMPRB", "MAT2", "MAT8", "MAT9", "PCOMP", "PCOMP1", "EIGR", "PLOTEL", "SEQGP",
+    "SPOINT",
 ];
 
 pub fn parse_with_base(text: &str, base: Option<&Path>) -> Result<Model> {
@@ -100,11 +102,7 @@ pub fn parse_with_base(text: &str, base: Option<&Path>) -> Result<Model> {
         let (k, v) = split_kv(line);
         match k.as_str() {
             "SOL" => {
-                sol = v
-                    .split_whitespace()
-                    .next()
-                    .and_then(|s| parse_i32(s).ok())
-                    .unwrap_or(101);
+                sol = classify_sol(&v)?;
             }
             "ID" => {
                 if id_title.is_empty() {
@@ -117,6 +115,41 @@ pub fn parse_with_base(text: &str, base: Option<&Path>) -> Result<Model> {
     let cases = parse_cases(&case_lines);
     let cards = assemble_cards(&bulk_lines)?;
     build_model(sol, id_title, &cases, &cards)
+}
+
+/// Manual 2025-09-22 §7. Anything else is an error, not silent statics.
+fn classify_sol(raw: &str) -> Result<i32> {
+    let folded = raw
+        .split('$')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .to_ascii_uppercase();
+    let folded = folded.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first = folded.split_whitespace().next().unwrap_or("");
+    let first = first.trim_end_matches(',');
+    if let Ok(n) = parse_i32(first) {
+        return match n {
+            1 | 101 => Ok(101),
+            3 | 103 => Ok(103),
+            5 | 105 => Ok(105),
+            4 | 104 => err("SOL 104: Differentialsteifigkeit wird nicht gerechnet."),
+            31 => err("SOL 31: Craig-Bampton wird nicht gerechnet."),
+            _ => err(format!("SOL {n} wird nicht gerechnet.")),
+        };
+    }
+    match folded.as_str() {
+        "STATICS" => Ok(101),
+        "MODES" | "MODAL" | "NORMAL MODES" => Ok(103),
+        "BUCKLING" => Ok(105),
+        "DIFFEREN" | "DIFFERENTIAL" | "DIFFERENTIAL STIFFNESS" => {
+            err("SOL 104: Differentialsteifigkeit wird nicht gerechnet.")
+        }
+        "GEN CB MODEL" => err("SOL 31: Craig-Bampton wird nicht gerechnet."),
+        "" => err("SOL ohne Kennung."),
+        other => err(format!("SOL {other} wird nicht gerechnet.")),
+    }
 }
 
 fn expand_includes(text: &str, base: Option<&Path>, depth: usize) -> Result<String> {
@@ -611,7 +644,6 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
     let mut spc: HashMap<i32, Vec<SpcTerm>> = HashMap::new();
     let mut spcadd: HashMap<i32, Vec<i32>> = HashMap::new();
     let mut rbes: Vec<(i32, i32, Vec<usize>, Vec<i32>)> = Vec::new();
-    let mut unknown: HashMap<String, usize> = HashMap::new();
     let mut mpcs: HashMap<i32, Vec<Vec<(i32, usize, f64)>>> = HashMap::new();
     let mut mpcadd: HashMap<i32, Vec<i32>> = HashMap::new();
     let mut rbe3s: Vec<(i32, i32, Vec<usize>, Vec<(f64, Vec<usize>, Vec<i32>)>)> = Vec::new();
@@ -1587,26 +1619,24 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 let ids = d.iter().filter(|s| !s.is_empty()).filter_map(|s| parse_i32(s).ok()).collect();
                 spcadd.insert(sid, ids);
             }
+            "PLOTEL" | "SEQGP" | "SPOINT" => {}
             "" => {}
             other => {
                 if let Some(card) = mystran_manifest::lookup(other) {
                     if card.status == CardStatus::Declined {
                         return err(format!("{other}: {}", card.note));
                     }
+                    return err(format!(
+                        "{other}: Karte steht im Manual, der Parser liest sie nicht."
+                    ));
                 }
-                *unknown.entry(other.to_string()).or_insert(0) += 1;
+                return err(format!(
+                    "{other}: Bulk-Karte steht nicht im MYSTRAN-Manual (2025-09-22) und wird abgewiesen."
+                ));
             }
         }
     }
 
-    if !unknown.is_empty() {
-        let mut names: Vec<_> = unknown.keys().cloned().collect();
-        names.sort();
-        model.warn(format!(
-            "Nicht unterstützte Bulk-Karten ignoriert: {}",
-            names.join(", ")
-        ));
-    }
     for (i, pid) in spring_pid {
         let k = pelas.get(&pid).copied().ok_or_else(|| {
             crate::error::FemError(format!("PELAS {pid} fehlt."))
@@ -1982,16 +2012,12 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
             model.eig_norm = norm;
             Procedure::Buckle { nmodes }
         }
-        1 | 101 | _ => {
-            if !matches!(sol, 1 | 101) {
-                model.warn(format!("SOL {sol} wird als lineare Statik (SOL 101) gerechnet."));
-            }
-            Procedure::Static {
-                nlgeom: false,
-                increments: 1,
-                riks: false,
-            }
-        }
+        1 | 101 => Procedure::Static {
+            nlgeom: false,
+            increments: 1,
+            riks: false,
+        },
+        _ => return err(format!("SOL {sol} wird nicht gerechnet.")),
     };
 
     let permanent: Vec<(i32, String)> = grids.iter().map(|(id, _, _, _, ps)| (*id, ps.clone())).collect();
@@ -3591,6 +3617,73 @@ ENDDATA
         let deck = "SOL 1\nCEND\nBEGIN BULK\nCUSERIN,1\nGRID,1,,0,0,0\nENDDATA\n";
         let err = parse_with_base(deck, None).unwrap_err();
         assert!(err.to_string().contains("CUSERIN"), "{err}");
+    }
+
+    #[test]
+    fn unknown_bulk_card_names_itself() {
+        let deck = "SOL 101\nCEND\nBEGIN BULK\nPLOAD1,1\nGRID,1,,0,0,0\nENDDATA\n";
+        let err = parse_with_base(deck, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("PLOAD1"), "{msg}");
+        assert!(msg.contains("abgewiesen"), "{msg}");
+    }
+
+    #[test]
+    fn sload_rspline_suport_are_rejected() {
+        for card in ["SLOAD,1,10,1.0", "RSPLINE,1,1,0.5,2", "SUPORT,1,123456", "CQUAD8,1,1,1,2,3,4"]
+        {
+            let deck = format!("SOL 101\nCEND\nBEGIN BULK\n{card}\nGRID,1,,0,0,0\nENDDATA\n");
+            let err = parse_with_base(&deck, None).unwrap_err();
+            let name = card.split(',').next().unwrap();
+            assert!(err.to_string().contains(name), "{err}");
+        }
+    }
+
+    #[test]
+    fn sol_31_and_104_are_rejected() {
+        for sol in ["31", "104", "4", "DIFFEREN", "GEN CB MODEL"] {
+            let deck = format!("SOL {sol}\nCEND\nBEGIN BULK\nGRID,1,,0,0,0\nENDDATA\n");
+            let err = parse_with_base(&deck, None).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("SOL"), "{sol}: {msg}");
+            assert!(!msg.contains("lineare Statik"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn sol_aliases_select_the_procedure() {
+        let deck = |sol: &str| {
+            format!(
+                "SOL {sol}\nCEND\nBEGIN BULK\nGRID,1,,0,0,0\nCELAS2,1,1.,1,1\nENDDATA\n"
+            )
+        };
+        let modes = parse_with_base(&deck("MODES"), None).unwrap();
+        assert!(matches!(modes.procedure, Procedure::Frequency { .. }));
+        let buck = parse_with_base(&deck("BUCKLING"), None).unwrap();
+        assert!(matches!(buck.procedure, Procedure::Buckle { .. }));
+        let stat = parse_with_base(&deck("STATICS"), None).unwrap();
+        assert!(matches!(stat.procedure, Procedure::Static { .. }));
+    }
+
+    #[test]
+    fn plotel_seqgp_spoint_are_accepted() {
+        let deck = "\
+SOL 101
+CEND
+BEGIN BULK
+GRID,1,,0,0,0
+CELAS2,1,1.,1,1
+PLOTEL,1,1,1
+SEQGP,1,1
+SPOINT,9
+ENDDATA
+";
+        let m = parse_with_base(deck, None).unwrap();
+        assert!(
+            !m.warnings.iter().any(|w| w.contains("ignoriert")),
+            "{:?}",
+            m.warnings
+        );
     }
 
     #[test]

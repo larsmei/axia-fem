@@ -1,9 +1,10 @@
 //! MYSTRAN bulk-card contract.
 //!
-//! The list is the User Manual (2025-09-22, chapter 7) crossed with the 2011
-//! manual contents and the decks under `Build_Test_Cases`. A card is either
-//! implemented, still planned, declined with a hard error, or a known MYSTRAN
-//! defect that Axia does not reproduce.
+//! The list is the User Manual (2025-09-22, chapter 11) crossed with the
+//! decks under `Build_Test_Cases`. A card is implemented, declined with a
+//! hard error, or a known MYSTRAN defect that Axia does not reproduce.
+//! Nothing in the manual stays planned, and a bulk name outside the manual
+//! is a hard error.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CardStatus {
@@ -117,6 +118,24 @@ pub static CARDS: &[Card] = &[
         CardStatus::Declined,
         "PARVEC1 ist ein MYSTRAN-Debug-Vektor und wird nicht gerechnet.",
     ),
+    card("CQUAD8", CardStatus::Declined, "quadratische Schale wird nicht gerechnet."),
+    card("PLOTEL", CardStatus::Implemented, "nur Plot, ohne Steifigkeit"),
+    card(
+        "PUSERIN",
+        CardStatus::Declined,
+        "Superelement PUSERIN liegt außerhalb des linearen Elementkerns.",
+    ),
+    card("RSPLINE", CardStatus::Declined, "RSPLINE wird nicht gerechnet."),
+    card("SEQGP", CardStatus::Implemented, "Sequenzierung ohne Wirkung"),
+    card("SLOAD", CardStatus::Declined, "skalare Last wird nicht gerechnet."),
+    card("SPOINT", CardStatus::Implemented, "skalarer Punkt für CELAS3/CMASS3"),
+    card(
+        "SUPORT",
+        CardStatus::Declined,
+        "SUPORT (Craig-Bampton) wird nicht gerechnet.",
+    ),
+    card("USET", CardStatus::Declined, "USET-Menge wird abgewiesen."),
+    card("USET1", CardStatus::Declined, "USET1-Menge wird abgewiesen."),
 ];
 
 const fn card(name: &'static str, status: CardStatus, note: &'static str) -> Card {
@@ -159,9 +178,29 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Phase 8: keine geplanten Karten mehr"]
     fn mystran_manifest_closed() {
         let gaps = open_gaps();
         assert!(gaps.is_empty(), "noch offen: {}", gaps.join(", "));
+    }
+
+    /// Chapter 11 of the 2025-09-22 manual. Every name is classified.
+    #[test]
+    fn manual_2025_09_22_bulk_is_classified() {
+        const MANUAL: &[&str] = &[
+            "ASET", "ASET1", "BAROR", "CBAR", "CBUSH", "CELAS1", "CELAS2", "CELAS3", "CELAS4",
+            "CHEXA", "CMASS1", "CMASS2", "CMASS3", "CMASS4", "CONM2", "CONROD", "CORD1C",
+            "CORD1R", "CORD1S", "CORD2C", "CORD2R", "CORD2S", "CPENTA", "CQUAD4", "CQUAD4K",
+            "CQUAD8", "CROD", "CSHEAR", "CTETRA", "CTRIA3", "CTRIA3K", "CUSERIN", "DEBUG", "EIGR",
+            "EIGRL", "FORCE", "GRAV", "GRDSET", "GRID", "LOAD", "MAT1", "MAT2", "MAT8", "MAT9",
+            "MOMENT", "MPC", "MPCADD", "OMIT", "OMIT1", "PARAM", "PARVEC", "PARVEC1", "PBAR",
+            "PBARL", "PBUSH", "PCOMP", "PCOMP1", "PELAS", "PLOAD2", "PLOAD4", "PLOTEL", "PROD",
+            "PSHEAR", "PSHELL", "PSOLID", "PUSERIN", "RBE2", "RBE3", "RFORCE", "RSPLINE", "SEQGP",
+            "SLOAD", "SPC", "SPC1", "SPCADD", "SPOINT", "SUPORT", "TEMP", "TEMPD", "TEMPP1",
+            "TEMPRB", "USET", "USET1",
+        ];
+        for name in MANUAL {
+            let card = lookup(name).unwrap_or_else(|| panic!("{name} fehlt im Manifest"));
+            assert_ne!(card.status, CardStatus::Planned, "{name} ist noch geplant");
+        }
     }
 }
