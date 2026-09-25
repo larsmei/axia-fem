@@ -3174,6 +3174,25 @@ von Mises truss — Riks snap-through
         assert!(out.solver.contains("Riks"));
     }
 
+    #[test]
+    fn riks_example_passes_the_limit_point_without_faer() {
+        // examples/riks_truss.inp. WASM has no faer and used to stop at
+        // increment 8 (λ≈0.40) because Cholesky rejects the indefinite tangent.
+        let inp = include_str!("../../examples/riks_truss.inp");
+        let out = with_sparse_backend(SparseBackend::Cholesky, || solve_native(inp))
+            .expect("riks example on in-crate LU");
+        let uy = out.u[out.model.node_index(3).unwrap()][1];
+        assert!(
+            uy < -0.8,
+            "apex uy={uy}, expected snap-through"
+        );
+        assert!(
+            (out.lambda - 1.0).abs() < 0.05,
+            "λ={} expected ~1 ({})",
+            out.lambda, out.solver
+        );
+    }
+
     fn cax3_lame_deck() -> String {
         let mut inp = String::from("*HEADING\nCAX3 Lame\n*NODE\n");
         let a = 10.0;

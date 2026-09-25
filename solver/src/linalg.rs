@@ -83,6 +83,9 @@ pub fn chol_solve(a: &mut [f64], n: usize, b: &[f64]) -> Result<Vec<f64>> {
                 s -= a[i * n + k] * a[j * n + k];
             }
             if i == j {
+                if s < 0.0 {
+                    return err("Steifigkeitsmatrix ist indefinit.");
+                }
                 if s <= 1e-30 {
                     return err(
                         "Steifigkeitsmatrix ist singulär — Randbedingungen unzureichend (Starrkörperbewegung oder entartete Elemente).",
@@ -109,6 +112,81 @@ pub fn chol_solve(a: &mut [f64], n: usize, b: &[f64]) -> Result<Vec<f64>> {
             s -= a[k * n + i] * x[k];
         }
         x[i] = s / a[i * n + i];
+    }
+    Ok(x)
+}
+
+/// Dense LU with partial pivoting. Symmetric indefinite tangents (Riks past
+/// the limit point) are not SPD, so Cholesky refuses them.
+pub fn lu_solve(a: &[f64], n: usize, b: &[f64]) -> Result<Vec<f64>> {
+    if n == 0 || a.len() < n * n || b.len() < n {
+        return err("LU: Dimension.");
+    }
+    let mut scale = 0.0_f64;
+    for &v in a.iter().take(n * n) {
+        scale = scale.max(v.abs());
+    }
+    if scale <= 0.0 {
+        return err(
+            "Steifigkeitsmatrix ist singulär — Randbedingungen unzureichend (Starrkörperbewegung oder entartete Elemente).",
+        );
+    }
+    let mut lu = a[..n * n].to_vec();
+    let mut piv: Vec<usize> = (0..n).collect();
+    for k in 0..n {
+        let mut pivrow = k;
+        let mut maxv = lu[k * n + k].abs();
+        for i in (k + 1)..n {
+            let v = lu[i * n + k].abs();
+            if v > maxv {
+                maxv = v;
+                pivrow = i;
+            }
+        }
+        if maxv <= 1e-14 * scale {
+            return err(
+                "Steifigkeitsmatrix ist singulär — Randbedingungen unzureichend (Starrkörperbewegung oder entartete Elemente).",
+            );
+        }
+        if pivrow != k {
+            for j in 0..n {
+                lu.swap(k * n + j, pivrow * n + j);
+            }
+            piv.swap(k, pivrow);
+        }
+        let akk = lu[k * n + k];
+        for i in (k + 1)..n {
+            lu[i * n + k] /= akk;
+            let lik = lu[i * n + k];
+            for j in (k + 1)..n {
+                lu[i * n + j] -= lik * lu[k * n + j];
+            }
+        }
+    }
+    let mut y = vec![0.0; n];
+    for i in 0..n {
+        y[i] = b[piv[i]];
+    }
+    for i in 0..n {
+        let mut s = y[i];
+        for k in 0..i {
+            s -= lu[i * n + k] * y[k];
+        }
+        y[i] = s;
+    }
+    let mut x = vec![0.0; n];
+    for i in (0..n).rev() {
+        let mut s = y[i];
+        for k in (i + 1)..n {
+            s -= lu[i * n + k] * x[k];
+        }
+        let diag = lu[i * n + i];
+        if diag.abs() <= 1e-14 * scale {
+            return err(
+                "Steifigkeitsmatrix ist singulär — Randbedingungen unzureichend (Starrkörperbewegung oder entartete Elemente).",
+            );
+        }
+        x[i] = s / diag;
     }
     Ok(x)
 }
@@ -198,11 +276,38 @@ fn residual_of(a: &Csr, x: &[f64], b: &[f64]) -> f64 {
     s.sqrt()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lu_solves_indefinite_2x2() {
+        // diag(1, -2) * [3, 4] = [3, -8]
+        let a = [1.0, 0.0, 0.0, -2.0];
+        let x = lu_solve(&a, 2, &[3.0, -8.0]).unwrap();
+        assert!((x[0] - 3.0).abs() < 1e-12);
+        assert!((x[1] - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cholesky_rejects_indefinite_and_lu_fallback_solves() {
+        let trips = vec![(0, 0, 1.0), (1, 1, -2.0)];
+        let rhs = [3.0, -8.0];
+        let s = crate::backend::with_sparse_backend(crate::backend::SparseBackend::Cholesky, || {
+            solve_kff(2, trips, &rhs)
+        })
+        .unwrap();
+        assert_eq!(s.name, "dense LU");
+        assert!((s.x[0] - 3.0).abs() < 1e-8, "{:?}", s.x);
+        assert!((s.x[1] - 4.0).abs() < 1e-8, "{:?}", s.x);
+    }
+}
+
 /// Factor and solve K_ff x = rhs.
 ///
 /// Native: `--solver` / `AXIA_SOLVER` selects PARDISO, faer, rivrs-sparse,
 /// dense Cholesky or PCG. Default `auto` is MKL → Panua → faer → rivrs.
-/// WASM keeps the in-crate Cholesky/PCG chain.
+/// WASM uses the in-crate Cholesky, and dense LU when the tangent is indefinite.
 pub fn solve_kff(n: usize, trips: Vec<(usize, usize, f64)>, rhs: &[f64]) -> Result<SparseResult> {
     crate::backend::apply_env_solver();
     let want = crate::backend::sparse_backend();
@@ -219,17 +324,38 @@ pub fn solve_kff(n: usize, trips: Vec<(usize, usize, f64)>, rhs: &[f64]) -> Resu
         if n > DENSE_LIMIT {
             return err("intern: dense Cholesky nur für kleine Systeme");
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        eprintln!("axia: sparse solver: dense Cholesky");
         let mut a = csr.to_dense();
-        let x = chol_solve(&mut a, n, rhs)?;
-        let residual = residual_of(csr, &x, rhs);
-        Ok(SparseResult {
-            x,
-            name: "Cholesky".into(),
-            iters: 1,
-            residual,
-        })
+        match chol_solve(&mut a, n, rhs) {
+            Ok(x) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                eprintln!("axia: sparse solver: dense Cholesky");
+                let residual = residual_of(csr, &x, rhs);
+                Ok(SparseResult {
+                    x,
+                    name: "Cholesky".into(),
+                    iters: 1,
+                    residual,
+                })
+            }
+            Err(e) => {
+                if !e.to_string().contains("indefinit") {
+                    return Err(e);
+                }
+                // Snap-through: K is symmetric indefinite. Faer uses LU here;
+                // the in-crate path (WASM, `--solver cholesky`) must too.
+                #[cfg(not(target_arch = "wasm32"))]
+                eprintln!("axia: sparse solver: dense LU");
+                let a = csr.to_dense();
+                let x = lu_solve(&a, n, rhs)?;
+                let residual = residual_of(csr, &x, rhs);
+                Ok(SparseResult {
+                    x,
+                    name: "dense LU".into(),
+                    iters: 1,
+                    residual,
+                })
+            }
+        }
     };
     let iterative = |csr: &Csr| -> Result<SparseResult> {
         #[cfg(not(target_arch = "wasm32"))]
