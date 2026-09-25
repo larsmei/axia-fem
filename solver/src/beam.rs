@@ -225,6 +225,58 @@ pub fn cbar_stiffness(
     nu: f64,
     sec: &BeamSection,
 ) -> Result<(Vec<f64>, f64)> {
+    let loc = cbar_local(xyz, e, nu, sec)?;
+    let mut r = [[0.0; 3]; 3];
+    for i in 0..3 {
+        r[i][0] = loc.t[i];
+        r[i][1] = loc.n1[i];
+        r[i][2] = loc.n2[i];
+    }
+    let mut ke = vec![0.0; 144];
+    // u_g = R u_l, K_g = T K_l T^T
+    let mut tl = [0.0; 144];
+    for node in 0..2 {
+        for blk in 0..2 {
+            let o = node * 6 + blk * 3;
+            for i in 0..3 {
+                for j in 0..3 {
+                    tl[(o + i) * 12 + (o + j)] = r[i][j];
+                }
+            }
+        }
+    }
+    let mut tmp = [0.0; 144];
+    for i in 0..12 {
+        for j in 0..12 {
+            let mut s = 0.0;
+            for k in 0..12 {
+                s += tl[i * 12 + k] * loc.kl[k * 12 + j];
+            }
+            tmp[i * 12 + j] = s;
+        }
+    }
+    for i in 0..12 {
+        for j in 0..12 {
+            let mut s = 0.0;
+            for k in 0..12 {
+                s += tmp[i * 12 + k] * tl[j * 12 + k];
+            }
+            ke[i * 12 + j] = s;
+        }
+    }
+    apply_end_offsets(&mut ke, sec.off_a, sec.off_b);
+    Ok((ke, loc.len))
+}
+
+struct CbarLocal {
+    kl: [f64; 144],
+    len: f64,
+    t: [f64; 3],
+    n1: [f64; 3],
+    n2: [f64; 3],
+}
+
+fn cbar_local(xyz: &[[f64; 3]], e: f64, nu: f64, sec: &BeamSection) -> Result<CbarLocal> {
     if xyz.len() < 2 {
         return err("CBAR braucht zwei Knoten.");
     }
@@ -265,46 +317,81 @@ pub fn cbar_stiffness(
     // Deflection along n2, θ_euler = −θ_n1, inertia I11, shear k22.
     add_timoshenko(&mut kl, e * sec.i11, sec.k22 * g * sec.area, len, [2, 4, 8, 10], [1.0, -1.0, 1.0, -1.0]);
     condense_releases(&mut kl, sec.rel_a, sec.rel_b);
-    let mut r = [[0.0; 3]; 3];
-    for i in 0..3 {
-        r[i][0] = t[i];
-        r[i][1] = n1[i];
-        r[i][2] = n2[i];
+    Ok(CbarLocal { kl, len, t, n1, n2 })
+}
+
+/// MYSTRAN BAR engineering forces. `ue` is the 12 basic DOF at the grids.
+/// `alpha_dt` is α(T−Tref). Tension and the two shears are positive as in OFP3_ELFE_1D.
+pub struct BarEngr {
+    pub m1a: f64,
+    pub m2a: f64,
+    pub m1b: f64,
+    pub m2b: f64,
+    pub v1: f64,
+    pub v2: f64,
+    pub axial: f64,
+    pub torque: f64,
+}
+
+pub fn cbar_engr_forces(
+    xyz: &[[f64; 3]],
+    ue: &[f64],
+    e: f64,
+    nu: f64,
+    sec: &BeamSection,
+    alpha_dt: f64,
+) -> Result<BarEngr> {
+    let loc = cbar_local(xyz, e, nu, sec)?;
+    let mut ug = [0.0; 12];
+    for i in 0..12 {
+        ug[i] = ue.get(i).copied().unwrap_or(0.0);
     }
-    let mut ke = vec![0.0; 144];
-    // u_g = R u_l, K_g = T K_l T^T
-    let mut tl = [0.0; 144];
-    for node in 0..2 {
+    // u_beam = T u_grid, T: u + θ × w.
+    let mut ub = ug;
+    for n in 0..2 {
+        let w = if n == 0 { sec.off_a } else { sec.off_b };
+        let o = n * 6;
+        let th = [ub[o + 3], ub[o + 4], ub[o + 5]];
+        let arm = [
+            th[1] * w[2] - th[2] * w[1],
+            th[2] * w[0] - th[0] * w[2],
+            th[0] * w[1] - th[1] * w[0],
+        ];
+        ub[o] += arm[0];
+        ub[o + 1] += arm[1];
+        ub[o + 2] += arm[2];
+    }
+    let r = [loc.t, loc.n1, loc.n2];
+    let mut ul = [0.0; 12];
+    for n in 0..2 {
         for blk in 0..2 {
-            let o = node * 6 + blk * 3;
-            for i in 0..3 {
-                for j in 0..3 {
-                    tl[(o + i) * 12 + (o + j)] = r[i][j];
-                }
+            let o = n * 6 + blk * 3;
+            for j in 0..3 {
+                ul[o + j] = r[j][0] * ub[o] + r[j][1] * ub[o + 1] + r[j][2] * ub[o + 2];
             }
         }
     }
-    let mut tmp = [0.0; 144];
+    let mut f = [0.0; 12];
     for i in 0..12 {
+        let mut s = 0.0;
         for j in 0..12 {
-            let mut s = 0.0;
-            for k in 0..12 {
-                s += tl[i * 12 + k] * kl[k * 12 + j];
-            }
-            tmp[i * 12 + j] = s;
+            s += loc.kl[i * 12 + j] * ul[j];
         }
+        f[i] = s;
     }
-    for i in 0..12 {
-        for j in 0..12 {
-            let mut s = 0.0;
-            for k in 0..12 {
-                s += tmp[i * 12 + k] * tl[j * 12 + k];
-            }
-            ke[i * 12 + j] = s;
-        }
-    }
-    apply_end_offsets(&mut ke, sec.off_a, sec.off_b);
-    Ok((ke, len))
+    let nth = e * sec.area * alpha_dt;
+    f[0] += nth;
+    f[6] -= nth;
+    Ok(BarEngr {
+        m1a: -f[5],
+        m2a: f[4],
+        m1b: -f[5] + f[1] * loc.len,
+        m2b: f[4] + f[2] * loc.len,
+        v1: -f[1],
+        v2: -f[2],
+        axial: -f[0],
+        torque: -f[3],
+    })
 }
 
 fn add_timoshenko(kl: &mut [f64], ei: f64, ks: f64, len: f64, idx: [usize; 4], sign: [f64; 4]) {
@@ -803,6 +890,29 @@ fn rotate_6(
             s += tfull[i * nd + k] * fe_l[k];
         }
         fe[i] = s;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cbar_cantilever_end_forces_match_hermite() {
+        let mut sec = BeamSection::general(1.0, 1.0, 0.0, 1.0, 1.0, [0.0, 1.0, 0.0]);
+        sec.k11 = 1.0e6;
+        sec.k22 = 1.0e6;
+        let xyz = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        // v = FL^3/3EI = 1/3, θ = FL^2/2EI = 1/2, F = 1
+        let mut ue = [0.0; 12];
+        ue[7] = 1.0 / 3.0;
+        ue[11] = 0.5;
+        let g = cbar_engr_forces(&xyz, &ue, 1.0, 0.0, &sec, 0.0).unwrap();
+        assert!((g.m1a - 1.0).abs() < 1e-4, "m1a {}", g.m1a);
+        assert!(g.m1b.abs() < 1e-4, "m1b {}", g.m1b);
+        assert!((g.v1 - 1.0).abs() < 1e-4, "v1 {}", g.v1);
+        assert!(g.v2.abs() < 1e-4 && g.axial.abs() < 1e-4 && g.torque.abs() < 1e-4);
+        assert!(g.m2a.abs() < 1e-4 && g.m2b.abs() < 1e-4);
     }
 }
 

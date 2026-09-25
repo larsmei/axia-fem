@@ -23,6 +23,7 @@ mod quadratic;
 mod shell;
 mod bdf;
 mod f06;
+mod op2;
 mod mystran_manifest;
 #[cfg(test)]
 mod nafems;
@@ -43,6 +44,7 @@ pub use backend::{
 };
 pub use bdf::is_mystran_deck;
 pub use f06::write_f06;
+pub use op2::write_op2;
 pub use model::{ElemKind, Model};
 
 fn mesh_json(model: &Model) -> Value {

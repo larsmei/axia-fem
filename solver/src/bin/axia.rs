@@ -12,7 +12,7 @@ use std::process;
 
 use axia_fem::{
     is_mystran_deck, mkl_self_test, parse_model, parse_model_with_base, parse_sparse_backend,
-    set_sparse_backend, solve_native, solve_native_with_base, write_f06, Model, SolveOutput,
+    set_sparse_backend, solve_native, solve_native_with_base, write_f06, write_op2, Model, SolveOutput,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -55,7 +55,7 @@ The chosen solver is printed on stderr and in --json (`solver`).
 
 Input is detected automatically:
     CalculiX / Abaqus INP  →  .frd and .dat
-    MYSTRAN / Nastran BDF  →  .f06
+    MYSTRAN / Nastran BDF  →  .f06 and .op2
     --format overrides the output (the input reader still follows the file).
 
 USAGE:
@@ -90,7 +90,7 @@ OPTIONS:
 
 EXAMPLES:
     {exe} cantilever              # cantilever.inp → cantilever.frd / .dat
-    {exe} model.bdf               # MYSTRAN deck → model.f06
+    {exe} model.bdf               # MYSTRAN deck → model.f06 and model.op2
     {exe} --format calculix model.bdf
     {exe} --solver faer job.inp
     {exe} -i deck.inp -o /tmp/run
@@ -525,6 +525,11 @@ fn run() -> Result<(), String> {
         write_file(&path, &write_f06(&out.model, &out))?;
         if !args.quiet && !args.json {
             eprintln!("  wrote      {}", path.display());
+        }
+        let op2 = stem.with_extension("op2");
+        fs::write(&op2, write_op2(&out.model, &out)).map_err(|e| format!("{}: {e}", op2.display()))?;
+        if !args.quiet && !args.json {
+            eprintln!("  wrote      {}", op2.display());
         }
     }
     Ok(())
