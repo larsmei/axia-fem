@@ -3335,6 +3335,39 @@ S,NOE
             "cholesky uy={uy_c} faer uy={uy}"
         );
         assert!(out.ninc >= 1, "ninc {}", out.ninc);
+        let mut incs = std::collections::HashSet::new();
+        let mut tmin = f64::MAX;
+        let mut tmax = f64::MIN;
+        let mut n_disp = 0usize;
+        for line in out.frd.lines() {
+            if line.starts_with(" -4  DISP") {
+                n_disp += 1;
+            }
+            if !line.starts_with("  100CL") || line.len() < 63 {
+                continue;
+            }
+            let b = line.as_bytes();
+            let time: f64 = std::str::from_utf8(&b[12..24])
+                .unwrap_or("")
+                .trim()
+                .parse()
+                .unwrap_or(0.0);
+            tmin = tmin.min(time);
+            tmax = tmax.max(time);
+            if let Ok(i) = std::str::from_utf8(&b[58..63]).unwrap_or("").trim().parse::<i32>() {
+                incs.insert(i);
+            }
+        }
+        assert_eq!(
+            incs.len(),
+            out.ninc,
+            "FRD increments {}, solver ninc {}",
+            incs.len(),
+            out.ninc
+        );
+        assert_eq!(n_disp, out.ninc, "one DISP block per Riks increment");
+        assert!(tmin < 0.0, "snap-back λ missing in FRD, tmin={tmin}");
+        assert!(tmax > 0.95, "final λ missing in FRD, tmax={tmax}");
     }
 
     fn cax3_lame_deck() -> String {

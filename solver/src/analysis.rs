@@ -4802,6 +4802,77 @@ fn truss3_midside_mpcs(model: &Model, ndn: usize) -> Result<Vec<constraint::Mpc>
     Ok(out)
 }
 
+/// Nodal fields at one converged Riks state. `λ` may be negative on the
+/// snap-back branch; that value is the FRD time so Mecway can plot it.
+fn riks_fields(
+    model: &Model,
+    u_full: &[f64],
+    asm: &NlAsm,
+    f_ext: &[f64],
+    lam: f64,
+    ndn: usize,
+    nnode: usize,
+) -> Result<(
+    Vec<[f64; 3]>,
+    Vec<[f64; 3]>,
+    Vec<[f64; 3]>,
+    Vec<[f64; 3]>,
+    Vec<[f64; 6]>,
+    Vec<[f64; 6]>,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<(i32, usize, [f64; 6])>,
+)> {
+    let (u, ur) = split_disp(u_full, ndn, nnode);
+    let mut rf = vec![[0.0; 3]; nnode];
+    let mut rm = vec![[0.0; 3]; nnode];
+    for ni in 0..nnode {
+        for d in 0..3 {
+            let g = dof_of(ndn, ni, d);
+            rf[ni][d] = asm.f_int[g] - lam * f_ext[g];
+            if ndn >= 6 {
+                let gr = dof_of(ndn, ni, 3 + d);
+                rm[ni][d] = asm.f_int[gr] - lam * f_ext[gr];
+            }
+        }
+    }
+    let mut accs = vec![[0.0; 6]; nnode];
+    let mut cnt = vec![0.0; nnode];
+    let mut gacc = vec![[0.0; 6]; nnode];
+    let mut pacc = vec![0.0; nnode];
+    let mut stress_gp = Vec::new();
+    for (ei, el) in model.elements.iter().enumerate() {
+        let s = asm.cauchy[ei];
+        let g = asm.gl[ei];
+        let p = asm.peeq_e[ei];
+        for &id in &el.nodes {
+            let ni = model.node_index(id)?;
+            for c in 0..6 {
+                accs[ni][c] += s[c];
+                gacc[ni][c] += g[c];
+            }
+            pacc[ni] += p;
+            cnt[ni] += 1.0;
+        }
+        stress_gp.push((el.id, 1usize, s));
+    }
+    let mut stress = vec![[0.0; 6]; nnode];
+    let mut strain = vec![[0.0; 6]; nnode];
+    let mut vm = vec![0.0; nnode];
+    let mut peeq = vec![0.0; nnode];
+    for i in 0..nnode {
+        if cnt[i] > 0.0 {
+            for c in 0..6 {
+                stress[i][c] = accs[i][c] / cnt[i];
+                strain[i][c] = gacc[i][c] / cnt[i];
+            }
+            peeq[i] = pacc[i] / cnt[i];
+        }
+        vm[i] = von_mises(&stress[i]);
+    }
+    Ok((u, ur, rf, rm, stress, strain, vm, peeq, stress_gp))
+}
+
 /// Modified Riks / Crisfield arc-length (CalculiX `*STATIC, RIKS`).
 fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
     let ctrl = model.riks.unwrap_or(RiksCtrl::default());
@@ -4849,6 +4920,7 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut last = assemble_nl(&model, &u_full, &hist)?;
     let mut retries = 0usize;
     let mut inc = 0usize;
+    let mut frd_frames: Vec<frd::FrdFrame> = Vec::new();
 
     while inc < ctrl.max_inc.max(1) {
         last = assemble_nl(&model, &u_full, &hist)?;
@@ -4994,6 +5066,17 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
             dl = (dl * grow).min(target_dl);
         }
         lam_conv = lam;
+        let (u_i, _, rf_i, _, stress_i, strain_i, _, peeq_i, _) =
+            riks_fields(&model, &u_full, &last, &f_ext, lam, ndn, nnode)?;
+        frd_frames.push(frd::FrdFrame {
+            time: lam,
+            iinc: ninc as i32,
+            u: u_i,
+            stress: stress_i,
+            rf: rf_i,
+            strain: strain_i,
+            peeq: peeq_i,
+        });
         if lam >= ctrl.period - 1e-8 {
             break;
         }
@@ -5012,54 +5095,9 @@ fn solve_riks(model: Model, t0: f64) -> Result<SolveOutput> {
 
     let solver = format!("Riks (λ={lam:.4}, {ninc} inc, {solver_name}, {total_iters} iters)");
 
-    let (u, ur) = split_disp(&u_full, ndn, nnode);
-    let mut rf = vec![[0.0; 3]; nnode];
-    let mut rm = vec![[0.0; 3]; nnode];
-    for ni in 0..nnode {
-        for d in 0..3 {
-            let g = dof_of(ndn, ni, d);
-            rf[ni][d] = last.f_int[g] - lam * f_ext[g];
-            if ndn >= 6 {
-                let gr = dof_of(ndn, ni, 3 + d);
-                rm[ni][d] = last.f_int[gr] - lam * f_ext[gr];
-            }
-        }
-    }
-    let mut accs = vec![[0.0; 6]; nnode];
-    let mut cnt = vec![0.0; nnode];
-    let mut gacc = vec![[0.0; 6]; nnode];
-    let mut pacc = vec![0.0; nnode];
-    let mut stress_gp = Vec::new();
-    for (ei, el) in model.elements.iter().enumerate() {
-        let s = last.cauchy[ei];
-        let g = last.gl[ei];
-        let p = last.peeq_e[ei];
-        for &id in &el.nodes {
-            let ni = model.node_index(id)?;
-            for c in 0..6 {
-                accs[ni][c] += s[c];
-                gacc[ni][c] += g[c];
-            }
-            pacc[ni] += p;
-            cnt[ni] += 1.0;
-        }
-        stress_gp.push((el.id, 1usize, s));
-    }
-    let mut stress = vec![[0.0; 6]; nnode];
-    let mut strain = vec![[0.0; 6]; nnode];
-    let mut vm = vec![0.0; nnode];
-    let mut peeq = vec![0.0; nnode];
-    for i in 0..nnode {
-        if cnt[i] > 0.0 {
-            for c in 0..6 {
-                stress[i][c] = accs[i][c] / cnt[i];
-                strain[i][c] = gacc[i][c] / cnt[i];
-            }
-            peeq[i] = pacc[i] / cnt[i];
-        }
-        vm[i] = von_mises(&stress[i]);
-    }
-    let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &peeq);
+    let (u, ur, rf, rm, stress, strain, vm, peeq, stress_gp) =
+        riks_fields(&model, &u_full, &last, &f_ext, lam, ndn, nnode)?;
+    let frd_s = frd::write_frd_frames(&model, &frd_frames);
     let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
     let procedure = model.procedure.name().to_string();
     let nsteps = model.steps.len().max(1);
