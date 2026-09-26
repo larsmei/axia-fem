@@ -40,16 +40,27 @@ pub fn write_f06(model: &Model, out: &SolveOutput) -> String {
 }
 
 fn write_case(s: &mut String, model: &Model, n: usize, case: &Subcase) {
+    s.push_str(&format!(
+        "0                                              OUTPUT FOR SUBCASE {n}\n"
+    ));
     s.push_str(&format!("0                                              SUBCASE {n}\n"));
     if !case.label.is_empty() {
         s.push_str(&format!("                                               {}\n", case.label));
     }
     if !case.frequencies.is_empty() {
         s.push_str("\n0                                              R E A L   E I G E N V A L U E S\n");
-        s.push_str("0     MODE        FREQUENCY\n");
-        s.push_str("                  CYCLES\n");
+        s.push_str("0     MODE    EXTRACTION      EIGENVALUE            RADIANS             CYCLES\n");
         for (i, f) in case.frequencies.iter().enumerate() {
-            s.push_str(&format!("     {:6}     {}\n", i + 1, es14(*f)));
+            let omega = std::f64::consts::TAU * *f;
+            let lambda = omega * omega;
+            s.push_str(&format!(
+                "     {:6}     {:6}     {}{}{}\n",
+                i + 1,
+                i + 1,
+                es14(lambda),
+                es14(omega),
+                es14(*f)
+            ));
         }
     }
     if !case.buckles.is_empty() {
@@ -208,7 +219,7 @@ fn grid_table(
     s.push('\n');
     s.push_str("1                                             ");
     s.push_str(sub);
-    s.push_str("\n\n");
+    s.push('\n');
     s.push_str("           GRID     COORD      T1            T2            T3            R1            R2            R3\n");
     s.push_str("                     SYS\n");
     let n = model.node_ids.len().min(t.len());

@@ -941,6 +941,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     };
 
     let mpcs = constraint::build_all_mpcs(&model, ndn)?;
+    autospc_null_diag(&model, ndn, ndof, &trips, &mpcs, &mut prescribed);
     let map = DofMap::build(ndof, &prescribed, &mpcs)?;
     let nfree = map.n_ind;
     let mut solver = "prescribed".to_string();
@@ -1942,20 +1943,94 @@ fn assemble_bush(
         Some(n) => Some(model.coords[model.node_index(n)?]),
         None => None,
     };
-    let mut x = b.x;
-    let xn = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt();
-    if xn < 1e-12 {
-        if let Some(p2) = p2 {
-            x = [p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]];
+    let (ex, ey, ez) = bush_frame(b.x, b.y);
+    // MYSTRAN default (no continuation): spring at S=0.5 along GA–GB.
+    // Offsets are from each grid to that station, in basic coordinates.
+    let (off1, off2) = bush_station_offsets(p1, p2);
+    if p2.is_none() {
+        scatter_bush_ground(model, ndn, b, &ex, &ey, &ez, trips)?;
+        return Ok(());
+    }
+    // Local displacement d = B g, with u_end = u + θ × offset, then into the element frame.
+    // K_global = B^T K_local B. K_local is the diagonal PBUSH pair.
+    let mut bmat = [[0.0; 12]; 12];
+    let offs = [off1, off2];
+    let axes = [ex, ey, ez];
+    for n in 0..2 {
+        let go = n * 6;
+        let o = offs[n];
+        let s = [
+            [0.0, o[2], -o[1]],
+            [-o[2], 0.0, o[0]],
+            [o[1], -o[0], 0.0],
+        ];
+        for i in 0..3 {
+            for j in 0..3 {
+                bmat[go + i][go + j] += axes[i][j];
+                bmat[go + 3 + i][go + 3 + j] += axes[i][j];
+            }
+            for k in 0..3 {
+                let mut c = 0.0;
+                for j in 0..3 {
+                    c += axes[i][j] * s[j][k];
+                }
+                bmat[go + i][go + 3 + k] += c;
+            }
         }
     }
+    let mut kl = [[0.0; 12]; 12];
+    for i in 0..6 {
+        let ki = b.k[i];
+        kl[i][i] = ki;
+        kl[i + 6][i + 6] = ki;
+        kl[i][i + 6] = -ki;
+        kl[i + 6][i] = -ki;
+    }
+    let mut temp = [[0.0; 12]; 12];
+    for i in 0..12 {
+        for j in 0..12 {
+            let mut s = 0.0;
+            for k in 0..12 {
+                s += kl[i][k] * bmat[k][j];
+            }
+            temp[i][j] = s;
+        }
+    }
+    let n1 = model.node_index(b.n1)?;
+    let n2 = model.node_index(b.n2.unwrap())?;
+    let lim = 6.min(ndn);
+    let mut gd = [0usize; 12];
+    for d in 0..lim {
+        gd[d] = dof_of(ndn, n1, d);
+        gd[6 + d] = dof_of(ndn, n2, d);
+    }
+    for i in 0..lim {
+        for j in 0..lim {
+            for ni in 0..2 {
+                for nj in 0..2 {
+                    let mut v = 0.0;
+                    for k in 0..12 {
+                        v += bmat[k][ni * 6 + i] * temp[k][nj * 6 + j];
+                    }
+                    if v.abs() > 0.0 {
+                        trips.push((gd[ni * 6 + i], gd[nj * 6 + j], v));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bush_frame(x_in: [f64; 3], y_in: [f64; 3]) -> ([f64; 3], [f64; 3], [f64; 3]) {
+    let mut x = x_in;
     let xn = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt();
     if xn < 1e-12 {
         x = [1.0, 0.0, 0.0];
     } else {
         x = [x[0] / xn, x[1] / xn, x[2] / xn];
     }
-    let mut y = b.y;
+    let mut y = y_in;
     let d = y[0] * x[0] + y[1] * x[1] + y[2] * x[2];
     y = [y[0] - d * x[0], y[1] - d * x[1], y[2] - d * x[2]];
     let yn = (y[0] * y[0] + y[1] * y[1] + y[2] * y[2]).sqrt();
@@ -1975,10 +2050,37 @@ fn assemble_bush(
         x[2] * y[0] - x[0] * y[2],
         x[0] * y[1] - x[1] * y[0],
     ];
+    (x, y, z)
+}
+
+fn bush_station_offsets(p1: [f64; 3], p2: Option<[f64; 3]>) -> ([f64; 3], [f64; 3]) {
+    let Some(p2) = p2 else {
+        return ([0.0; 3], [0.0; 3]);
+    };
+    let d = [p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if len < 1.0e-4 {
+        return ([0.0; 3], [0.0; 3]);
+    }
+    let s = 0.5;
+    let off1 = [d[0] * s, d[1] * s, d[2] * s];
+    let off2 = [d[0] * (s - 1.0), d[1] * (s - 1.0), d[2] * (s - 1.0)];
+    (off1, off2)
+}
+
+fn scatter_bush_ground(
+    model: &Model,
+    ndn: usize,
+    b: &crate::model::BushEl,
+    ex: &[f64; 3],
+    ey: &[f64; 3],
+    ez: &[f64; 3],
+    trips: &mut Vec<(usize, usize, f64)>,
+) -> Result<()> {
     let r = [
-        [x[0], y[0], z[0]],
-        [x[1], y[1], z[1]],
-        [x[2], y[2], z[2]],
+        [ex[0], ey[0], ez[0]],
+        [ex[1], ey[1], ez[1]],
+        [ex[2], ey[2], ez[2]],
     ];
     let mut kg = [0.0; 36];
     for blk in 0..2 {
@@ -1999,30 +2101,11 @@ fn assemble_bush(
     for d in 0..lim {
         g1[d] = dof_of(ndn, n1, d);
     }
-    if let Some(n2id) = b.n2 {
-        let n2 = model.node_index(n2id)?;
-        let mut g2 = [0usize; 6];
-        for d in 0..lim {
-            g2[d] = dof_of(ndn, n2, d);
-        }
-        for i in 0..lim {
-            for j in 0..lim {
-                let v = kg[i * 6 + j];
-                if v.abs() > 0.0 {
-                    trips.push((g1[i], g1[j], v));
-                    trips.push((g2[i], g2[j], v));
-                    trips.push((g1[i], g2[j], -v));
-                    trips.push((g2[i], g1[j], -v));
-                }
-            }
-        }
-    } else {
-        for i in 0..lim {
-            for j in 0..lim {
-                let v = kg[i * 6 + j];
-                if v.abs() > 0.0 {
-                    trips.push((g1[i], g1[j], v));
-                }
+    for i in 0..lim {
+        for j in 0..lim {
+            let v = kg[i * 6 + j];
+            if v.abs() > 0.0 {
+                trips.push((g1[i], g1[j], v));
             }
         }
     }
@@ -2068,6 +2151,78 @@ fn scale_eigenvector(u: &mut [f64], norm: &crate::model::EigNorm, model: &Model,
                     *v /= s;
                 }
             }
+        }
+    }
+}
+
+/// Pin a free DOF whose diagonal is numerical noise next to Kmax.
+/// MYSTRAN's default AUTOSPC_RAT is 1e-8, which also freezes real but soft
+/// bending/drilling DOFs when another diagonal is huge. Exact nulls (J = 0)
+/// sit far below that, so the cut here is 1e-14·Kmax. MPC slaves, pretension
+/// dummies and pin-released beam nodes are left alone: a release is a real
+/// mechanism, not an unused pivot.
+fn autospc_null_diag(
+    model: &Model,
+    ndn: usize,
+    ndof: usize,
+    trips: &[(usize, usize, f64)],
+    mpcs: &[constraint::Mpc],
+    prescribed: &mut HashMap<usize, f64>,
+) {
+    if !model.autospc || ndof == 0 || ndn == 0 {
+        return;
+    }
+    let mut skip = HashSet::new();
+    for m in mpcs {
+        // Raw Kii of an MPC master is often 0; the stiffness arrives only
+        // after reduction. Pinning it drops the load.
+        skip.insert(m.slave);
+        for (d, _) in &m.masters {
+            skip.insert(*d);
+        }
+    }
+    for p in &model.pretensions {
+        if let Ok(i) = model.node_index(p.dummy) {
+            for d in 0..ndn {
+                skip.insert(dof_of(ndn, i, d));
+            }
+        }
+    }
+    for el in &model.elements {
+        if !el.kind.is_beam() {
+            continue;
+        }
+        let Ok(sec) = model.beam_section_for(el) else {
+            continue;
+        };
+        if sec.rel_a == 0 && sec.rel_b == 0 {
+            continue;
+        }
+        for &id in &el.nodes {
+            if let Ok(i) = model.node_index(id) {
+                for d in 0..ndn {
+                    skip.insert(dof_of(ndn, i, d));
+                }
+            }
+        }
+    }
+    let mut diag = vec![0.0; ndof];
+    for &(i, j, v) in trips {
+        if i == j && i < ndof {
+            diag[i] += v;
+        }
+    }
+    let max_d = diag.iter().fold(0.0_f64, |m, d| m.max(d.abs()));
+    if max_d < 1e-30 {
+        return;
+    }
+    let tol = max_d * 1e-14;
+    for i in 0..ndof {
+        if prescribed.contains_key(&i) || skip.contains(&i) {
+            continue;
+        }
+        if diag[i].abs() <= tol {
+            prescribed.insert(i, 0.0);
         }
     }
 }

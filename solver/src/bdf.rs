@@ -516,7 +516,8 @@ struct BushRaw {
     n2: Option<i32>,
     pid: i32,
     nvec: [f64; 3],
-    cid: i32,
+    /// None: CID blank. Some(0): basic. Some(n): that coordinate system.
+    cid: Option<i32>,
 }
 
 enum BuiltEl {
@@ -1074,11 +1075,12 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 }));
             }
             "BAROR" => {
-                let n1 = bar_orient_fields_at(d, 2);
+                // Same columns as CBAR: X1,X2,X3 are fields 6–8 (d[4..]).
+                let n1 = bar_orient_fields(d);
                 if g0_flag(&n1) || n1[0].abs() + n1[1].abs() + n1[2].abs() > 1e-15 {
                     baror.n1 = n1;
                 }
-                let (offt, base) = cbar_tail_base_at(d, 5);
+                let (offt, base) = cbar_tail_base(d);
                 if !field(d, base).is_empty() {
                     baror.rel_a = pin_bits(field(d, base));
                 }
@@ -1355,7 +1357,13 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 let n1 = req_i32(d, 2, "CBUSH GA")?;
                 let n2 = field_i32(d, 3).filter(|g| *g != 0);
                 let nvec = bar_orient_fields(d);
-                let cid = field_i32(d, 7).unwrap_or(0);
+                // Blank CID → element axis from GA–GB / v-vector (MYSTRAN CID = -99).
+                // An explicit 0 is the basic frame, not "missing".
+                let cid = if field(d, 7).is_empty() {
+                    None
+                } else {
+                    Some(field_i32(d, 7).unwrap_or(0))
+                };
                 bushes.push(BushRaw { n1, n2, pid, nvec, cid });
             }
             "RBE2" => {
@@ -1367,10 +1375,16 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
             }
             "RBE3" => {
                 let eid = req_i32(d, 0, "RBE3")?;
-                let gref = req_i32(d, 1, "RBE3 REF")?;
-                let refc = comps(field(d, 2));
+                // Fixed-field RBE3 leaves field 2 blank; REFGRID is field 3.
+                // Free-field omits that blank (`RBE3,EID,REFGRID,REFC,...`).
+                let (gref_i, refc_i, mut i) = if field(d, 1).is_empty() {
+                    (2, 3, 4)
+                } else {
+                    (1, 2, 3)
+                };
+                let gref = req_i32(d, gref_i, "RBE3 REF")?;
+                let refc = comps(field(d, refc_i));
                 let mut groups = Vec::new();
-                let mut i = 3;
                 while i < d.len() {
                     if d[i].is_empty() {
                         i += 1;
@@ -1448,12 +1462,9 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                     field_f64(d, 5).unwrap_or(0.0),
                     field_f64(d, 6).unwrap_or(0.0),
                 ];
-                let ln = norm3(n);
-                let f = if ln < 1e-30 {
-                    [0.0; 3]
-                } else {
-                    scale3(n, mag / ln)
-                };
+                // MYSTRAN BD_FORMOM stores SCALEF*Vi and does not divide by |V|
+                // (MSC normalizes the direction). The validation decks rely on that.
+                let f = scale3(n, mag);
                 loads.entry(sid).or_default().push(LoadItem::Force {
                     g,
                     cid,
@@ -1488,11 +1499,10 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                     field_f64(d, 4).unwrap_or(0.0),
                     field_f64(d, 5).unwrap_or(0.0),
                 ];
-                let ln = norm3(n);
-                let dir = if ln < 1e-30 { [0.0, 0.0, -1.0] } else { scale3(n, 1.0 / ln) };
+                // MYSTRAN BD_GRAV: ACCEL = SCALEF*VEC, not SCALEF*unit(VEC).
                 loads.entry(sid).or_default().push(LoadItem::Grav {
                     cid,
-                    a: scale3(dir, a),
+                    a: scale3(n, a),
                 });
             }
             "LOAD" => {
@@ -1957,30 +1967,7 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
         slave_nodes.extend(dep.iter().copied());
     }
     for (eid, gref, refc, groups) in &rbe3s {
-        if refc.is_empty() {
-            return err(format!("RBE3 {eid} ohne REFC."));
-        }
-        for &comp in refc {
-            let mut wsum = 0.0;
-            for (w, cm, gs) in groups {
-                if cm.contains(&comp) {
-                    wsum += *w * gs.len() as f64;
-                }
-            }
-            if wsum.abs() < 1e-30 {
-                return err(format!("RBE3 {eid}: Komponente {comp} ohne unabhängige Gitter."));
-            }
-            let mut terms = vec![(*gref, comp - 1, 1.0)];
-            for (w, cm, gs) in groups {
-                if !cm.contains(&comp) {
-                    continue;
-                }
-                for g in gs {
-                    terms.push((*g, comp - 1, -w / wsum));
-                }
-            }
-            model.equations.push(Equation { terms, rhs: 0.0 });
-        }
+        push_rbe3(&mut model, *eid, *gref, refc, groups)?;
     }
 
     let pin_rot: Vec<i32> = if rbes.is_empty() {
@@ -2380,9 +2367,12 @@ fn ensure_grid(model: &mut Model, id: i32) {
 }
 
 fn bush_axes(b: &BushRaw, model: &Model, cords: &HashMap<i32, Cord>) -> Result<([f64; 3], [f64; 3])> {
-    if b.cid != 0 {
-        let c = cords.get(&b.cid).ok_or_else(|| {
-            crate::error::FemError(format!("CBUSH: Koordinatensystem {} fehlt.", b.cid))
+    if let Some(cid) = b.cid {
+        if cid == 0 {
+            return Ok(([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]));
+        }
+        let c = cords.get(&cid).ok_or_else(|| {
+            crate::error::FemError(format!("CBUSH: Koordinatensystem {cid} fehlt."))
         })?;
         return Ok((c.ex, c.ey));
     }
@@ -2727,6 +2717,295 @@ fn disp_matrix(c: &Cord, at: [f64; 3]) -> [[f64; 3]; 3] {
 
 fn grid_xyz_opt(model: &Model, id: i32) -> Option<[f64; 3]> {
     model.id_to_index.get(&id).map(|&i| model.coords[i])
+}
+
+/// MYSTRAN `RBE3_PROC`: dependent DOFs are the weighted rigid fit of the
+/// independent translations, not a per-component average. Rotations in REFC
+/// are determined by the moment arms even when the independent set is only
+/// T1–T3. The small dependent block is solved so each equation has a single
+/// slave (the reference component).
+fn push_rbe3(
+    model: &mut Model,
+    eid: i32,
+    gref: i32,
+    refc: &[usize],
+    groups: &[(f64, Vec<usize>, Vec<i32>)],
+) -> Result<()> {
+    if refc.is_empty() {
+        return err(format!("RBE3 {eid} ohne REFC."));
+    }
+    let iref = model.node_index(gref).map_err(|_| {
+        crate::error::FemError(format!("RBE3 {eid}: REFGRID {gref} fehlt."))
+    })?;
+    let pref = model.coords[iref];
+    let mut dep = [false; 6];
+    for &c in refc {
+        if (1..=6).contains(&c) {
+            dep[c - 1] = true;
+        }
+    }
+    if !dep.iter().any(|d| *d) {
+        return err(format!("RBE3 {eid} ohne REFC."));
+    }
+    struct Ind {
+        g: i32,
+        w: [f64; 6],
+        d: [f64; 3],
+    }
+    let mut inds: Vec<Ind> = Vec::new();
+    for (w, cm, gs) in groups {
+        if *w == 0.0 || cm.is_empty() {
+            continue;
+        }
+        for &g in gs {
+            let ip = model.node_index(g).map_err(|_| {
+                crate::error::FemError(format!("RBE3 {eid}: Gitter {g} fehlt."))
+            })?;
+            let p = model.coords[ip];
+            let mut ww = [0.0; 6];
+            for &c in cm {
+                if (1..=6).contains(&c) {
+                    ww[c - 1] = *w;
+                }
+            }
+            inds.push(Ind {
+                g,
+                w: ww,
+                d: [p[0] - pref[0], p[1] - pref[1], p[2] - pref[2]],
+            });
+        }
+    }
+    let mut wt6 = [0.0; 6];
+    let mut dx_bar = 0.0;
+    let mut dy_bar = 0.0;
+    let mut dz_bar = 0.0;
+    let mut ebar_yz = 0.0;
+    let mut ebar_zx = 0.0;
+    let mut ebar_xy = 0.0;
+    let mut sxy = 0.0;
+    let mut szx = 0.0;
+    let mut syz = 0.0;
+    for ind in &inds {
+        for c in 0..6 {
+            wt6[c] += ind.w[c];
+        }
+        dx_bar += ind.w[0] * ind.d[0];
+        dy_bar += ind.w[1] * ind.d[1];
+        dz_bar += ind.w[2] * ind.d[2];
+        ebar_yz += ind.w[2] * ind.d[1] * ind.d[1] + ind.w[1] * ind.d[2] * ind.d[2];
+        ebar_zx += ind.w[0] * ind.d[2] * ind.d[2] + ind.w[2] * ind.d[0] * ind.d[0];
+        ebar_xy += ind.w[1] * ind.d[0] * ind.d[0] + ind.w[0] * ind.d[1] * ind.d[1];
+        sxy += ind.w[2] * ind.d[0] * ind.d[1];
+        szx += ind.w[1] * ind.d[2] * ind.d[0];
+        syz += ind.w[0] * ind.d[1] * ind.d[2];
+    }
+    let eps = 1.0e-10;
+    let mut a = [[0.0; 6]; 6];
+    // Rows follow RBE3_PROC: coefficients of the reference DOFs.
+    if dep[0] {
+        a[0][0] += wt6[0];
+        if dep[4] {
+            a[0][4] += dz_bar;
+        }
+        if dep[5] {
+            a[0][5] += -dy_bar;
+        }
+    }
+    if dep[1] {
+        a[1][1] += wt6[1];
+        if dep[3] {
+            a[1][3] += -dz_bar;
+        }
+        if dep[5] {
+            a[1][5] += dx_bar;
+        }
+    }
+    if dep[2] {
+        a[2][2] += wt6[2];
+        if dep[3] {
+            a[2][3] += dy_bar;
+        }
+        if dep[4] {
+            a[2][4] += -dx_bar;
+        }
+    }
+    if dep[3] {
+        a[3][3] += if ebar_yz.abs() > eps { ebar_yz } else { 1.0 };
+        if dep[4] {
+            a[3][4] += -sxy;
+        }
+        if dep[5] {
+            a[3][5] += -szx;
+        }
+        if dep[1] {
+            a[3][1] += -dz_bar;
+        }
+        if dep[2] {
+            a[3][2] += dy_bar;
+        }
+    }
+    if dep[4] {
+        a[4][4] += if ebar_zx.abs() > eps { ebar_zx } else { 1.0 };
+        if dep[3] {
+            a[4][3] += -sxy;
+        }
+        if dep[5] {
+            a[4][5] += -syz;
+        }
+        if dep[0] {
+            a[4][0] += dz_bar;
+        }
+        if dep[2] {
+            a[4][2] += -dx_bar;
+        }
+    }
+    if dep[5] {
+        a[5][5] += if ebar_xy.abs() > eps { ebar_xy } else { 1.0 };
+        if dep[3] {
+            a[5][3] += -szx;
+        }
+        if dep[4] {
+            a[5][4] += -syz;
+        }
+        if dep[0] {
+            a[5][0] += -dy_bar;
+        }
+        if dep[1] {
+            a[5][1] += dx_bar;
+        }
+    }
+    // Independent columns, one per (grid, component) that MYSTRAN actually writes.
+    let mut cols: Vec<(i32, usize, [f64; 6])> = Vec::new();
+    let mut col_of = HashMap::<(i32, usize), usize>::new();
+    let mut add_col = |g: i32, c: usize, row: usize, v: f64, cols: &mut Vec<(i32, usize, [f64; 6])>| {
+        if v.abs() == 0.0 {
+            return;
+        }
+        let e = col_of.entry((g, c)).or_insert_with(|| {
+            cols.push((g, c, [0.0; 6]));
+            cols.len() - 1
+        });
+        cols[*e].2[row] += v;
+    };
+    for ind in &inds {
+        for k in 0..3 {
+            if ind.w[k] == 0.0 {
+                continue;
+            }
+            for row in 0..3 {
+                if dep[row] {
+                    // TDI = I in basic: -w * δ_row,k
+                    if row == k {
+                        add_col(ind.g, k, row, -ind.w[k], &mut cols);
+                    }
+                }
+            }
+        }
+        if dep[3] {
+            if ind.w[1] != 0.0 {
+                add_col(ind.g, 1, 3, ind.w[0] * ind.d[2], &mut cols);
+            }
+            if ind.w[2] != 0.0 {
+                add_col(ind.g, 2, 3, -ind.w[0] * ind.d[1], &mut cols);
+            }
+        }
+        if dep[4] {
+            if ind.w[0] != 0.0 {
+                add_col(ind.g, 0, 4, -ind.w[1] * ind.d[2], &mut cols);
+            }
+            if ind.w[2] != 0.0 {
+                add_col(ind.g, 2, 4, ind.w[1] * ind.d[0], &mut cols);
+            }
+        }
+        if dep[5] {
+            if ind.w[0] != 0.0 {
+                add_col(ind.g, 0, 5, ind.w[2] * ind.d[1], &mut cols);
+            }
+            if ind.w[1] != 0.0 {
+                add_col(ind.g, 1, 5, -ind.w[2] * ind.d[0], &mut cols);
+            }
+        }
+    }
+    let rows: Vec<usize> = (0..6).filter(|&i| dep[i]).collect();
+    let n = rows.len();
+    let mut mat = vec![0.0; n * n];
+    for (i, &ri) in rows.iter().enumerate() {
+        for (j, &cj) in rows.iter().enumerate() {
+            mat[i * n + j] = a[ri][cj];
+        }
+    }
+    let mut rhs = vec![0.0; n * cols.len().max(1)];
+    for (k, col) in cols.iter().enumerate() {
+        for (i, &ri) in rows.iter().enumerate() {
+            rhs[i * cols.len().max(1) + k] = col.2[ri];
+        }
+    }
+    let nrhs = cols.len().max(1);
+    if cols.is_empty() {
+        return err(format!("RBE3 {eid}: keine unabhängigen Komponenten."));
+    }
+    solve_dense(n, nrhs, &mut mat, &mut rhs).map_err(|_| {
+        crate::error::FemError(format!("RBE3 {eid}: abhängiger Block ist singulär."))
+    })?;
+    for (i, &ri) in rows.iter().enumerate() {
+        let mut terms = vec![(gref, ri, 1.0)];
+        for (k, col) in cols.iter().enumerate() {
+            let coef = rhs[i * nrhs + k];
+            if coef.abs() > 1e-14 {
+                terms.push((col.0, col.1, coef));
+            }
+        }
+        if terms.len() >= 2 {
+            model.equations.push(Equation { terms, rhs: 0.0 });
+        }
+    }
+    Ok(())
+}
+
+fn solve_dense(n: usize, nrhs: usize, a: &mut [f64], b: &mut [f64]) -> Result<()> {
+    for k in 0..n {
+        let mut piv = k;
+        let mut best = a[k * n + k].abs();
+        for i in (k + 1)..n {
+            let v = a[i * n + k].abs();
+            if v > best {
+                best = v;
+                piv = i;
+            }
+        }
+        if best < 1e-14 {
+            return err("singulär");
+        }
+        if piv != k {
+            for j in k..n {
+                a.swap(k * n + j, piv * n + j);
+            }
+            for j in 0..nrhs {
+                b.swap(k * nrhs + j, piv * nrhs + j);
+            }
+        }
+        let diag = a[k * n + k];
+        for i in (k + 1)..n {
+            let f = a[i * n + k] / diag;
+            a[i * n + k] = 0.0;
+            for j in (k + 1)..n {
+                a[i * n + j] -= f * a[k * n + j];
+            }
+            for j in 0..nrhs {
+                b[i * nrhs + j] -= f * b[k * nrhs + j];
+            }
+        }
+    }
+    for i in (0..n).rev() {
+        for j in 0..nrhs {
+            let mut s = b[i * nrhs + j];
+            for k in (i + 1)..n {
+                s -= a[i * n + k] * b[k * nrhs + j];
+            }
+            b[i * nrhs + j] = s / a[i * n + i];
+        }
+    }
+    Ok(())
 }
 
 fn resolve_mpc(
@@ -3132,10 +3411,13 @@ pub fn parse_f64(s: &str) -> Result<f64> {
     }
     let mut u = t.replace(['d', 'D'], "E");
     if !u.contains('E') && !u.contains('e') {
-        // Nastran 1.0+3 / 1.0-3, but not a leading sign.
+        // Nastran 1.0+3, 1.+7 and 10.+06: exponent sign after a digit or a decimal point.
         if let Some(k) = u.rfind(['+', '-']) {
-            if k > 0 && u.as_bytes()[k - 1].is_ascii_digit() {
-                u.insert(k, 'E');
+            if k > 0 {
+                let prev = u.as_bytes()[k - 1];
+                if prev.is_ascii_digit() || prev == b'.' {
+                    u.insert(k, 'E');
+                }
             }
         }
     }
@@ -3540,6 +3822,10 @@ mod tests {
         assert!((parse_f64("1.0+3").unwrap() - 1000.0).abs() < 1e-9);
         assert!((parse_f64("2.5-4").unwrap() - 2.5e-4).abs() < 1e-12);
         assert!((parse_f64("1.E+7").unwrap() - 1e7).abs() < 1.0);
+        assert!((parse_f64("1.+7").unwrap() - 1e7).abs() < 1.0);
+        assert!((parse_f64("10.+06").unwrap() - 1e7).abs() < 1.0);
+        assert!((parse_f64("10.+6").unwrap() - 1e7).abs() < 1.0);
+        assert!((parse_f64("-10.+6").unwrap() + 1e7).abs() < 1.0);
         let deck = "SOL 1\nCEND\nBEGIN BULK\nGRID,1,,0,0,0\nENDDATA\n";
         assert!(is_mystran_deck(deck));
         assert!(!is_mystran_deck("*NODE\n1, 0, 0, 0\n"));
@@ -4186,7 +4472,7 @@ CEND
 SPC = 1
 LOAD = 1
 BEGIN BULK
-BAROR,,,0.,1.,0.
+BAROR,,,,,0.,1.,0.
 GRID,11,,0.,0.,0.
 GRID,12,,100.,0.,0.
 CBAR,1,10,11,12
