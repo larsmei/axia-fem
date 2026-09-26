@@ -508,6 +508,11 @@ pub struct BeamSection {
     /// Grid-to-beam-end offsets in the basic system.
     pub off_a: [f64; 3],
     pub off_b: [f64; 3],
+    /// PBAR stress recovery points (y, z) in the element plane: C, D, E, F.
+    /// Zero means the points were blank (SA1–SA4 stay 0; max/min equal axial).
+    pub rec: [[f64; 2]; 4],
+    /// PBAR torsional stress coefficient C. Nonzero prints the torsional column.
+    pub sc: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -537,6 +542,8 @@ impl BeamSection {
             rel_b: 0,
             off_a: [0.0; 3],
             off_b: [0.0; 3],
+            rec: [[0.0; 2]; 4],
+            sc: 0.0,
         }
     }
 
@@ -560,6 +567,8 @@ impl BeamSection {
             rel_b: 0,
             off_a: [0.0; 3],
             off_b: [0.0; 3],
+            rec: [[0.0; 2]; 4],
+            sc: 0.0,
         }
     }
 
@@ -587,6 +596,8 @@ impl BeamSection {
             rel_b: 0,
             off_a: [0.0; 3],
             off_b: [0.0; 3],
+            rec: [[0.0; 2]; 4],
+            sc: 0.0,
         }
     }
 
@@ -627,6 +638,8 @@ impl BeamSection {
             rel_b: 0,
             off_a: [0.0; 3],
             off_b: [0.0; 3],
+            rec: [[0.0; 2]; 4],
+            sc: 0.0,
         }
     }
 
@@ -650,6 +663,8 @@ impl BeamSection {
             rel_b: 0,
             off_a: [0.0; 3],
             off_b: [0.0; 3],
+            rec: [[0.0; 2]; 4],
+            sc: 0.0,
         }
     }
 }
@@ -984,6 +999,8 @@ pub struct BushEl {
     pub k: [f64; 6],
     pub x: [f64; 3],
     pub y: [f64; 3],
+    /// PBUSH RCV stress coefficients (default 1). Multiplied by the element forces.
+    pub rcv: [f64; 2],
 }
 
 /// CSHEAR panel. `g` is the shear modulus, `t` the thickness.

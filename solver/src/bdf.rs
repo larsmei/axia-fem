@@ -473,9 +473,15 @@ enum Prop {
         j: f64,
         k1: f64,
         k2: f64,
+        /// PBAR continuation: (y, z) of stress points C, D, E, F.
+        rec: [[f64; 2]; 4],
+        /// Torsional stress coefficient C (blank = 0).
+        sc: f64,
     },
     Bush {
         k: [f64; 6],
+        /// RCV stress coefficients. Default 1 when the RCV card is absent.
+        rcv: [f64; 2],
     },
     Shear {
         mid: i32,
@@ -966,10 +972,20 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 let i1 = field_f64(d, 3).unwrap_or(0.0);
                 let i2 = field_f64(d, 4).unwrap_or(0.0);
                 let j = field_f64(d, 5).unwrap_or(0.0);
-                // stress-recovery continuation (8 values) then K1 K2 I12
+                let mut rec = [[0.0; 2]; 4];
+                let any_pt = (7..15).any(|i| field_f64(d, i).unwrap_or(0.0).abs() > 0.0);
+                if any_pt {
+                    for p in 0..4 {
+                        rec[p] = [
+                            field_f64(d, 7 + 2 * p).unwrap_or(0.0),
+                            field_f64(d, 8 + 2 * p).unwrap_or(0.0),
+                        ];
+                    }
+                }
                 let k1 = field_f64(d, 16).unwrap_or(0.0);
                 let k2 = field_f64(d, 17).unwrap_or(0.0);
                 let i12 = field_f64(d, 18).unwrap_or(0.0);
+                let sc = field_f64(d, 19).unwrap_or(0.0);
                 props.insert(
                     pid,
                     Prop::Bar {
@@ -981,6 +997,8 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                         j,
                         k1,
                         k2,
+                        rec,
+                        sc,
                     },
                 );
             }
@@ -1009,6 +1027,8 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                         j,
                         k1: 0.0,
                         k2: 0.0,
+                        rec: [[0.0; 2]; 4],
+                        sc: 0.0,
                     },
                 );
             }
@@ -1335,21 +1355,26 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
             "PBUSH" => {
                 let pid = req_i32(d, 0, "PBUSH")?;
                 let mut k = [0.0; 6];
+                let mut rcv = [1.0, 1.0];
                 let mut i = 1;
                 while i < d.len() {
                     let tag = field(d, i).to_ascii_uppercase();
-                    if matches!(tag.as_str(), "K" | "B" | "GE" | "R" | "T") {
+                    if matches!(tag.as_str(), "K" | "B" | "GE" | "RCV" | "R" | "T") {
                         if tag == "K" {
                             for a in 0..6 {
                                 k[a] = field_f64(d, i + 1 + a).unwrap_or(0.0);
                             }
+                        } else if tag == "RCV" {
+                            // MYSTRAN RPBUSH 19–22: stress T, stress R, strain T, strain R.
+                            rcv[0] = field_f64(d, i + 1).unwrap_or(1.0);
+                            rcv[1] = field_f64(d, i + 2).unwrap_or(1.0);
                         }
                         i += 7;
                     } else {
                         i += 1;
                     }
                 }
-                props.insert(pid, Prop::Bush { k });
+                props.insert(pid, Prop::Bush { k, rcv });
             }
             "CBUSH" => {
                 let _eid = req_i32(d, 0, "CBUSH")?;
@@ -1803,7 +1828,19 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 let prop = props.get(&b.pid).ok_or_else(|| {
                     crate::error::FemError(format!("CBAR {}: PID {} fehlt.", b.eid, b.pid))
                 })?;
-                let Prop::Bar { mid, area, i1, i2, i12, j, k1, k2 } = prop.clone() else {
+                let Prop::Bar {
+                    mid,
+                    area,
+                    i1,
+                    i2,
+                    i12,
+                    j,
+                    k1,
+                    k2,
+                    rec,
+                    sc,
+                } = prop.clone()
+                else {
                     return err(format!("CBAR {}: PID {} ist kein PBAR/PBARL.", b.eid, b.pid));
                 };
                 let elset = format!("PID{}E{}", b.pid, b.eid);
@@ -1827,6 +1864,8 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
                 let n2 = cross3(t, n1);
                 sec.off_a = offset_in_basic(&b.offt, 1, b.off_a, t, n1, n2);
                 sec.off_b = offset_in_basic(&b.offt, 2, b.off_b, t, n1, n2);
+                sec.rec = rec;
+                sec.sc = sc;
                 model.elset_beam.insert(elset.clone(), sec);
                 model.elements.push(Element {
                     id: b.eid,
@@ -1920,8 +1959,8 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
         model.dof_masses.push(s);
     }
     for b in bushes {
-        let k = match props.get(&b.pid) {
-            Some(Prop::Bush { k }) => *k,
+        let (k, rcv) = match props.get(&b.pid) {
+            Some(Prop::Bush { k, rcv }) => (*k, *rcv),
             _ => {
                 return err(format!("CBUSH: PBUSH {} fehlt.", b.pid));
             }
@@ -1936,6 +1975,7 @@ fn build_model(sol: i32, id_title: String, cases: &[CaseCtrl], cards: &[Vec<Stri
             k,
             x,
             y,
+            rcv,
         });
     }
     for (pid, n) in shear_raw {

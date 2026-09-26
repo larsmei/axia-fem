@@ -2022,7 +2022,7 @@ fn assemble_bush(
     Ok(())
 }
 
-fn bush_frame(x_in: [f64; 3], y_in: [f64; 3]) -> ([f64; 3], [f64; 3], [f64; 3]) {
+pub(crate) fn bush_frame(x_in: [f64; 3], y_in: [f64; 3]) -> ([f64; 3], [f64; 3], [f64; 3]) {
     let mut x = x_in;
     let xn = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt();
     if xn < 1e-12 {
@@ -2053,7 +2053,7 @@ fn bush_frame(x_in: [f64; 3], y_in: [f64; 3]) -> ([f64; 3], [f64; 3], [f64; 3]) 
     (x, y, z)
 }
 
-fn bush_station_offsets(p1: [f64; 3], p2: Option<[f64; 3]>) -> ([f64; 3], [f64; 3]) {
+pub(crate) fn bush_station_offsets(p1: [f64; 3], p2: Option<[f64; 3]>) -> ([f64; 3], [f64; 3]) {
     let Some(p2) = p2 else {
         return ([0.0; 3], [0.0; 3]);
     };

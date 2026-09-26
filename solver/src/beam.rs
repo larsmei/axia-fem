@@ -376,6 +376,9 @@ pub struct BarEngr {
     pub v2: f64,
     pub axial: f64,
     pub torque: f64,
+    /// Local nodal forces at end A: [fx, fy, fz, mx, my, mz], tension positive on fx of end B.
+    pub fa: [f64; 6],
+    pub len: f64,
 }
 
 pub fn cbar_engr_forces(
@@ -436,6 +439,8 @@ pub fn cbar_engr_forces(
         v2: -f[2],
         axial: -f[0],
         torque: -f[3],
+        fa: [f[0], f[1], f[2], f[3], f[4], f[5]],
+        len: loc.len,
     })
 }
 

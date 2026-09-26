@@ -392,6 +392,8 @@ fn engr_forces(s: &mut String, model: &Model, case: &Subcase) {
         write_bar_forces(s, &bars);
         write_bar_stress(s, &bars);
     }
+    write_bush_stress(s, model, &disp);
+    write_solid_stress(s, model, case);
 }
 
 struct RodRow {
@@ -411,6 +413,14 @@ struct BarRow {
     axial: f64,
     torque: f64,
     sa: f64,
+    sa_pt: [f64; 4],
+    sb_pt: [f64; 4],
+    sa_max: f64,
+    sa_min: f64,
+    sb_max: f64,
+    sb_min: f64,
+    st: f64,
+    torsional: bool,
 }
 
 fn rod_row(model: &Model, el: &crate::model::Element, disp: &BasicDisp) -> Option<RodRow> {
@@ -468,6 +478,24 @@ fn bar_row(model: &Model, el: &crate::model::Element, disp: &BasicDisp) -> Optio
     let sec = model.beam_section_for(el).ok()?;
     let g = crate::beam::cbar_engr_forces(&xyz, &ue, mat.e, mat.nu, &sec, alpha_dt(model, el, &mat)).ok()?;
     let sa = if sec.area.abs() > 1e-30 { g.axial / sec.area } else { 0.0 };
+    // MYSTRAN BAR1 with I12 = 0: s2 = Mz_end/I2, s3 = -My_end/I1, S = -(y*s2 + z*s3).
+    // I2 is sec.i11 (bending of the y axis), I1 is sec.i22.
+    let point = |my: f64, mz: f64, yz: [f64; 2]| {
+        let s2 = if sec.i11.abs() > 1e-30 { mz / sec.i11 } else { 0.0 };
+        let s3 = if sec.i22.abs() > 1e-30 { -my / sec.i22 } else { 0.0 };
+        -(yz[0] * s2 + yz[1] * s3)
+    };
+    let mut sa_pt = [0.0; 4];
+    let mut sb_pt = [0.0; 4];
+    for i in 0..4 {
+        sa_pt[i] = point(g.fa[4], g.fa[5], sec.rec[i]);
+        let my_b = g.fa[4] + g.fa[2] * g.len;
+        let mz_b = g.fa[5] - g.fa[1] * g.len;
+        sb_pt[i] = point(my_b, mz_b, sec.rec[i]);
+    }
+    let hi = |p: [f64; 4]| p.into_iter().fold(f64::NEG_INFINITY, f64::max);
+    let lo = |p: [f64; 4]| p.into_iter().fold(f64::INFINITY, f64::min);
+    let st = if sec.jtor.abs() > 1e-30 { sec.sc * g.torque / sec.jtor } else { 0.0 };
     Some(BarRow {
         m1a: g.m1a,
         m2a: g.m2a,
@@ -478,6 +506,14 @@ fn bar_row(model: &Model, el: &crate::model::Element, disp: &BasicDisp) -> Optio
         axial: g.axial,
         torque: g.torque,
         sa,
+        sa_pt,
+        sb_pt,
+        sa_max: sa + hi(sa_pt),
+        sa_min: sa + lo(sa_pt),
+        sb_max: sa + hi(sb_pt),
+        sb_min: sa + lo(sb_pt),
+        st,
+        torsional: sec.sc.abs() > 0.0,
     })
 }
 
@@ -627,6 +663,9 @@ fn write_bar_forces(s: &mut String, rows: &[(i32, BarRow)]) {
 }
 
 fn write_bar_stress(s: &mut String, rows: &[(i32, BarRow)]) {
+    // WRITE_ELEM_STRESSES format 1101. Two lines per element (end A, then end B).
+    // Margins stay blank. The torsional column is printed only if a PBAR C is nonzero.
+    let torsional = rows.iter().any(|(_, r)| r.torsional);
     s.push_str("\n");
     s.push_str(&format!(
         "{:29}E L E M E N T   S T R E S S E S   I N   L O C A L   E L E M E N T   C O O R D I N A T E   S Y S T E M\n",
@@ -636,35 +675,214 @@ fn write_bar_stress(s: &mut String, rows: &[(i32, BarRow)]) {
         "{:58}F O R   E L E M E N T   T Y P E   {:<11}\n",
         "", "BAR"
     ));
-    s.push_str(" Element      SA1           SA2           SA3           SA4           Axial        SA-Max        SA-Min      M.S.-T     Torsional\n");
-    s.push_str("    ID        SB1           SB2           SB3           SB4          Stress        SB-Max        SB-Min      M.S.-C   Stress/Margin\n");
+    if torsional {
+        s.push_str(" Element      SA1           SA2           SA3           SA4           Axial        SA-Max        SA-Min      M.S.-T     Torsional\n");
+        s.push_str("    ID        SB1           SB2           SB3           SB4          Stress        SB-Max        SB-Min      M.S.-C   Stress/Margin\n");
+    } else {
+        s.push_str(" Element      SA1           SA2           SA3           SA4          Axial         SA-Max        SA-Min      M.S.-T\n");
+        s.push_str("    ID        SB1           SB2           SB3           SB4          Stress        SB-Max        SB-Min      M.S.-C\n");
+    }
     for (id, row) in rows {
-        // Recovery points C/D/E/F are not stored; SA1–SA4 stay 0, axial is N/A.
         s.push_str(&format!(
-            " {:8}{}{}{}{}{}{}{}{:10}{}\n",
+            " {:8}{}{}{}{}{}{}{}",
             id,
-            es14(0.0),
-            es14(0.0),
-            es14(0.0),
-            es14(0.0),
+            es14(row.sa_pt[0]),
+            es14(row.sa_pt[1]),
+            es14(row.sa_pt[2]),
+            es14(row.sa_pt[3]),
             es14(row.sa),
-            es14(row.sa),
-            es14(row.sa),
-            "",
-            es14(0.0),
+            es14(row.sa_max),
+            es14(row.sa_min),
         ));
+        s.push_str("          ");
+        if torsional {
+            s.push_str(&es14(row.st));
+        }
+        s.push('\n');
         s.push_str(&format!(
             " {:8}{}{}{}{}{:14}{}{}\n",
             "",
-            es14(0.0),
-            es14(0.0),
-            es14(0.0),
-            es14(0.0),
+            es14(row.sb_pt[0]),
+            es14(row.sb_pt[1]),
+            es14(row.sb_pt[2]),
+            es14(row.sb_pt[3]),
             "",
-            es14(row.sa),
-            es14(row.sa),
+            es14(row.sb_max),
+            es14(row.sb_min),
         ));
     }
+}
+
+fn write_bush_stress(s: &mut String, model: &Model, disp: &BasicDisp) {
+    // WRITE_ELEM_STRESSES formats 1801/1802. Default RCV = 1, so stress equals the element force.
+    if model.bushes.is_empty() {
+        return;
+    }
+    let mut rows: Vec<(i32, [f64; 6])> = Vec::new();
+    for (i, b) in model.bushes.iter().enumerate() {
+        let Some(ia) = model.id_to_index.get(&b.n1).copied() else {
+            continue;
+        };
+        let pa = model.coords.get(ia).copied().unwrap_or([0.0; 3]);
+        let ua = disp.u.get(ia).copied().unwrap_or([0.0; 3]);
+        let ra = disp.ur.get(ia).copied().unwrap_or([0.0; 3]);
+        let (ub, rb, pb) = if let Some(n2) = b.n2 {
+            let Some(ib) = model.id_to_index.get(&n2).copied() else {
+                continue;
+            };
+            (
+                disp.u.get(ib).copied().unwrap_or([0.0; 3]),
+                disp.ur.get(ib).copied().unwrap_or([0.0; 3]),
+                model.coords.get(ib).copied().unwrap_or(pa),
+            )
+        } else {
+            ([0.0; 3], [0.0; 3], pa)
+        };
+        let (ex, ey, ez) = crate::analysis::bush_frame(b.x, b.y);
+        let (off1, off2) = if b.n2.is_some() {
+            crate::analysis::bush_station_offsets(pa, Some(pb))
+        } else {
+            ([0.0; 3], [0.0; 3])
+        };
+        let cross = |a: [f64; 3], c: [f64; 3]| {
+            [
+                a[1] * c[2] - a[2] * c[1],
+                a[2] * c[0] - a[0] * c[2],
+                a[0] * c[1] - a[1] * c[0],
+            ]
+        };
+        let shift = |u: [f64; 3], th: [f64; 3], off: [f64; 3]| {
+            let w = cross(th, off);
+            [u[0] + w[0], u[1] + w[1], u[2] + w[2]]
+        };
+        let da = shift(ua, ra, off1);
+        let db = shift(ub, rb, off2);
+        let loc = |v: [f64; 3]| {
+            [
+                ex[0] * v[0] + ex[1] * v[1] + ex[2] * v[2],
+                ey[0] * v[0] + ey[1] * v[1] + ey[2] * v[2],
+                ez[0] * v[0] + ez[1] * v[1] + ez[2] * v[2],
+            ]
+        };
+        let dlt = loc([db[0] - da[0], db[1] - da[1], db[2] - da[2]]);
+        let dlr = loc([rb[0] - ra[0], rb[1] - ra[1], rb[2] - ra[2]]);
+        // MYSTRAN multiplies the element engineering forces by the PBUSH RCV
+        // coefficients (default 1). Offset moments are not added: the reference
+        // bush deck has no RCV card, and adding the grid offset changes S2..S6.
+        let mut f = [0.0; 6];
+        for c in 0..3 {
+            f[c] = b.k[c] * dlt[c] * b.rcv[0];
+            f[c + 3] = b.k[c + 3] * dlr[c] * b.rcv[1];
+        }
+        rows.push(((i as i32) + 1, f));
+    }
+    if rows.is_empty() {
+        return;
+    }
+    s.push_str("\n");
+    s.push_str(&format!(
+        "{:29}E L E M E N T   S T R E S S E S   I N   L O C A L   E L E M E N T   C O O R D I N A T E   S Y S T E M\n",
+        ""
+    ));
+    s.push_str(&format!(
+        "{:58}F O R   E L E M E N T   T Y P E   {:<11}\n",
+        "", "BUSH"
+    ));
+    s.push_str("                    Element   Stress-1      Stress-2      Stress-3      Stress-4      Stress-5      Stress-6\n");
+    s.push_str("                       ID\n");
+    for (id, f) in rows {
+        s.push_str(&format!(
+            "                   {:8}{}{}{}{}{}{}\n",
+            id,
+            es14(f[0]),
+            es14(f[1]),
+            es14(f[2]),
+            es14(f[3]),
+            es14(f[4]),
+            es14(f[5]),
+        ));
+    }
+}
+
+fn write_solid_stress(s: &mut String, model: &Model, case: &Subcase) {
+    // WRITE_ELEM_STRESSES format 1301/1303: center stress of HEXA, PENTA and TETRA.
+    let mut rows: Vec<(i32, [f64; 6], f64)> = Vec::new();
+    for el in &model.elements {
+        let solid = matches!(
+            el.kind,
+            crate::model::ElemKind::Hex8
+                | crate::model::ElemKind::Hex8I
+                | crate::model::ElemKind::Hex8R
+                | crate::model::ElemKind::Hex20
+                | crate::model::ElemKind::Hex20R
+                | crate::model::ElemKind::Tet4
+                | crate::model::ElemKind::Tet10
+                | crate::model::ElemKind::Tet10T
+                | crate::model::ElemKind::Wedge6
+                | crate::model::ElemKind::Wedge15
+        );
+        if !solid || el.nodes.is_empty() {
+            continue;
+        }
+        let mut acc = [0.0; 6];
+        let mut n = 0.0;
+        for nid in &el.nodes {
+            let Some(&i) = model.id_to_index.get(nid) else {
+                continue;
+            };
+            if i >= case.stress.len() {
+                continue;
+            }
+            for k in 0..6 {
+                acc[k] += case.stress[i][k];
+            }
+            n += 1.0;
+        }
+        if n == 0.0 {
+            continue;
+        }
+        for k in 0..6 {
+            acc[k] /= n;
+        }
+        rows.push((el.id, acc, crate::elem::von_mises(&acc)));
+    }
+    if rows.is_empty() {
+        return;
+    }
+    s.push_str("\n");
+    s.push_str(&format!(
+        "{:29}E L E M E N T   S T R E S S E S   I N   L O C A L   E L E M E N T   C O O R D I N A T E   S Y S T E M\n",
+        ""
+    ));
+    s.push_str(&format!(
+        "{:58}F O R   E L E M E N T   T Y P E   {:<11}\n",
+        "", "HEXA"
+    ));
+    s.push_str("   Elem  Location            Sigma-xx      Sigma-yy      Sigma-zz       Tau-xy        Tau-yz        Tau-zx       von Mises\n");
+    s.push_str("    ID\n");
+    let mut cols = vec![Vec::new(); 7];
+    for (id, sig, vm) in &rows {
+        let v = [sig[0], sig[1], sig[2], sig[3], sig[4], sig[5], *vm];
+        s.push_str(&format!("{:8}  CENTER          ", id));
+        for (k, x) in v.iter().enumerate() {
+            s.push_str(&es14(*x));
+            cols[k].push(*x);
+        }
+        s.push('\n');
+    }
+    s.push_str("                            ------------- ------------- ------------- ------------- ------------- ------------- -------------\n");
+    fn col_line(s: &mut String, cols: &[Vec<f64>], label: &str, pick: fn(&[f64]) -> f64) {
+        s.push_str(label);
+        for c in cols {
+            s.push_str(&es14(pick(c)));
+        }
+        s.push('\n');
+    }
+    col_line(s, &cols, "                MAX* :     ", |c| c.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+    col_line(s, &cols, "                MIN* :     ", |c| c.iter().copied().fold(f64::INFINITY, f64::min));
+    s.push('\n');
+    col_line(s, &cols, "                ABS* :     ", |c| c.iter().copied().fold(0.0_f64, |a, v| a.max(v.abs())));
+    s.push_str("                * for output set\n");
 }
 
 fn grid_row(id: i32, cid: i32, v: [f64; 6]) -> String {
