@@ -265,9 +265,11 @@ pub fn hex20_face_pressure(xyz: &[[f64; 3]], face: i32, p: f64) -> Result<Vec<f6
         let nx = rxi[1] * reta[2] - rxi[2] * reta[1];
         let ny = rxi[2] * reta[0] - rxi[0] * reta[2];
         let nz = rxi[0] * reta[1] - rxi[1] * reta[0];
-        let tx = -p * nx * w;
-        let ty = -p * ny * w;
-        let tz = -p * nz * w;
+        // Same convention as C3D8: face order gives the inward normal,
+        // positive pressure compresses.
+        let tx = p * nx * w;
+        let ty = p * ny * w;
+        let tz = p * nz * w;
         for a in 0..8 {
             let gd = 3 * faces[fi][a];
             fe[gd] += nshp[a] * tx;

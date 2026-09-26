@@ -932,10 +932,12 @@ pub fn hex8_face_pressure(xyz: &[[f64; 3]; 8], face: i32, p: f64) -> Result<[f64
             let nx = rxi[1] * reta[2] - rxi[2] * reta[1];
             let ny = rxi[2] * reta[0] - rxi[0] * reta[2];
             let nz = rxi[0] * reta[1] - rxi[1] * reta[0];
-            // traction = -p * n_outward, dA vector is n_outward * dξ dη
-            let tx = -p * nx;
-            let ty = -p * ny;
-            let tz = -p * nz;
+            // Face winding follows the CalculiX node order, whose cross
+            // product points into the element. Positive pressure is
+            // compression (into the element), so the traction is +p * n_in.
+            let tx = p * nx;
+            let ty = p * ny;
+            let tz = p * nz;
             for a in 0..4 {
                 let gd = 3 * faces[fi][a];
                 fe[gd] += n[a] * tx;

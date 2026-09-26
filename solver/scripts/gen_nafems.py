@@ -173,8 +173,8 @@ def gen_le10(nr=4, nt=6, nz=2, name="le10_c3d20.inp"):
         fh.write("*BOUNDARY\n")
         fh.write("YS, 2, 2\nXS, 1, 1\nOUTER, 1, 2\nOMID, 3, 3\n")
         fh.write("*STEP\n*STATIC\n")
-        # Positive P on the top face (P2) points outward (+z). Compression → negative.
-        fh.write("*DLOAD\nTOP, P2, -1\n")
+        # CalculiX: positive pressure on P2 (top) points into the solid (−z).
+        fh.write("*DLOAD\nTOP, P2, 1\n")
         fh.write("*NODE FILE\nU\n*EL FILE\nS\n*END STEP\n")
     return path, d, n, eid
 

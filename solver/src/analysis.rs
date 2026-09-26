@@ -6,8 +6,8 @@ use crate::constraint::{self, DofMap};
 use crate::contact;
 use crate::dat;
 use crate::elem::{
-    element_ke, element_nodal_stress, hex8_body_force, hex8_face_pressure, quad4_body_force,
-    quad4_edge_pressure, tet4_body_force, von_mises,
+    d_iso_3d, element_ke, element_nodal_stress, hex8_body_force, hex8_face_pressure,
+    quad4_body_force, quad4_edge_pressure, tet4_body_force, von_mises,
 };
 use crate::error::{err, Result};
 use crate::extra;
@@ -637,9 +637,22 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
             }
         }
         if mat.density.abs() > 0.0 && kef.volume.abs() > 0.0 {
-            let mnode = mat.density * kef.volume / nn as f64;
+            let mass = mat.density * kef.volume.abs();
+            // Quadratic beams: row-sum of the consistent mass. Equal
+            // 1/n lumping puts twice the tip mass on a B32 and drops
+            // the first bending frequency by about 6 %.
+            let w_end = 1.0 / 6.0;
+            let w_mid = 2.0 / 3.0;
             for a in 0..nn {
                 let ni = model.node_index(el.nodes[a])?;
+                let w = if el.kind.is_beam() && nn == 3 {
+                    if a == 2 { w_mid } else { w_end }
+                } else if el.kind.is_beam() && nn == 2 {
+                    0.5
+                } else {
+                    1.0 / nn as f64
+                };
+                let mnode = mass * w;
                 for d in 0..3.min(local_dim) {
                     m_full[dof_of(ndn, ni, d)] += mnode;
                 }
@@ -983,7 +996,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                 ue[a * local_dim + d] = u_full[dof_of(ndn, ni, d)];
             }
         }
-        let sn = element_nodal_stress(
+        let mut sn = element_nodal_stress(
             el.kind,
             &xyz,
             &ue,
@@ -993,6 +1006,48 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
             th,
             elem_dirs(el, &model, &shell_n).as_deref(),
         )?;
+        if mat.alpha.abs() > 0.0
+            && matches!(
+                el.kind,
+                ElemKind::Hex8
+                    | ElemKind::Hex8I
+                    | ElemKind::Hex8R
+                    | ElemKind::Hex20
+                    | ElemKind::Hex20R
+                    | ElemKind::Tet4
+                    | ElemKind::Tet10
+                    | ElemKind::Tet10T
+                    | ElemKind::Wedge6
+                    | ElemKind::Wedge15
+            )
+        {
+            let dt_th = if let Some(&te) = model.elem_temp.get(&el.id) {
+                te - mat.tref
+            } else {
+                let mut tsum = 0.0;
+                for &id in &el.nodes {
+                    tsum += model.temperature_at(id);
+                }
+                tsum / nn as f64 - mat.tref
+            };
+            if dt_th.abs() > 0.0 {
+                if let Ok(dmat) = d_iso_3d(mat.e, mat.nu) {
+                    let eth = mat.alpha * dt_th;
+                    let ethv = [eth, eth, eth, 0.0, 0.0, 0.0];
+                    let mut sig_th = [0.0; 6];
+                    for r in 0..6 {
+                        for c in 0..6 {
+                            sig_th[r] += dmat[r * 6 + c] * ethv[c];
+                        }
+                    }
+                    for row in &mut sn {
+                        for c in 0..6 {
+                            row[c] -= sig_th[c];
+                        }
+                    }
+                }
+            }
+        }
         for a in 0..nn {
             let ni = model.node_index(el.nodes[a])?;
             for c in 0..6 {
@@ -1182,7 +1237,9 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     }
 
     let frd_s = frd::write_frd(&model, &u, &stress, &rf, &strain, &[]);
-    let dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
+    let mut dat_s = dat::write_dat(&model, &u, &stress_gp, &rf);
+    dat::append_nodal_stress(&mut dat_s, &model.node_ids, &stress);
+    dat::append_frequencies(&mut dat_s, &frequencies);
     let dt = now_ms() - t0;
     let procedure = model.procedure.name().to_string();
     let nsteps = model.steps.len().max(1);

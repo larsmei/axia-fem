@@ -757,13 +757,100 @@ S
             }
         }
         let mean: f64 = ux_loaded.iter().sum::<f64>() / ux_loaded.len() as f64;
-        assert!((mean - 0.01).abs() < 1e-5, "ux={mean}, expected 0.01");
+        assert!(
+            (mean + 0.01).abs() < 1e-5,
+            "ux={mean}, expected -0.01 (P4>0 is compression)"
+        );
         let mut sxx = 0.0;
         for s in &out.stress {
             sxx += s[0];
         }
         sxx /= out.stress.len() as f64;
-        assert!((sxx - 210.0).abs() < 1.0, "sxx={sxx}, expected 210");
+        assert!(
+            (sxx + 210.0).abs() < 1.0,
+            "sxx={sxx}, expected -210"
+        );
+    }
+
+    #[test]
+    fn thermal_hex_stress_subtracts_alpha_dt() {
+        let inp = r#"
+*HEADING
+thermal
+*NODE, NSET=NALL
+1,0,0,0
+2,10,0,0
+3,10,10,0
+4,0,10,0
+5,0,0,10
+6,10,0,10
+7,10,10,10
+8,0,10,10
+*ELEMENT,TYPE=C3D8,ELSET=E
+1,1,2,3,4,5,6,7,8
+*NSET,NSET=X0
+1,4,5,8
+*NSET,NSET=X1
+2,3,6,7
+*MATERIAL,NAME=S
+*ELASTIC
+210000,0.3
+*EXPANSION
+1.2e-5
+*SOLID SECTION,ELSET=E,MATERIAL=S
+*BOUNDARY
+X0,1
+X1,1
+1,2
+1,3
+*STEP
+*STATIC
+*TEMPERATURE
+NALL,100
+*END STEP
+"#;
+        let out = solve_native(inp).unwrap();
+        let sxx = out.stress[0][0];
+        assert!((sxx + 252.0).abs() < 0.5, "sxx={sxx}, expected -252");
+    }
+
+    #[test]
+    fn boundary_two_field_ss_beam() {
+        let inp = r#"
+*HEADING
+ss
+*NODE
+1,0,0,0
+2,0,0,50
+3,0,0,100
+4,0,0,150
+5,0,0,200
+*ELEMENT,TYPE=B32,ELSET=E
+1,1,2,3
+2,3,4,5
+*MATERIAL,NAME=S
+*ELASTIC
+210000,0.3
+*BEAM SECTION,ELSET=E,MATERIAL=S,SECTION=RECT
+10,10
+1,0,0
+*BOUNDARY
+1,1,3
+1,4
+1,6
+5,1,2
+5,4
+5,6
+*STEP
+*STATIC
+*CLOAD
+3,1,100
+*END STEP
+"#;
+        let out = solve_native(inp).expect("ss beam");
+        let ux = out.u[out.model.node_index(3).unwrap()][0];
+        // Euler FL^3/48EI = 0.095238, Timoshenko adds shear.
+        assert!((ux - 0.09598).abs() < 1e-4, "umid={ux}");
     }
 
     fn cps8_cantilever() -> String {

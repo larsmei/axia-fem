@@ -181,6 +181,74 @@ fn is_keyword_line(line: &str) -> bool {
     t.starts_with('*') && !t.starts_with("**")
 }
 
+/// One `*BOUNDARY` card. Two fields are `node, dof`. Three fields are
+/// `node, first, last` when the third entry is a DOF, otherwise
+/// `node, dof, value`. Flattening every line into one token stream made
+/// `1, 4` followed by `1, 6` swallow the next node id.
+fn boundary_card(toks: &[String]) -> Option<(String, usize, usize, f64)> {
+    if toks.len() < 2 {
+        return None;
+    }
+    let name = toks[0].to_ascii_uppercase();
+    let d1 = parse_i32(&toks[1]).ok()? as usize;
+    if toks.len() == 2 {
+        return Some((name, d1, d1, 0.0));
+    }
+    let dof_id = |s: &str| -> Option<usize> {
+        if !is_int_token(s) {
+            return None;
+        }
+        let v = parse_i32(s).ok()? as usize;
+        ((1..=6).contains(&v) || v == 11).then_some(v)
+    };
+    if toks.len() == 3 {
+        if let Some(d2) = dof_id(&toks[2]) {
+            return Some((name, d1, d2, 0.0));
+        }
+        let val = parse_f64_inner(&toks[2]).unwrap_or(0.0);
+        return Some((name, d1, d1, val));
+    }
+    let d2 = dof_id(&toks[2]).unwrap_or(d1);
+    let val = parse_f64_inner(&toks[3]).unwrap_or(0.0);
+    Some((name, d1, d2, val))
+}
+
+fn push_boundary(model: &mut Model, name: &str, first: usize, last: usize, val: f64) {
+    let first = first.max(1);
+    let last = last.max(first);
+    let ids: Vec<i32> = if let Ok(id) = parse_i32(name) {
+        vec![id]
+    } else if let Some(nodes) = model.nsets.get(name).cloned().filter(|v| !v.is_empty()) {
+        nodes
+    } else {
+        for d in first..=last {
+            if d >= 1 && d <= 6 {
+                model.warnings.push(format!(
+                    "__BC__|{name}|{}|{}|{val}",
+                    d - 1,
+                    d - 1
+                ));
+            } else if d == 11 {
+                model.warnings.push(format!("__TB__|{name}|{val}"));
+            }
+        }
+        return;
+    };
+    for id in ids {
+        for d in first..=last {
+            if d >= 1 && d <= 6 {
+                model.bcs.push(Boundary {
+                    node: id,
+                    dof: d - 1,
+                    value: val,
+                });
+            } else if d == 11 {
+                model.thermal_bcs.push(ThermalBc { node: id, value: val });
+            }
+        }
+    }
+}
+
 /// Collect data tokens from lines starting at `i` until the next keyword.
 /// Returns (tokens, index of next keyword or end).
 fn collect_tokens(lines: &[&str], mut i: usize) -> (Vec<String>, usize) {
@@ -666,121 +734,21 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                 if op_is_new(&params) {
                     step_bc_from = model.bcs.len();
                 }
-                let (toks, ni) = collect_tokens(&lines, i + 1);
-                i = ni;
-                let mut k = 0;
-                while k < toks.len() {
-                    let name = toks[k].to_ascii_uppercase();
-                    k += 1;
-                    if k >= toks.len() {
+                i += 1;
+                while i < n {
+                    let raw = strip_comment(lines[i]);
+                    if raw.trim().is_empty() {
+                        i += 1;
+                        continue;
+                    }
+                    if is_keyword_line(raw) {
                         break;
                     }
-                    let d1 = parse_i32(&toks[k])? as usize;
-                    k += 1;
-                    let d2 = if k < toks.len() && parse_i32(&toks[k]).is_ok() {
-                        let v = parse_i32(&toks[k])? as usize;
-                        k += 1;
-                        v
-                    } else {
-                        d1
-                    };
-                    let first = d1.max(1);
-                    let last = d2.max(first);
-                    let thermal = first == 11 || last == 11;
-                    let val = if k < toks.len() {
-                        let peek = &toks[k];
-                        if thermal && looks_like_number(peek) {
-                            let v = parse_f64_inner(peek).unwrap_or(0.0);
-                            k += 1;
-                            v
-                        } else if looks_like_number(peek) {
-                            let is_pure_int = is_int_token(peek);
-                            if is_pure_int && k + 1 < toks.len() {
-                                let maybe_dof = parse_i32(&toks[k + 1]).ok();
-                                if maybe_dof == Some(1)
-                                    || maybe_dof == Some(2)
-                                    || maybe_dof == Some(3)
-                                    || maybe_dof == Some(4)
-                                    || maybe_dof == Some(5)
-                                    || maybe_dof == Some(6)
-                                    || maybe_dof == Some(11)
-                                {
-                                    0.0
-                                } else {
-                                    let v = parse_f64_inner(peek).unwrap_or(0.0);
-                                    k += 1;
-                                    v
-                                }
-                            } else {
-                                let v = parse_f64_inner(peek).unwrap_or(0.0);
-                                k += 1;
-                                v
-                            }
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        0.0
-                    };
-                    let nodes = if let Ok(id) = parse_i32(&name) {
-                        vec![id]
-                    } else {
-                        // nsets not yet complete — store as synthetic later
-                        model
-                            .nsets
-                            .get(&name)
-                            .cloned()
-                            .unwrap_or_else(|| vec![])
-                            .into_iter()
-                            .chain(if name.chars().all(|c| c.is_ascii_digit() || c == '-') {
-                                vec![]
-                            } else {
-                                Vec::new()
-                            })
-                            .collect()
-                    };
-                    if nodes.is_empty() && parse_i32(&name).is_err() {
+                    let toks = tokenize_data(raw);
+                    if let Some((name, d1, d2, val)) = boundary_card(&toks) {
+                        push_boundary(&mut model, &name, d1, d2, val);
                     }
-                    if parse_i32(&name).is_ok() {
-                        let id = parse_i32(&name)?;
-                        for d in first..=last {
-                            if d >= 1 && d <= 6 {
-                                model.bcs.push(Boundary {
-                                    node: id,
-                                    dof: d - 1,
-                                    value: val,
-                                });
-                            } else if d == 11 {
-                                model.thermal_bcs.push(ThermalBc { node: id, value: val });
-                            }
-                        }
-                    } else if let Some(nodes) = model.nsets.get(&name).cloned().filter(|v| !v.is_empty()) {
-                        for id in nodes {
-                            for d in first..=last {
-                                if d >= 1 && d <= 6 {
-                                    model.bcs.push(Boundary {
-                                        node: id,
-                                        dof: d - 1,
-                                        value: val,
-                                    });
-                                } else if d == 11 {
-                                    model.thermal_bcs.push(ThermalBc { node: id, value: val });
-                                }
-                            }
-                        }
-                    } else {
-                        for d in first..=last {
-                            if d >= 1 && d <= 6 {
-                                model.warnings.push(format!(
-                                    "__BC__|{name}|{}|{}|{val}",
-                                    d - 1,
-                                    d - 1
-                                ));
-                            } else if d == 11 {
-                                model.warnings.push(format!("__TB__|{name}|{val}"));
-                            }
-                        }
-                    }
+                    i += 1;
                 }
             }
             "*CLOAD" => {
