@@ -171,6 +171,40 @@ pub fn hex20_nodal_stress(
     Ok(hex20_extrapolate(&gsig, reduced))
 }
 
+/// Geometric stiffness from the displacement. σ is the mean of the Gauss-point
+/// stresses (nodal extrapolation overshoots point-load peaks and trips buckling).
+pub fn hex20_kg_ue(
+    xyz: &[[f64; 3]],
+    ue: &[f64],
+    e: f64,
+    nu: f64,
+    reduced: bool,
+) -> Result<Vec<f64>> {
+    let d = d_iso_3d(e, nu)?;
+    let nd = 60usize;
+    let mut mean = [0.0; 6];
+    let mut ng = 0.0;
+    for (xi, eta, zeta, _) in hex_gauss(reduced) {
+        let (dndx, det, _) = hex20_dndx(xyz, xi, eta, zeta)?;
+        if det <= 0.0 {
+            continue;
+        }
+        let mut b = vec![0.0; 6 * nd];
+        fill_b3(&mut b, 20, &dndx);
+        let s = sigma_from_b(&b, 6, nd, &d, ue);
+        for c in 0..6 {
+            mean[c] += s[c];
+        }
+        ng += 1.0;
+    }
+    if ng > 0.0 {
+        for c in 0..6 {
+            mean[c] /= ng;
+        }
+    }
+    crate::eigen::hex20_kg(xyz, &mean, reduced)
+}
+
 pub(crate) fn hex20_extrapolate(gsig: &[[f64; 6]], reduced: bool) -> Vec<[f64; 6]> {
     let pts: Vec<f64> = if reduced { vec![-G2, G2] } else { G3.to_vec() };
     let n1 = pts.len();

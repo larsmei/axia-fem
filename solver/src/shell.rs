@@ -256,25 +256,36 @@ fn cartesian_shear_b(nshp: &[f64], dndx: &[[f64; 2]], nn: usize) -> Vec<f64> {
     b
 }
 
-fn s8_local(xy: &[[f64; 2]], e: f64, nu: f64, h: f64, reduced_shear: bool) -> Result<(Vec<f64>, f64)> {
+fn s8_local(
+    xy: &[[f64; 2]],
+    e: f64,
+    nu: f64,
+    h: f64,
+    hn: Option<&[f64]>,
+    reduced_shear: bool,
+) -> Result<(Vec<f64>, f64, f64)> {
     let nn = 8usize;
     let nd = 48usize;
     let mut ke = vec![0.0; nd * nd];
     let dm0 = d_plane_stress(e, nu)?;
-    let mut dm = [0.0; 9];
-    let mut db = [0.0; 9];
-    for i in 0..9 {
-        dm[i] = dm0[i] * h;
-        db[i] = dm0[i] * h * h * h / 12.0;
-    }
-    let ds = ds_mat(e, nu, h);
     let mut area = 0.0;
+    let mut vol = 0.0;
+    let mut hsum = 0.0;
+    let mut hw = 0.0;
     for i in 0..3 {
         for j in 0..3 {
             let xi = G3[i];
             let eta = G3[j];
             let w = W3[i] * W3[j];
             let (nshp, dn) = quad8_shape(xi, eta);
+            let hg = thickness_at(&nshp, h, hn);
+            let mut dm = [0.0; 9];
+            let mut db = [0.0; 9];
+            for k in 0..9 {
+                dm[k] = dm0[k] * hg;
+                db[k] = dm0[k] * hg * hg * hg / 12.0;
+            }
+            let ds = ds_mat(e, nu, hg);
             let mut dna = [[0.0; 2]; 8];
             dna.copy_from_slice(&dn);
             let (_, det, dndx) = jac_xy(xy, &dna, nn)?;
@@ -288,12 +299,17 @@ fn s8_local(xy: &[[f64; 2]], e: f64, nu: f64, h: f64, reduced_shear: bool) -> Re
                 add_shear(&mut ke, nd, &bg, &ds, w * det, nn);
             }
             area += w * det;
+            vol += w * det * hg;
+            hsum += w * det * hg;
+            hw += w * det;
         }
     }
     if reduced_shear {
         for &xi in &[-G2, G2] {
             for &eta in &[-G2, G2] {
                 let (nshp, dn) = quad8_shape(xi, eta);
+                let hg = thickness_at(&nshp, h, hn);
+                let ds = ds_mat(e, nu, hg);
                 let mut dna = [[0.0; 2]; 8];
                 dna.copy_from_slice(&dn);
                 let (_, det, dndx) = jac_xy(xy, &dna, nn)?;
@@ -302,8 +318,81 @@ fn s8_local(xy: &[[f64; 2]], e: f64, nu: f64, h: f64, reduced_shear: bool) -> Re
             }
         }
     }
-    add_drill(&mut ke, nd, nn, e, h, area);
-    Ok((ke, area))
+    let h_drill = if hw > 0.0 { hsum / hw } else { h };
+    add_drill(&mut ke, nd, nn, e, h_drill, area);
+    Ok((ke, area, vol))
+}
+
+fn thickness_at(n: &[f64], h: f64, hn: Option<&[f64]>) -> f64 {
+    let Some(hs) = hn else {
+        return h;
+    };
+    let mut s = 0.0;
+    for a in 0..n.len().min(hs.len()) {
+        s += n[a] * hs[a];
+    }
+    if s.abs() < 1e-16 { h.max(1e-16) } else { s.abs() }
+}
+
+/// S8/S8R with `*NODAL THICKNESS`. Returns (ke, mid-area, ∫h dA).
+pub fn shell8_variable_h(
+    xyz: &[[f64; 3]],
+    e: f64,
+    nu: f64,
+    hnodes: &[f64],
+    reduced: bool,
+) -> Result<(Vec<f64>, f64, f64)> {
+    if hnodes.len() < 8 {
+        return err("*NODAL THICKNESS: S8 braucht 8 Dicken.");
+    }
+    if e <= 0.0 || hnodes.iter().any(|h| *h <= 0.0) {
+        return err("S8: E-Modul und Knotendicke müssen positiv sein.");
+    }
+    let (e1, e2, e3) = local_frame(xyz, 8)?;
+    let xy = project_xy(xyz, e1, e2, 8);
+    let (mut ke, area, vol) = s8_local(&xy, e, nu, hnodes[0], Some(hnodes), reduced)?;
+    rotate_ke(&mut ke, 8, e1, e2, e3);
+    let _ = e3;
+    Ok((ke, area, vol))
+}
+
+/// Consistent translational mass of an S8 with nodal thickness. 48×48, rotations left at 0.
+pub fn shell8_consistent_mass(xyz: &[[f64; 3]], hnodes: &[f64], rho: f64) -> Result<Vec<f64>> {
+    if hnodes.len() < 8 {
+        return err("*NODAL THICKNESS: S8 braucht 8 Dicken.");
+    }
+    let (e1, e2, _) = local_frame(xyz, 8)?;
+    let xy = project_xy(xyz, e1, e2, 8);
+    let nd = 48usize;
+    let mut me = vec![0.0; nd * nd];
+    for i in 0..3 {
+        for j in 0..3 {
+            let xi = G3[i];
+            let eta = G3[j];
+            let wg = W3[i] * W3[j];
+            let (nshp, dn) = quad8_shape(xi, eta);
+            let hg = thickness_at(&nshp, hnodes[0], Some(hnodes));
+            let mut dna = [[0.0; 2]; 8];
+            dna.copy_from_slice(&dn);
+            let (_, det, _) = jac_xy(&xy, &dna, 8)?;
+            if det <= 0.0 {
+                continue;
+            }
+            let w = rho * hg * det * wg;
+            for a in 0..8 {
+                for b in 0..8 {
+                    let mab = nshp[a] * nshp[b] * w;
+                    if mab.abs() == 0.0 {
+                        continue;
+                    }
+                    for d in 0..3 {
+                        me[(6 * a + d) * nd + (6 * b + d)] += mab;
+                    }
+                }
+            }
+        }
+    }
+    Ok(me)
 }
 
 fn tri3_shape() -> ([f64; 3], [[f64; 2]; 3]) {
@@ -534,7 +623,10 @@ pub fn stiffness_bend(
         ElemKind::Shell4 | ElemKind::Shell4R => {
             return crate::mitc4::s4_ke_bi(xyz, e, nu, h, None, bend);
         }
-        ElemKind::Shell8 | ElemKind::Shell8R => s8_local(&xy, e, nu, h, kind.reduced_int())?,
+        ElemKind::Shell8 | ElemKind::Shell8R => {
+            let (ke, area, _) = s8_local(&xy, e, nu, h, None, kind.reduced_int())?;
+            (ke, area)
+        }
         ElemKind::Shell3 => {
             let mut p = [[0.0; 2]; 3];
             p.copy_from_slice(&xy[..3]);

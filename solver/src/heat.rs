@@ -171,6 +171,63 @@ pub fn hex8_face_heat(
     Ok((ke, fe))
 }
 
+/// Nonlinear face radiation. Returns (Jacobian ∂r/∂T, residual r)
+/// with r_a = ∫ N_a ε σ (θ^4 − θ_sink^4) dA, θ = T − T_abs.
+pub fn hex8_face_radiation(
+    xyz: &[[f64; 3]],
+    face: i32,
+    eps: f64,
+    sigma: f64,
+    t_abs: f64,
+    t_sink: f64,
+    t_node: &[f64],
+) -> Result<(Vec<f64>, Vec<f64>)> {
+    if !(1..=6).contains(&face) {
+        return err(format!("Ungültige C3D8-Fläche R{face}"));
+    }
+    if t_node.len() < 8 {
+        return err("*RADIATE: zu wenige Knotentemperaturen.");
+    }
+    let p = hex_as_8(xyz)?;
+    let fi = (face - 1) as usize;
+    let mut r = vec![0.0; 8];
+    let mut ke = vec![0.0; 64];
+    let theta_e = t_sink - t_abs;
+    let pts = [-G2, G2];
+    for &xi in &pts {
+        for &eta in &pts {
+            let (n, dnxi, dneta) = face_shape(xi, eta);
+            let mut rxi = [0.0; 3];
+            let mut reta = [0.0; 3];
+            let mut temp = 0.0;
+            for a in 0..4 {
+                let q = p[HEX_FACES[fi][a]];
+                temp += n[a] * t_node[HEX_FACES[fi][a]];
+                for k in 0..3 {
+                    rxi[k] += dnxi[a] * q[k];
+                    reta[k] += dneta[a] * q[k];
+                }
+            }
+            let nx = rxi[1] * reta[2] - rxi[2] * reta[1];
+            let ny = rxi[2] * reta[0] - rxi[0] * reta[2];
+            let nz = rxi[0] * reta[1] - rxi[1] * reta[0];
+            let jac = (nx * nx + ny * ny + nz * nz).sqrt();
+            let theta = (temp - t_abs).max(1.0);
+            let g = eps * sigma * (theta.powi(4) - theta_e.powi(4));
+            let dg = eps * sigma * 4.0 * theta.powi(3);
+            for a in 0..4 {
+                let ia = HEX_FACES[fi][a];
+                r[ia] += n[a] * g * jac;
+                for b in 0..4 {
+                    let ib = HEX_FACES[fi][b];
+                    ke[ia * 8 + ib] += dg * n[a] * n[b] * jac;
+                }
+            }
+        }
+    }
+    Ok((ke, r))
+}
+
 pub fn quad4_conductivity(xyz: &[[f64; 3]], k: f64, th: f64) -> Result<(Vec<f64>, f64)> {
     let mut xy = [[0.0; 2]; 4];
     for i in 0..4 {

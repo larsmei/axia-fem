@@ -76,6 +76,22 @@ fn tokenize_data(line: &str) -> Vec<String> {
         .collect()
 }
 
+/// `R1`, `R1CR`, `S2` → (face, cavity name).
+fn parse_rad_face(tok: &str) -> (i32, String) {
+    let t = tok.trim();
+    let b = t.as_bytes();
+    let mut i = 0;
+    if i < b.len() && (b[i] == b'R' || b[i] == b'S' || b[i] == b'F' || b[i] == b'P') {
+        i += 1;
+    }
+    let start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    let face = t[start..i].parse::<i32>().unwrap_or(1).max(1);
+    (face, t[i..].trim().to_string())
+}
+
 fn parse_f64(s: &str) -> Result<f64> {
     parse_f64_inner(s).ok_or_else(|| crate::error::FemError(format!("Keine Zahl: {s}")))
 }
@@ -823,7 +839,7 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                     } else if typ == "CENTRIF" {
                         if k + 6 >= toks.len() {
                             return err(
-                                "*DLOAD CENTRIF braucht ω² und zwei Achspunkte (7 Zahlen).",
+                                "*DLOAD CENTRIF braucht ω², einen Achspunkt und die Achsrichtung (7 Zahlen).",
                             );
                         }
                         let omega2 = parse_f64(&toks[k])?;
@@ -1223,6 +1239,89 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                             .warnings
                             .push(format!("__DF__|{name}|{tag}|{mag}"));
                     }
+                }
+            }
+            "*PHYSICAL CONSTANTS" => {
+                if let Some(z) = params.get("ABSOLUTE ZERO") {
+                    model.absolute_zero = parse_f64(z)?;
+                }
+                if let Some(s) = params.get("STEFAN BOLTZMANN") {
+                    model.stefan_boltzmann = parse_f64(s)?;
+                }
+                i += 1;
+            }
+            "*NODAL THICKNESS" => {
+                i += 1;
+                while i < n {
+                    let raw = strip_comment(lines[i]);
+                    if raw.trim().is_empty() {
+                        i += 1;
+                        continue;
+                    }
+                    if is_keyword_line(raw) {
+                        break;
+                    }
+                    let parts: Vec<&str> = raw
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if parts.len() >= 2 {
+                        let name = parts[0].to_ascii_uppercase();
+                        let th = parse_f64(parts[1])?;
+                        if let Ok(id) = parse_i32(&name) {
+                            model.nodal_thickness.insert(id, th);
+                        } else {
+                            model.warnings.push(format!("__NH__|{name}|{th}"));
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            "*RADIATE" => {
+                i += 1;
+                while i < n {
+                    let raw = strip_comment(lines[i]);
+                    if raw.trim().is_empty() {
+                        i += 1;
+                        continue;
+                    }
+                    if is_keyword_line(raw) {
+                        break;
+                    }
+                    let parts: Vec<&str> = raw.split(',').map(|s| s.trim()).collect();
+                    if parts.len() >= 2 && !parts[0].is_empty() {
+                        let name = parts[0].to_ascii_uppercase();
+                        let face_tok = parts.get(1).unwrap_or(&"").to_ascii_uppercase();
+                        let (face, cavity) = parse_rad_face(&face_tok);
+                        let sink = if parts.len() >= 3 && !parts[2].is_empty() {
+                            Some(parse_f64(parts[2])?)
+                        } else {
+                            None
+                        };
+                        let eps = if parts.len() >= 4 && !parts[3].is_empty() {
+                            parse_f64(parts[3])?
+                        } else {
+                            1.0
+                        };
+                        if let Ok(id) = parse_i32(&name) {
+                            model.radiates.push(crate::model::Radiate {
+                                elem: id,
+                                face,
+                                t_sink: sink,
+                                emissivity: eps,
+                                cavity,
+                            });
+                        } else {
+                            let sink_s = sink
+                                .map(|v| v.to_string())
+                                .unwrap_or_default();
+                            model.warnings.push(format!(
+                                "__RD__|{name}|{face}|{sink_s}|{eps}|{cavity}"
+                            ));
+                        }
+                    }
+                    i += 1;
                 }
             }
             "*FILM" => {
@@ -1867,11 +1966,14 @@ fn parse_expanded(inp: &str) -> Result<Model> {
                 if toks.is_empty() {
                     return err("*EXPANSION ohne Wert");
                 }
-                let alpha = parse_f64(&toks[0])?;
                 let name = current_material
                     .clone()
                     .unwrap_or_else(|| "MATERIAL-1".into());
-                model.materials.entry(name).or_default().alpha = alpha;
+                let mat = model.materials.entry(name).or_default();
+                mat.alpha = parse_f64(&toks[0])?;
+                if let Some(z) = params.get("ZERO") {
+                    mat.tref = parse_f64(z)?;
+                }
             }
             "*TEMPERATURE" => {
                 let (toks, ni) = collect_tokens(&lines, i + 1);
@@ -2353,6 +2455,17 @@ fn expand_deferred(model: &mut Model) -> Result<()> {
                         for e in elems {
                             s.faces.push((e, face));
                         }
+                    }
+                }
+            }
+        } else if let Some(rest) = w.strip_prefix("__NH__|") {
+            let p: Vec<&str> = rest.split('|').collect();
+            if p.len() >= 2 {
+                let name = p[0];
+                let th: f64 = p[1].parse().unwrap_or(0.0);
+                if let Ok(nodes) = model.expand_nset(name) {
+                    for n in nodes {
+                        model.nodal_thickness.insert(n, th);
                     }
                 }
             }

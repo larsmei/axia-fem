@@ -265,6 +265,97 @@ pub fn cax8_body_force(xyz: &[[f64; 3]], br: f64, bz: f64, reduced: bool) -> Res
     Ok(fe)
 }
 
+fn centrif_at(omega2: f64, origin: [f64; 3], axis_dir: [f64; 3], p: [f64; 3]) -> [f64; 3] {
+    let mut axis = axis_dir;
+    let al = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    if al < 1e-18 {
+        axis = [0.0, 0.0, 1.0];
+    } else {
+        axis[0] /= al;
+        axis[1] /= al;
+        axis[2] /= al;
+    }
+    let rv = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+    let proj = rv[0] * axis[0] + rv[1] * axis[1] + rv[2] * axis[2];
+    [
+        omega2 * (rv[0] - proj * axis[0]),
+        omega2 * (rv[1] - proj * axis[1]),
+        omega2 * (rv[2] - proj * axis[2]),
+    ]
+}
+
+fn z_of(xy: &[[f64; 2]], nshp: &[f64], nn: usize) -> f64 {
+    let mut z = 0.0;
+    for a in 0..nn {
+        z += nshp[a] * xy[a][1];
+    }
+    z
+}
+
+/// Centrifugal load with a = ω² r_⊥ evaluated at each Gauss point.
+pub fn cax8_centrif_force(
+    xyz: &[[f64; 3]],
+    rho: f64,
+    omega2: f64,
+    origin: [f64; 3],
+    axis: [f64; 3],
+    reduced: bool,
+) -> Result<Vec<f64>> {
+    if xyz.len() < 8 {
+        return err("CAX8 braucht 8 Knoten.");
+    }
+    let mut xy = [[0.0; 2]; 8];
+    for i in 0..8 {
+        xy[i] = [xyz[i][0], xyz[i][1]];
+    }
+    let mut fe = vec![0.0; 16];
+    for (xi, eta, w0) in cax8_gauss(reduced) {
+        let (_, det, nshp) = quad8_dndx(&xy, xi, eta)?;
+        if det <= 0.0 {
+            continue;
+        }
+        let r = radius(&xy, &nshp, 8);
+        let p = [r, z_of(&xy, &nshp, 8), 0.0];
+        let a = centrif_at(omega2, origin, axis, p);
+        let w = two_pi() * r.max(1e-16) * det * w0;
+        for i in 0..8 {
+            fe[2 * i] += nshp[i] * rho * a[0] * w;
+            fe[2 * i + 1] += nshp[i] * rho * a[1] * w;
+        }
+    }
+    Ok(fe)
+}
+
+pub fn cax4_centrif_force(
+    xyz: &[[f64; 3]],
+    rho: f64,
+    omega2: f64,
+    origin: [f64; 3],
+    axis: [f64; 3],
+    reduced: bool,
+) -> Result<Vec<f64>> {
+    let mut xy = [[0.0; 2]; 4];
+    for i in 0..4.min(xyz.len()) {
+        xy[i] = [xyz[i][0], xyz[i][1]];
+    }
+    let mut fe = vec![0.0; 8];
+    for (xi, eta, w0) in cax4_gauss(reduced) {
+        let (_, det, nshp) = quad4_dndx(&xy, xi, eta)?;
+        if det <= 0.0 {
+            continue;
+        }
+        let r = radius(&xy, &nshp, 4);
+        let p = [r, z_of(&xy, &nshp, 4), 0.0];
+        let a = centrif_at(omega2, origin, axis, p);
+        let w = two_pi() * r.max(1e-16) * det * w0;
+        for i in 0..4 {
+            fe[2 * i] += nshp[i] * rho * a[0] * w;
+            fe[2 * i + 1] += nshp[i] * rho * a[1] * w;
+        }
+    }
+    Ok(fe)
+}
+
 pub fn cax_edge_pressure(xyz: &[[f64; 3]], nn: usize, face: i32, p: f64) -> Result<Vec<f64>> {
     // Faces 1-4: edges of the r-z quad. Traction in the outward in-plane normal, 2π r.
     if !(1..=4).contains(&face) {

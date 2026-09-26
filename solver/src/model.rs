@@ -694,7 +694,7 @@ pub enum Dload {
         dir: [f64; 3],
         mag: f64,
     },
-    /// `*DLOAD, CENTRIF`: ω² and two points on the rotation axis.
+    /// `*DLOAD, CENTRIF`: ω², a point on the axis (`p1`) and the axis direction (`p2`).
     /// `elems` empty → all elements.
     Centrif {
         omega2: f64,
@@ -818,6 +818,16 @@ pub struct Film {
     pub face: i32,
     pub t_inf: f64,
     pub h: f64,
+}
+
+/// CalculiX `*RADIATE`. `t_sink = None` is cavity radiation (not an environment temperature).
+#[derive(Clone, Debug)]
+pub struct Radiate {
+    pub elem: i32,
+    pub face: i32,
+    pub t_sink: Option<f64>,
+    pub emissivity: f64,
+    pub cavity: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1026,6 +1036,13 @@ pub struct Model {
     pub cfluxes: Vec<Cflux>,
     pub dfluxes: Vec<Dflux>,
     pub films: Vec<Film>,
+    /// `*RADIATE`: face emission to a sink temperature (CalculiX).
+    pub radiates: Vec<Radiate>,
+    /// `*NODAL THICKNESS`, node id → thickness.
+    pub nodal_thickness: HashMap<i32, f64>,
+    /// `*PHYSICAL CONSTANTS`. CalculiX defaults.
+    pub absolute_zero: f64,
+    pub stefan_boltzmann: f64,
     pub amplitudes: Vec<Amplitude>,
     pub init: Vec<InitCond>,
     pub damp_alpha: f64,
@@ -1125,6 +1142,10 @@ impl Model {
             cfluxes: Vec::new(),
             dfluxes: Vec::new(),
             films: Vec::new(),
+            radiates: Vec::new(),
+            nodal_thickness: HashMap::new(),
+            absolute_zero: -273.15,
+            stefan_boltzmann: 5.669e-8,
             amplitudes: Vec::new(),
             init: Vec::new(),
             damp_alpha: 0.0,

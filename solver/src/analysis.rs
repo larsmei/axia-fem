@@ -570,6 +570,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
 
     let mut trips: Vec<(usize, usize, f64)> = Vec::new();
     let mut c_trips: Vec<(usize, usize, f64)> = Vec::new();
+    let mut m_trips: Vec<(usize, usize, f64)> = Vec::new();
     for el in &model.elements {
         let xyz = elem_xyz(&model, &el.nodes)?;
         if el.kind.is_special() {
@@ -596,19 +597,48 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
             None
         };
         let dirs = elem_dirs(el, &model, &shell_n);
-        let mut kef = element_ke(
-            el.kind,
-            &xyz,
-            mat.e,
-            mat.nu,
-            th,
-            sec.as_ref(),
-            dirs.as_deref(),
-            model.bend_scale(el),
-            model.shell_law.get(&el.id),
-            model.solid_d.get(&el.id),
-            model.k6rot,
-        )?;
+        let h_nodes = shell_node_thickness(&model, el, th);
+        let mut kef = if matches!(el.kind, ElemKind::Shell8 | ElemKind::Shell8R) {
+            if let Some(hs) = h_nodes.as_ref() {
+                let (ke, _, vol) =
+                    shell::shell8_variable_h(&xyz, mat.e, mat.nu, hs, el.kind.reduced_int())?;
+                let nd = 6 * hs.len();
+                crate::elem::KeFe {
+                    ke,
+                    fe: vec![0.0; nd],
+                    ndof: nd,
+                    volume: vol,
+                }
+            } else {
+                element_ke(
+                    el.kind,
+                    &xyz,
+                    mat.e,
+                    mat.nu,
+                    th,
+                    sec.as_ref(),
+                    dirs.as_deref(),
+                    model.bend_scale(el),
+                    model.shell_law.get(&el.id),
+                    model.solid_d.get(&el.id),
+                    model.k6rot,
+                )?
+            }
+        } else {
+            element_ke(
+                el.kind,
+                &xyz,
+                mat.e,
+                mat.nu,
+                th,
+                sec.as_ref(),
+                dirs.as_deref(),
+                model.bend_scale(el),
+                model.shell_law.get(&el.id),
+                model.solid_d.get(&el.id),
+                model.k6rot,
+            )?
+        };
         if !model.node_transform.is_empty() {
             constraint::transform_ke(
                 &mut kef.ke,
@@ -643,9 +673,32 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
             // the first bending frequency by about 6 %.
             let w_end = 1.0 / 6.0;
             let w_mid = 2.0 / 3.0;
+            let shell_consistent = h_nodes.is_some()
+                && matches!(el.kind, ElemKind::Shell8 | ElemKind::Shell8R);
+            if shell_consistent {
+                if let Some(hs) = h_nodes.as_ref() {
+                    let me = shell::shell8_consistent_mass(&xyz, hs, mat.density)?;
+                    let nd = 6 * hs.len();
+                    for i in 0..nd {
+                        for j in 0..nd {
+                            let v = me[i * nd + j];
+                            if v.abs() > 0.0 {
+                                m_trips.push((gdofs[i], gdofs[j], v));
+                            }
+                        }
+                    }
+                }
+            }
             for a in 0..nn {
                 let ni = model.node_index(el.nodes[a])?;
-                let w = if el.kind.is_beam() && nn == 3 {
+                let w = if let Some(hs) = h_nodes.as_ref() {
+                    let s: f64 = hs.iter().sum();
+                    if s > 0.0 {
+                        hs[a] / s
+                    } else {
+                        1.0 / nn as f64
+                    }
+                } else if el.kind.is_beam() && nn == 3 {
                     if a == 2 { w_mid } else { w_end }
                 } else if el.kind.is_beam() && nn == 2 {
                     0.5
@@ -653,8 +706,10 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                     1.0 / nn as f64
                 };
                 let mnode = mass * w;
-                for d in 0..3.min(local_dim) {
-                    m_full[dof_of(ndn, ni, d)] += mnode;
+                if !shell_consistent {
+                    for d in 0..3.min(local_dim) {
+                        m_full[dof_of(ndn, ni, d)] += mnode;
+                    }
                 }
                 if local_dim >= 6 {
                     let c2 = kef.volume.abs().powf(2.0 / 3.0).max(1e-6);
@@ -739,6 +794,17 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                     p2,
                     elems,
                 } if centrif_applies(elems, el.id) => {
+                    if !apply_axisym_centrif(
+                        el.kind,
+                        &xyz,
+                        mat.density,
+                        *omega2,
+                        *p1,
+                        *p2,
+                        &gdofs,
+                        local_dim,
+                        &mut f_full,
+                    )? {
                     let a = centrif_accel(*omega2, *p1, *p2, &xyz);
                     let bx = mat.density * a[0];
                     let by = mat.density * a[1];
@@ -764,6 +830,7 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
                             local_dim,
                             &mut f_full,
                         )?;
+                    }
                     }
                 }
                 Dload::BeamGlobal { elem, dir, mag } if *elem == el.id && el.kind.is_beam() => {
@@ -886,17 +953,36 @@ fn solve_linear(model: Model, t0: f64) -> Result<SolveOutput> {
     let mut u_full = if nfree == 0 {
         map.u0.clone()
     } else if let Procedure::Frequency { nmodes } = model.procedure {
-        let mut m_ind = vec![0.0; nfree];
-        for d in 0..ndof {
-            for &(a, ta) in &map.t_row[d] {
-                m_ind[a] += ta * ta * m_full[d];
-            }
-        }
-        if m_ind.iter().all(|v| *v <= 0.0) {
-            return err("*FREQUENCY: *DENSITY fehlt oder Masse ist null.");
+        if model.u_start.len() == nnode {
+            // *FREQUENCY after a static step, including *STEP,PERTURBATION:
+            // (K + Kg(σ)) φ = ω² M φ with σ from the preload displacement.
+            add_preload_kg(&model, ndn, &mut trips)?;
         }
         let (ff_trips, _) = map.reduce(&trips, &f_full);
-        let ev = crate::eigen::subspace_gen(nfree, ff_trips, &m_ind, nmodes.max(1))?;
+        let ev = if m_trips.is_empty() {
+            let mut m_ind = vec![0.0; nfree];
+            for d in 0..ndof {
+                for &(a, ta) in &map.t_row[d] {
+                    m_ind[a] += ta * ta * m_full[d];
+                }
+            }
+            if m_ind.iter().all(|v| *v <= 0.0) {
+                return err("*FREQUENCY: *DENSITY fehlt oder Masse ist null.");
+            }
+            crate::eigen::subspace_gen(nfree, ff_trips, &m_ind, nmodes.max(1))?
+        } else {
+            let mut a_trips = m_trips.clone();
+            for i in 0..ndof {
+                if m_full[i].abs() > 0.0 {
+                    a_trips.push((i, i, m_full[i]));
+                }
+            }
+            let (a_ff, _) = map.reduce(&a_trips, &f_full);
+            if a_ff.is_empty() {
+                return err("*FREQUENCY: *DENSITY fehlt oder Masse ist null.");
+            }
+            crate::eigen::subspace_ab(nfree, ff_trips, a_ff, nmodes.max(1))?
+        };
         frequencies = ev
             .values
             .iter()
@@ -1465,8 +1551,9 @@ fn scatter_fe(fe: &[f64], gdofs: &[usize], fe_dim: usize, local_dim: usize, f_fu
     }
 }
 
-/// Centrifugal acceleration at the element centroid: ω² r_⊥.
-fn centrif_accel(omega2: f64, p1: [f64; 3], p2: [f64; 3], xyz: &[[f64; 3]]) -> [f64; 3] {
+/// Centrifugal acceleration ω² r_⊥ at the element centroid.
+/// `axis_dir` is the direction of the rotation axis through `origin` (CalculiX CENTRIF).
+fn centrif_accel(omega2: f64, origin: [f64; 3], axis_dir: [f64; 3], xyz: &[[f64; 3]]) -> [f64; 3] {
     if xyz.is_empty() {
         return [0.0, 0.0, 0.0];
     }
@@ -1480,7 +1567,7 @@ fn centrif_accel(omega2: f64, p1: [f64; 3], p2: [f64; 3], xyz: &[[f64; 3]]) -> [
     c[0] /= n;
     c[1] /= n;
     c[2] /= n;
-    let mut axis = [p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]];
+    let mut axis = axis_dir;
     let al = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
     if al < 1e-18 {
         axis = [0.0, 0.0, 1.0];
@@ -1489,7 +1576,7 @@ fn centrif_accel(omega2: f64, p1: [f64; 3], p2: [f64; 3], xyz: &[[f64; 3]]) -> [
         axis[1] /= al;
         axis[2] /= al;
     }
-    let r = [c[0] - p1[0], c[1] - p1[1], c[2] - p1[2]];
+    let r = [c[0] - origin[0], c[1] - origin[1], c[2] - origin[2]];
     let proj = r[0] * axis[0] + r[1] * axis[1] + r[2] * axis[2];
     let rp = [
         r[0] - proj * axis[0],
@@ -1501,6 +1588,191 @@ fn centrif_accel(omega2: f64, p1: [f64; 3], p2: [f64; 3], xyz: &[[f64; 3]]) -> [
 
 fn centrif_applies(elems: &[i32], id: i32) -> bool {
     elems.is_empty() || elems.contains(&id)
+}
+
+fn apply_axisym_centrif(
+    kind: ElemKind,
+    xyz: &[[f64; 3]],
+    rho: f64,
+    omega2: f64,
+    origin: [f64; 3],
+    axis: [f64; 3],
+    gdofs: &[usize],
+    local_dim: usize,
+    f_full: &mut [f64],
+) -> Result<bool> {
+    let fe = match kind {
+        ElemKind::Cax8 | ElemKind::Cax8R => crate::axisym::cax8_centrif_force(
+            xyz,
+            rho,
+            omega2,
+            origin,
+            axis,
+            kind.reduced_int(),
+        )?,
+        ElemKind::Cax4 | ElemKind::Cax4R => crate::axisym::cax4_centrif_force(
+            xyz,
+            rho,
+            omega2,
+            origin,
+            axis,
+            kind.reduced_int(),
+        )?,
+        _ => return Ok(false),
+    };
+    scatter_fe(&fe, gdofs, 2, local_dim, f_full);
+    Ok(true)
+}
+
+fn shell_node_thickness(model: &Model, el: &crate::model::Element, th: f64) -> Option<Vec<f64>> {
+    if model.nodal_thickness.is_empty() || !el.kind.is_shell() {
+        return None;
+    }
+    let hs: Vec<f64> = el
+        .nodes
+        .iter()
+        .map(|id| model.nodal_thickness.get(id).copied().unwrap_or(th))
+        .collect();
+    let scale = th.abs().max(1.0);
+    if hs.iter().all(|h| (*h - th).abs() <= 1e-12 * scale) {
+        None
+    } else {
+        Some(hs)
+    }
+}
+
+/// Geometric stiffness of the preload displacement `model.u_start`, added to K.
+fn add_preload_kg(
+    model: &Model,
+    ndn: usize,
+    trips: &mut Vec<(usize, usize, f64)>,
+) -> Result<()> {
+    for el in &model.elements {
+        if !el.kind.needs_material() {
+            continue;
+        }
+        let xyz = elem_xyz(model, &el.nodes)?;
+        let nn = el.kind.nnodes();
+        let local_dim = el.kind.ndof_per_node();
+        let mut ue = vec![0.0; nn * local_dim];
+        let mut gdofs = Vec::with_capacity(nn * local_dim);
+        for a in 0..nn {
+            let ni = model.node_index(el.nodes[a])?;
+            for d in 0..3.min(local_dim) {
+                ue[a * local_dim + d] = model.u_start[ni][d];
+            }
+            for d in 0..local_dim {
+                gdofs.push(dof_of(ndn, ni, d));
+            }
+        }
+        let mat = model.material_for(el)?;
+        let th = model.thickness_for(el);
+        let sec = if el.kind.is_beam() {
+            Some(model.beam_section_for(el)?)
+        } else {
+            None
+        };
+        let kg = if el.kind.is_truss() {
+            let area = th;
+            let i1 = if nn == 2 { 1 } else { 2 };
+            let mut d = [
+                xyz[i1][0] - xyz[0][0],
+                xyz[i1][1] - xyz[0][1],
+                xyz[i1][2] - xyz[0][2],
+            ];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-18);
+            d[0] /= len;
+            d[1] /= len;
+            d[2] /= len;
+            let du = [
+                ue[3 * i1] - ue[0],
+                ue[3 * i1 + 1] - ue[1],
+                ue[3 * i1 + 2] - ue[2],
+            ];
+            let n_ax = mat.e * area * (du[0] * d[0] + du[1] * d[1] + du[2] * d[2]) / len;
+            crate::eigen::truss_kg(&xyz, n_ax)
+        } else if el.kind.is_beam() {
+            let sec = sec.as_ref().unwrap();
+            let dx = xyz[1][0] - xyz[0][0];
+            let dy = xyz[1][1] - xyz[0][1];
+            let dz = xyz[1][2] - xyz[0][2];
+            let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-18);
+            let axial = (ue[local_dim] - ue[0]) * dx / len
+                + (ue[local_dim + 1] - ue[1]) * dy / len
+                + (ue[local_dim + 2] - ue[2]) * dz / len;
+            let n_ax = mat.e * sec.area * axial / len;
+            crate::eigen::beam_kg(&xyz, n_ax, nn)?
+        } else if matches!(
+            el.kind,
+            ElemKind::Hex8
+                | ElemKind::Hex8I
+                | ElemKind::Hex8R
+                | ElemKind::Hex20
+                | ElemKind::Hex20R
+                | ElemKind::Tet4
+                | ElemKind::Tet10
+                | ElemKind::Tet10T
+                | ElemKind::Wedge6
+                | ElemKind::Wedge15
+        ) {
+            let sn = element_nodal_stress(
+                el.kind,
+                &xyz,
+                &ue,
+                mat.e,
+                mat.nu,
+                sec.as_ref(),
+                th,
+                None,
+            )?;
+            let mut mean = [0.0; 6];
+            if !sn.is_empty() {
+                for row in &sn {
+                    for c in 0..6 {
+                        mean[c] += row[c];
+                    }
+                }
+                let inv = 1.0 / sn.len() as f64;
+                for c in 0..6 {
+                    mean[c] *= inv;
+                }
+            }
+            match el.kind {
+                ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R => {
+                    crate::eigen::hex8_kg(&xyz, &mean)?
+                }
+                ElemKind::Hex20 | ElemKind::Hex20R => {
+                    crate::quadratic::hex20_kg_ue(
+                        &xyz,
+                        &ue,
+                        mat.e,
+                        mat.nu,
+                        el.kind.reduced_int(),
+                    )?
+                }
+                ElemKind::Tet4 => crate::eigen::tet4_kg(&xyz, &mean)?,
+                ElemKind::Tet10 | ElemKind::Tet10T => crate::eigen::tet10_kg(&xyz, &mean)?,
+                ElemKind::Wedge6 => extra::wedge6_kg(&xyz, &mean)?,
+                ElemKind::Wedge15 => extra::wedge15_kg(&xyz, &mean)?,
+                _ => continue,
+            }
+        } else {
+            continue;
+        };
+        let m = gdofs.len();
+        if kg.len() < m * m {
+            continue;
+        }
+        for i in 0..m {
+            for j in 0..m {
+                let v = kg[i * m + j];
+                if v.abs() > 0.0 {
+                    trips.push((gdofs[i], gdofs[j], v));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// CalculiX *RIGID BODY, ROT NODE=n: dofs 1–3 of the rot node are θ of the ref node.
@@ -2501,13 +2773,13 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
         let ni = model.node_index(bc.node)?;
         prescribed.insert(ni, bc.value);
     }
-    for ic in &model.init {
-        if ic.kind == InitKind::Temperature {
-            let ni = model.node_index(ic.node)?;
-            prescribed.entry(ni).or_insert(ic.value);
-        }
-    }
-    if prescribed.is_empty() && model.films.is_empty() {
+    // *INITIAL CONDITIONS,TYPE=TEMPERATURE is the starting field, not a Dirichlet BC.
+    if prescribed.is_empty()
+        && model.films.is_empty()
+        && model.radiates.iter().all(|r| r.t_sink.is_none())
+        && model.cfluxes.is_empty()
+        && model.dfluxes.is_empty()
+    {
         return err("*HEAT TRANSFER: keine Temperatur-Randbedingung (DOF 11) und kein *FILM.");
     }
 
@@ -2642,6 +2914,73 @@ fn solve_heat(model: Model, t0: f64) -> Result<SolveOutput> {
             }
             solver = format!("backward-Euler ({solver}, {nsteps} steps)");
             iters = nsteps;
+        } else if model.radiates.iter().any(|r| r.t_sink.is_some()) {
+            let sigma = model.stefan_boltzmann;
+            let t_abs = model.absolute_zero;
+            let mut last_name = "faer".to_string();
+            let mut last_res = 0.0;
+            let mut niter = 0usize;
+            for it in 0..25 {
+                niter = it + 1;
+                let mut trips_n = trips.clone();
+                let mut rhs = f.clone();
+                for rad in &model.radiates {
+                    let Some(tsink) = rad.t_sink else {
+                        continue;
+                    };
+                    let Some(el) = model.elements.iter().find(|e| e.id == rad.elem) else {
+                        continue;
+                    };
+                    if !matches!(el.kind, ElemKind::Hex8 | ElemKind::Hex8I | ElemKind::Hex8R)
+                        || rad.face < 1
+                    {
+                        continue;
+                    }
+                    let xyz = elem_xyz(&model, &el.nodes)?;
+                    let mut t_node = vec![0.0; 8];
+                    let mut gd = [0usize; 8];
+                    for a in 0..8.min(el.nodes.len()) {
+                        let ni = model.node_index(el.nodes[a])?;
+                        gd[a] = ni;
+                        t_node[a] = t_full[ni];
+                    }
+                    let (jac, rad_r) = heat::hex8_face_radiation(
+                        &xyz,
+                        rad.face,
+                        rad.emissivity,
+                        sigma,
+                        t_abs,
+                        tsink,
+                        &t_node,
+                    )?;
+                    for a in 0..8 {
+                        rhs[gd[a]] -= rad_r[a];
+                        for b in 0..8 {
+                            let v = jac[a * 8 + b];
+                            if v.abs() > 0.0 {
+                                trips_n.push((gd[a], gd[b], v));
+                                rhs[gd[a]] += v * t_node[b];
+                            }
+                        }
+                    }
+                }
+                let (ff, rhs_r) = map.reduce(&trips_n, &rhs);
+                let solved = solve_kff(nfree, ff, &rhs_r)?;
+                last_name = solved.name;
+                last_res = solved.residual;
+                let t_new = map.reconstruct(&solved.x);
+                let mut dmax = 0.0f64;
+                for i in 0..ndof {
+                    dmax = dmax.max((t_new[i] - t_full[i]).abs());
+                }
+                t_full = t_new;
+                if dmax < 1e-8 {
+                    break;
+                }
+            }
+            solver = format!("radiation-Newton ({last_name}, {niter} iters)");
+            residual = last_res;
+            iters = niter;
         } else {
             let (ff, rhs) = map.reduce(&trips, &f);
             let solved = solve_kff(nfree, ff, &rhs)?;
@@ -2800,19 +3139,31 @@ fn assemble_fext_u(
                     p2,
                     elems,
                 } if centrif_applies(elems, el.id) => {
-                    let a = centrif_accel(*omega2, *p1, *p2, &xyz);
-                    apply_body(
-                        model,
+                    if !apply_axisym_centrif(
                         el.kind,
                         &xyz,
-                        mat.density * a[0],
-                        mat.density * a[1],
-                        mat.density * a[2],
-                        th,
+                        mat.density,
+                        *omega2,
+                        *p1,
+                        *p2,
                         &gdofs,
                         local_dim,
                         &mut f,
-                    )?;
+                    )? {
+                        let a = centrif_accel(*omega2, *p1, *p2, &xyz);
+                        apply_body(
+                            model,
+                            el.kind,
+                            &xyz,
+                            mat.density * a[0],
+                            mat.density * a[1],
+                            mat.density * a[2],
+                            th,
+                            &gdofs,
+                            local_dim,
+                            &mut f,
+                        )?;
+                    }
                 }
                 _ => {}
             }
